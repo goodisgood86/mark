@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
@@ -1145,27 +1146,13 @@ class _HomePageState extends State<HomePage> {
       // 촬영본에서: overlayTop / imageHeight = normalizedTop
       // 촬영본에서: normalizedTop * finalHeight = topBarHeight
 
-      // 1. 촬영본에서 실제로 사용한 overlayTop 계산
-      final double targetRatio = aspectRatioOf(_aspectMode);
-      final double targetHeight = finalWidth / targetRatio;
-      double overlayTop = 0;
-      if (targetHeight < finalHeight) {
-        overlayTop = (finalHeight - targetHeight) / 2;
-      }
-
-      // 2. 정규화된 비율 계산
-      final double normalizedTop = overlayTop / finalHeight;
-
-      // 3. 프리뷰와 동일하게 정규화 비율을 적용하여 topBarHeight 계산
-      // 촬영본은 이미 크롭된 이미지이므로, overlayTop 이후의 위치
-      final double calculatedTopBarHeight = normalizedTop * finalHeight;
-
-      // 4. frameMargin 추가 (프리뷰와 동일)
+      // 촬영본은 이미 크롭된 이미지이므로, 프레임 위치를 크롭된 이미지 기준으로 직접 계산
+      // 프리뷰와 동일하게 프레임은 크롭된 이미지 상단에서 frameMargin만큼 아래에 배치
       final double frameMargin = finalWidth * 0.02;
-      final double finalTopBarHeight = calculatedTopBarHeight + frameMargin;
+      final double finalTopBarHeight = frameMargin;
 
       debugPrint(
-        '[Petgram] 📸 _addPhotoFrame (정규화): image=${finalWidth}x${finalHeight}, overlayTop=$overlayTop, normalizedTop=$normalizedTop, calculatedTopBarHeight=$calculatedTopBarHeight, finalTopBarHeight=$finalTopBarHeight',
+        '[Petgram] 📸 _addPhotoFrame: image=${finalWidth}x${finalHeight}, frameMargin=$frameMargin, finalTopBarHeight=$finalTopBarHeight',
       );
 
       final framePainter = FramePainter(
@@ -1809,7 +1796,7 @@ class _HomePageState extends State<HomePage> {
     // 타이머로 인한 촬영이거나 일반 촬영 모두 연속 촬영 가능
     if (_isBurstMode && _burstCount == 0) {
       setState(() {
-        _burstCount = 0; // 촬영 전이므로 0
+        _burstCount = 1; // 첫 장부터 카운팅 시작
         _shouldStopBurst = false;
       });
       debugPrint('📸 연속 촬영 시작: $_burstCountSetting장 (타이머: $_isTimerTriggered)');
@@ -2109,13 +2096,14 @@ class _HomePageState extends State<HomePage> {
 
         // 연속 촬영 모드 처리 (finally에서 처리하여 _isProcessing이 false가 된 후 실행)
         if (_isBurstMode && !_shouldStopBurst) {
-          // 현재 촬영한 장수 증가 (현재 촬영 포함)
-          setState(() => _burstCount++);
+          // 현재 촬영한 장수 확인 (이미 증가된 상태)
           debugPrint('📸 연속 촬영 진행: $_burstCount/$_burstCountSetting');
 
           // 설정한 매수에 도달했는지 확인
           if (_burstCount < _burstCountSetting) {
             // 아직 설정한 매수에 도달하지 않았으면 계속 촬영 (속도 개선: 300ms -> 100ms)
+            // 다음 촬영을 위해 카운트 증가
+            setState(() => _burstCount++);
             Future.delayed(const Duration(milliseconds: 100), () {
               if (mounted && !_shouldStopBurst) {
                 _takePhoto();
@@ -2127,14 +2115,6 @@ class _HomePageState extends State<HomePage> {
                     _burstCount = 0;
                     _shouldStopBurst = false;
                   });
-                  // 연속 촬영 강제 종료 시 스낵바 표시
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('연속 촬영이 종료되었습니다.'),
-                      behavior: SnackBarBehavior.floating,
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
                 }
               }
             });
@@ -2175,16 +2155,7 @@ class _HomePageState extends State<HomePage> {
               _isTimerTriggered = false;
             }
           });
-          // 연속 촬영 강제 종료 시 스낵바 표시
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('연속 촬영이 종료되었습니다.'),
-                behavior: SnackBarBehavior.floating,
-                duration: Duration(seconds: 2),
-              ),
-            );
-          }
+          // 중지 요청 시에는 스낵바 표시하지 않음 (완료 메시지와 중복 방지)
         }
       }
     }
@@ -2670,87 +2641,53 @@ class _HomePageState extends State<HomePage> {
   Map<String, double> _calculateCameraPreviewDimensions() {
     final screenSize = MediaQuery.of(context).size;
     final double screenW = screenSize.width;
-
-    // 1단계: 카메라 실제 비율 가져오기
-    // mockup 모드일 때도 실제 카메라처럼 9:16 비율 사용 (mockup 이미지 비율과 무관)
-    double cameraAspect = (9 / 16); // 기본값
-    if (!_useMockCamera &&
-        _cameraController != null &&
-        _cameraController!.value.isInitialized) {
-      final actualRatio = _cameraController!.value.aspectRatio;
-      if (actualRatio > 0) {
-        cameraAspect = actualRatio;
-        debugPrint(
-          '[Petgram] 📐 _calculateCameraPreviewDimensions: 실제 카메라 비율 사용 - $cameraAspect (${(1 / cameraAspect).toStringAsFixed(3)}:1)',
-        );
-      } else {
-        debugPrint(
-          '[Petgram] ⚠️ _calculateCameraPreviewDimensions: 카메라 비율이 0이거나 유효하지 않음, 기본값 사용',
-        );
-      }
-    } else {
-      debugPrint(
-        '[Petgram] 📐 _calculateCameraPreviewDimensions: 목업 모드 또는 카메라 미초기화, 기본값 사용',
-      );
-    }
-
-    // 카메라 비율에 맞는 프리뷰 크기 계산
-    // cameraAspect는 width/height 비율 (가로/세로)
     final double screenH = screenSize.height;
+
+    // 타겟 비율 계산 (1:1, 3:4, 9:16)
+    final double targetRatio = aspectRatioOf(_aspectMode);
+
+    // 프리뷰 박스 크기 계산 (targetRatio 기반)
     double previewW;
     double previewH;
 
-    if (cameraAspect > 1.0) {
+    if (targetRatio > 1.0) {
       // 가로가 더 긴 비율: 가로를 기준으로 계산
       previewW = screenW;
-      previewH = previewW / cameraAspect;
+      previewH = previewW / targetRatio;
 
       if (previewH > screenH) {
         previewH = screenH;
-        previewW = previewH * cameraAspect;
+        previewW = previewH * targetRatio;
+      }
+    } else if (targetRatio < 1.0) {
+      // 세로가 더 긴 비율 (3:4 등): 가로를 기준으로 계산
+      previewW = screenW;
+      previewH = previewW / targetRatio;
+
+      if (previewH > screenH) {
+        previewH = screenH;
+        previewW = previewH * targetRatio;
       }
     } else {
-      // 세로가 더 긴 비율: 세로를 기준으로 계산
-      previewH = screenH;
-      previewW = previewH * cameraAspect;
+      // 1:1 비율: 가로를 기준으로 계산
+      previewW = screenW;
+      previewH = previewW;
 
-      if (previewW > screenW) {
-        previewW = screenW;
-        previewH = previewW / cameraAspect;
+      if (previewH > screenH) {
+        previewH = screenH;
+        previewW = previewH;
       }
     }
 
-    debugPrint(
-      '[Petgram] 📐 _calculateCameraPreviewDimensions: cameraAspect=$cameraAspect (${cameraAspect > 1.0 ? "가로>세로" : "세로>가로"}), preview=$previewW x $previewH, screen=$screenW x $screenH',
-    );
-
-    // 2단계: 오버레이(9:16, 3:4, 1:1)는 "카메라 프리뷰 박스 기준"으로 다시 계산
-    final double targetRatio = aspectRatioOf(_aspectMode);
-    final double targetH = previewW / targetRatio;
-
+    // 오버레이는 더 이상 필요 없음 (프리뷰 박스가 이미 targetRatio를 따름)
+    // 하지만 기존 코드 호환성을 위해 0으로 설정
     double overlayTop = 0;
     double overlayBottom = 0;
-
-    if (targetH < previewH) {
-      // 비율이 더 넓은 경우 (예: 1:1, 3:4) - 상하단에 오버레이
-      overlayTop = (previewH - targetH) / 2;
-      overlayBottom = (previewH - targetH) / 2;
-    }
-    // 비율이 더 긴 경우 (예: 9:16) - 상하단 오버레이 없음 (전체 사용)
-
-    // 9:16 모드 기준 오버레이 높이 계산 (상하단 바 고정 위치용)
-    final double nineSixteenRatio = aspectRatioOf(AspectRatioMode.nineSixteen);
-    final double nineSixteenTargetH = previewW / nineSixteenRatio;
     double nineSixteenOverlayTop = 0;
     double nineSixteenOverlayBottom = 0;
 
-    if (nineSixteenTargetH < previewH) {
-      nineSixteenOverlayTop = (previewH - nineSixteenTargetH) / 2;
-      nineSixteenOverlayBottom = (previewH - nineSixteenTargetH) / 2;
-    }
-
     debugPrint(
-      '[Petgram] 📐 카메라 프리뷰 계산: cameraAspect=$cameraAspect, preview=$previewW x $previewH, targetRatio=$targetRatio, targetH=$targetH, overlayTop=$overlayTop, overlayBottom=$overlayBottom',
+      '[Petgram] 📐 _calculateCameraPreviewDimensions: targetRatio=$targetRatio, preview=$previewW x $previewH, screen=$screenW x $screenH',
     );
 
     return {
@@ -2758,9 +2695,10 @@ class _HomePageState extends State<HomePage> {
       'previewH': previewH,
       'overlayTop': overlayTop,
       'overlayBottom': overlayBottom,
-      'cameraAspect': cameraAspect,
       'nineSixteenOverlayTop': nineSixteenOverlayTop,
       'nineSixteenOverlayBottom': nineSixteenOverlayBottom,
+      'offsetX': (screenW - previewW) / 2,
+      'offsetY': (screenH - previewH) / 2,
     };
   }
 
@@ -2778,78 +2716,75 @@ class _HomePageState extends State<HomePage> {
         final double safeAreaTop = mediaQuery.padding.top;
         final double safeAreaBottom = mediaQuery.padding.bottom;
 
-        // 카메라 실제 비율 가져오기
-        // 카메라 실제 비율 가져오기
-        double cameraAspectRatio = (9 / 16); // 기본값
+        // sensorRatio 계산 (previewSize 기준)
+        double sensorRatio = 16.0 / 9.0; // 기본값
+        Size? rawPreviewSize;
         if (!_useMockCamera &&
             _cameraController != null &&
             _cameraController!.value.isInitialized) {
-          final actualRatio = _cameraController!.value.aspectRatio;
-          if (actualRatio > 0) {
-            cameraAspectRatio = actualRatio;
+          rawPreviewSize = _cameraController!.value.previewSize;
+          if (rawPreviewSize != null) {
+            sensorRatio =
+                math.max(rawPreviewSize.width, rawPreviewSize.height) /
+                math.min(rawPreviewSize.width, rawPreviewSize.height);
           }
         }
 
-        // 카메라 비율에 맞는 실제 프리뷰 크기 계산 (가로 기준)
-        // 카메라 비율에 맞는 실제 프리뷰 크기 계산
-        // cameraAspectRatio는 width/height 비율 (가로/세로)
-        double actualPreviewW;
-        double actualPreviewH;
+        // 타겟 비율 계산 (1:1, 3:4, 9:16)
+        final double targetRatio = aspectRatioOf(_aspectMode);
 
-        if (cameraAspectRatio > 1.0) {
+        // 프리뷰 박스 크기 계산 (targetRatio 기반)
+        double previewBoxW;
+        double previewBoxH;
+
+        if (targetRatio > 1.0) {
           // 가로가 더 긴 비율: 가로를 기준으로 계산
-          actualPreviewW = maxWidth;
-          actualPreviewH = actualPreviewW / cameraAspectRatio;
+          previewBoxW = maxWidth;
+          previewBoxH = previewBoxW / targetRatio;
 
-          if (actualPreviewH > maxHeight) {
-            actualPreviewH = maxHeight;
-            actualPreviewW = actualPreviewH * cameraAspectRatio;
+          if (previewBoxH > maxHeight) {
+            previewBoxH = maxHeight;
+            previewBoxW = previewBoxH * targetRatio;
+          }
+        } else if (targetRatio < 1.0) {
+          // 세로가 더 긴 비율 (3:4 등): 가로를 기준으로 계산
+          previewBoxW = maxWidth;
+          previewBoxH = previewBoxW / targetRatio;
+
+          if (previewBoxH > maxHeight) {
+            previewBoxH = maxHeight;
+            previewBoxW = previewBoxH * targetRatio;
           }
         } else {
-          // 세로가 더 긴 비율: 세로를 기준으로 계산
-          actualPreviewH = maxHeight;
-          actualPreviewW = actualPreviewH * cameraAspectRatio;
+          // 1:1 비율: 가로를 기준으로 계산
+          previewBoxW = maxWidth;
+          previewBoxH = previewBoxW;
 
-          if (actualPreviewW > maxWidth) {
-            actualPreviewW = maxWidth;
-            actualPreviewH = actualPreviewW / cameraAspectRatio;
+          if (previewBoxH > maxHeight) {
+            previewBoxH = maxHeight;
+            previewBoxW = previewBoxH;
           }
         }
 
+        // 호환성을 위해 actualPreviewW/H 사용 (previewBox와 동일)
+        final double actualPreviewW = previewBoxW;
+        final double actualPreviewH = previewBoxH;
+
         debugPrint(
-          '[Petgram] 📐 _buildAspectRatioOverlay 프리뷰 크기: cameraAspectRatio=$cameraAspectRatio (${cameraAspectRatio > 1.0 ? "가로>세로" : "세로>가로"}), actualPreview=$actualPreviewW x $actualPreviewH, maxSize=$maxWidth x $maxHeight',
+          '[Petgram] 📐 _buildAspectRatioOverlay 프리뷰 크기: sensorRatio=$sensorRatio, targetRatio=$targetRatio, previewBox=$actualPreviewW x $actualPreviewH, maxSize=$maxWidth x $maxHeight',
         );
 
         // 중앙 정렬을 위한 오프셋
+        final double offsetX = (maxWidth - actualPreviewW) / 2;
         final double offsetY = (maxHeight - actualPreviewH) / 2;
 
-        // 타겟 비율 계산 (1:1, 3:4, 9:16) - 가로 기준으로 높이 계산
-        final double targetRatio = aspectRatioOf(_aspectMode);
-        double targetH;
-
-        if (_aspectMode == AspectRatioMode.oneOne) {
-          // 1:1 비율: 가로와 세로 중 작은 쪽을 기준
-          if (actualPreviewW < actualPreviewH) {
-            targetH = actualPreviewW;
-          } else {
-            targetH = actualPreviewH;
-          }
-        } else {
-          // 3:4, 9:16 비율: 가로를 기준으로 세로 계산
-          targetH = actualPreviewW / targetRatio;
-        }
-
-        // 중앙 기준으로 오버레이 계산
+        // 오버레이는 더 이상 필요 없음 (프리뷰 박스가 이미 targetRatio를 따름)
+        // 하지만 기존 코드 호환성을 위해 0으로 설정
         double actualOverlayTop = 0;
         double actualOverlayBottom = 0;
 
-        if (targetH < actualPreviewH) {
-          actualOverlayTop = (actualPreviewH - targetH) / 2;
-          actualOverlayBottom = (actualPreviewH - targetH) / 2;
-        }
-
         debugPrint(
-          '[Petgram] 🔍 AspectRatioOverlay: maxSize=$maxWidth x $maxHeight, actualPreview=$actualPreviewW x $actualPreviewH, targetRatio=$targetRatio, targetH=$targetH, overlayTop=$actualOverlayTop, overlayBottom=$actualOverlayBottom, offsetY=$offsetY, safeAreaTop=$safeAreaTop, safeAreaBottom=$safeAreaBottom',
+          '[Petgram] 🔍 AspectRatioOverlay: maxSize=$maxWidth x $maxHeight, actualPreview=$actualPreviewW x $actualPreviewH, targetRatio=$targetRatio, overlayTop=$actualOverlayTop, overlayBottom=$actualOverlayBottom, offsetY=$offsetY, safeAreaTop=$safeAreaTop, safeAreaBottom=$safeAreaBottom',
         );
 
         // 오버레이는 constraints 전체를 기준으로 배치하되, SafeArea까지 확장
@@ -3030,32 +2965,23 @@ class _HomePageState extends State<HomePage> {
         'focus_${_focusPointRelative!.dx}_${_focusPointRelative!.dy}_$_showFocusIndicator',
       ),
       builder: (context) {
-        // 카메라 실제 비율 기준으로 프리뷰 박스 및 오버레이 계산
+        // 프리뷰 박스 크기 및 오프셋 계산
         final previewDims = _calculateCameraPreviewDimensions();
         final double previewW = previewDims['previewW']!;
         final double previewH = previewDims['previewH']!;
-        final double overlayTop = previewDims['overlayTop']!;
-        final double overlayBottom = previewDims['overlayBottom']!;
+        final double offsetX = previewDims['offsetX']!;
+        final double offsetY = previewDims['offsetY']!;
 
-        // 카메라 프리뷰 박스가 화면보다 높을 수 있으므로 오프셋 고려
-        final screenSize = MediaQuery.of(context).size;
-        final double screenH = screenSize.height;
-        final double previewOffsetY = previewH > screenH
-            ? (screenH - previewH) / 2
-            : 0;
+        // previewBox 내부 로컬 좌표로 변환 (정규화된 좌표를 previewBox 좌표로)
+        final double focusXInPreviewBox = previewW * _focusPointRelative!.dx;
+        final double focusYInPreviewBox = previewH * _focusPointRelative!.dy;
 
-        // 실제 프리뷰 영역 기준으로 위치 계산 (_handleTapFocus와 동일)
-        final double actualPreviewHeight =
-            previewH - overlayTop - overlayBottom;
-        final double focusX = previewW * _focusPointRelative!.dx - 50;
-        final double focusY =
-            previewOffsetY +
-            overlayTop +
-            (actualPreviewHeight * _focusPointRelative!.dy) -
-            50;
+        // 화면 좌표로 변환 (Positioned는 Stack 기준이므로 offset 추가)
+        final double focusX = offsetX + focusXInPreviewBox - 50;
+        final double focusY = offsetY + focusYInPreviewBox - 50;
 
         debugPrint(
-          '[Petgram] 🔍 Focus indicator: preview=$previewW x $previewH, overlayTop=$overlayTop, overlayBottom=$overlayBottom, previewOffsetY=$previewOffsetY',
+          '[Petgram] 🔍 Focus indicator: preview=$previewW x $previewH, offset=($offsetX, $offsetY), focusInPreviewBox=($focusXInPreviewBox, $focusYInPreviewBox)',
         );
         debugPrint(
           '[Petgram] 🔍 Focus position: relative=${_focusPointRelative}, absolute=($focusX, $focusY)',
@@ -3070,9 +2996,10 @@ class _HomePageState extends State<HomePage> {
         final double centerSize = 48.0;
         final double dotSize = 6.0;
 
+        final screenSize = MediaQuery.of(context).size;
         return Positioned(
-          left: focusX.clamp(0.0, previewW - indicatorSize),
-          top: focusY.clamp(0.0, screenH - indicatorSize),
+          left: focusX.clamp(0.0, screenSize.width - indicatorSize),
+          top: focusY.clamp(0.0, screenSize.height - indicatorSize),
           child: IgnorePointer(
             ignoring: true,
             child: _showFocusIndicator
@@ -3160,22 +3087,15 @@ class _HomePageState extends State<HomePage> {
 
     debugPrint('[Petgram] 🔍 자동 초점 설정: 화면 중앙 ($centerPoint)');
 
-    // 초점 표시기를 먼저 표시 (화면 중앙)
-    if (mounted) {
-      setState(() {
-        _focusPointRelative = centerPoint;
-        _showFocusIndicator = true;
-      });
-    }
-
-    // 카메라에 초점 설정
+    // 카메라에 초점 설정 (자동 초점이므로 UI 표시하지 않음)
     try {
       await _cameraController!.setFocusPoint(centerPoint);
       debugPrint('[Petgram] ✅ 자동 초점 설정 완료 (화면 중앙)');
 
-      // 초점 설정 성공 시 자동 초점 표시기도 표시
+      // 초점 설정 성공 시 자동 초점 표시기만 표시 (수동 터치 초점과 구분)
       if (mounted) {
         setState(() {
+          _focusPointRelative = centerPoint;
           _showAutoFocusIndicator = true;
         });
         // 1.5초 후 자동 초점 표시기 숨기기
@@ -3190,15 +3110,6 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       debugPrint('[Petgram] ❌ 자동 초점 설정 실패: $e');
     }
-
-    // 1.5초 후 초점 표시기 숨기기
-    Future.delayed(const Duration(milliseconds: 1500), () {
-      if (mounted) {
-        setState(() {
-          _showFocusIndicator = false;
-        });
-      }
-    });
   }
 
   /// 탭 포커스 핸들러 (위치 기반)
@@ -3244,48 +3155,142 @@ class _HomePageState extends State<HomePage> {
     // 전체 화면 기준 로컬 좌표
     final Offset localPoint = gestureBox.globalToLocal(globalPos);
 
-    // 카메라 실제 비율 기준으로 프리뷰 박스 및 오버레이 계산
-    final previewDims = _calculateCameraPreviewDimensions();
-    final double previewW = previewDims['previewW']!;
-    final double previewH = previewDims['previewH']!;
-    final double overlayTop = previewDims['overlayTop']!;
-    final double overlayBottom = previewDims['overlayBottom']!;
-
-    // 카메라 프리뷰 박스가 화면보다 높을 수 있으므로 오프셋 고려
+    // _buildCameraStack과 동일한 로직으로 프리뷰 박스 크기 계산
     final screenSize = MediaQuery.of(context).size;
-    final double screenH = screenSize.height;
-    final double previewOffsetY = previewH > screenH
-        ? (screenH - previewH) / 2
-        : 0;
+    final double maxWidth = screenSize.width;
+    final double maxHeight = screenSize.height;
 
-    debugPrint(
-      '[Petgram] Tap: local=$localPoint, preview=$previewW x $previewH, overlayTop=$overlayTop, overlayBottom=$overlayBottom, previewOffsetY=$previewOffsetY',
-    );
+    // 프리뷰 박스 크기는 _aspectMode의 targetRatio를 기준으로 계산
+    final double targetRatio = aspectRatioOf(_aspectMode);
 
-    // 탭한 위치가 실제 프리뷰 영역 안에 있는지 확인 (오프셋 고려)
-    final double adjustedY = localPoint.dy - previewOffsetY;
-    // 오버레이 영역을 클릭해도 초점 표시는 프리뷰 영역 내에 표시되도록 클램프
-    final double clampedAdjustedY = adjustedY.clamp(
-      overlayTop,
-      previewH - overlayBottom,
-    );
+    // 프리뷰 박스 크기 계산 (targetRatio 기반)
+    double previewBoxW;
+    double previewBoxH;
 
-    // 오버레이 영역 클릭 시에도 초점 표시는 표시하되, 프리뷰 영역 내에 클램프
-    if (adjustedY < overlayTop || adjustedY > previewH - overlayBottom) {
-      debugPrint('[Petgram] Tap in overlay area, clamping to preview area');
-      // 오버레이 영역이어도 초점 표시는 계속 진행 (클램프된 위치 사용)
+    if (targetRatio > 1.0) {
+      // 가로가 더 긴 비율: 가로를 기준으로 계산
+      previewBoxW = maxWidth;
+      previewBoxH = previewBoxW / targetRatio;
+
+      if (previewBoxH > maxHeight) {
+        previewBoxH = maxHeight;
+        previewBoxW = previewBoxH * targetRatio;
+      }
+    } else if (targetRatio < 1.0) {
+      // 세로가 더 긴 비율 (3:4 등): 가로를 기준으로 계산 (고정)
+      previewBoxW = maxWidth;
+      previewBoxH = previewBoxW / targetRatio;
+
+      if (previewBoxH > maxHeight) {
+        previewBoxH = maxHeight;
+        previewBoxW = previewBoxH * targetRatio;
+      }
+    } else {
+      // 1:1 비율: 가로를 기준으로 계산 (고정)
+      previewBoxW = maxWidth;
+      previewBoxH = previewBoxW; // 1:1이므로 같음
+
+      if (previewBoxH > maxHeight) {
+        previewBoxH = maxHeight;
+        previewBoxW = previewBoxH; // 1:1이므로 같음
+      }
     }
 
-    // 실제 프리뷰 영역 기준으로 상대 좌표 계산
-    final double actualPreviewHeight = previewH - overlayTop - overlayBottom;
-    final double relativeY =
-        (clampedAdjustedY - overlayTop) / actualPreviewHeight;
-    final double relativeX = localPoint.dx / previewW;
+    // 중앙 정렬을 위한 오프셋
+    final double offsetX = (maxWidth - previewBoxW) / 2;
+    final double offsetY = (maxHeight - previewBoxH) / 2;
+
+    // sensorRatio 계산 (previewSize 기준)
+    double sensorRatio = 16.0 / 9.0; // 기본값 (세로가 긴 경우)
+    Size? rawPreviewSize;
+    if (!_useMockCamera &&
+        _cameraController != null &&
+        _cameraController!.value.isInitialized) {
+      rawPreviewSize = _cameraController!.value.previewSize;
+      if (rawPreviewSize != null) {
+        sensorRatio =
+            math.max(rawPreviewSize.width, rawPreviewSize.height) /
+            math.min(rawPreviewSize.width, rawPreviewSize.height);
+      }
+    }
+
+    // 터치 좌표를 프리뷰 박스 기준으로 변환 (previewBox 내부 로컬 좌표)
+    final double tapXInPreviewBox = localPoint.dx - offsetX;
+    final double tapYInPreviewBox = localPoint.dy - offsetY;
+
+    // 프리뷰 박스 영역 밖이면 무시
+    if (tapXInPreviewBox < 0 ||
+        tapXInPreviewBox > previewBoxW ||
+        tapYInPreviewBox < 0 ||
+        tapYInPreviewBox > previewBoxH) {
+      debugPrint(
+        '[Petgram] 🔍 Tap outside preview box: ($tapXInPreviewBox, $tapYInPreviewBox)',
+      );
+      return;
+    }
+
+    // normalize된 sensorRatio 기준으로 상대 좌표 계산 (0.0~1.0)
+    // previewBox 내부 로컬 좌표를 센서 좌표계로 변환
+    double relativeX;
+    double relativeY;
+
+    if (rawPreviewSize != null) {
+      // FittedBox 내부의 SizedBox 크기 계산 (_buildCameraStack과 동일한 로직)
+      double contentW;
+      double contentH;
+
+      if (rawPreviewSize.width >= rawPreviewSize.height) {
+        // 가로가 큰 경우
+        contentH = previewBoxH;
+        contentW = previewBoxH * sensorRatio;
+      } else {
+        // 세로가 큰 경우
+        contentW = previewBoxH;
+        contentH = previewBoxH / sensorRatio;
+      }
+
+      // FittedBox(BoxFit.cover)는 content를 previewBox에 맞추기 위해 스케일링
+      // previewBox 내부 좌표를 content 좌표계로 변환
+      final double contentRatio = contentW / contentH;
+      final double previewBoxRatio = previewBoxW / previewBoxH;
+
+      double scaledContentW;
+      double scaledContentH;
+      double contentOffsetX = 0;
+      double contentOffsetY = 0;
+
+      if (contentRatio > previewBoxRatio) {
+        // content가 더 넓음: 높이를 기준으로 스케일링
+        scaledContentH = previewBoxH;
+        scaledContentW = scaledContentH * contentRatio;
+        contentOffsetX = (previewBoxW - scaledContentW) / 2;
+      } else {
+        // content가 더 좁음: 너비를 기준으로 스케일링
+        scaledContentW = previewBoxW;
+        scaledContentH = scaledContentW / contentRatio;
+        contentOffsetY = (previewBoxH - scaledContentH) / 2;
+      }
+
+      // previewBox 내부 좌표를 content 좌표계로 변환
+      final double contentX = tapXInPreviewBox - contentOffsetX;
+      final double contentY = tapYInPreviewBox - contentOffsetY;
+
+      // content 좌표를 rawPreviewSize 기준으로 정규화 (0.0~1.0)
+      relativeX = (contentX / scaledContentW).clamp(0.0, 1.0);
+      relativeY = (contentY / scaledContentH).clamp(0.0, 1.0);
+    } else {
+      // rawPreviewSize가 없으면 previewBox 기준으로 정규화
+      relativeX = (tapXInPreviewBox / previewBoxW).clamp(0.0, 1.0);
+      relativeY = (tapYInPreviewBox / previewBoxH).clamp(0.0, 1.0);
+    }
 
     // 상대 좌표를 0.0~1.0 범위로 클램프
     final double clampedX = relativeX.clamp(0.0, 1.0);
     final double clampedY = relativeY.clamp(0.0, 1.0);
 
+    debugPrint(
+      '[Petgram] 🔍 Tap: screen=(${localPoint.dx}, ${localPoint.dy}), previewBox=($tapXInPreviewBox, $tapYInPreviewBox), relative=($clampedX, $clampedY), sensorRatio=$sensorRatio',
+    );
     debugPrint('[Petgram] 🔍 Focus point calculated: ($clampedX, $clampedY)');
     debugPrint(
       '[Petgram] 🔍 Setting focus indicator: show=true, point=($clampedX, $clampedY)',
@@ -3392,21 +3397,19 @@ class _HomePageState extends State<HomePage> {
   }) {
     return Builder(
       builder: (context) {
-        // 카메라 실제 비율 가져오기
-        // mockup 모드일 때도 실제 카메라처럼 9:16 비율 사용 (mockup 이미지 비율과 무관)
-        double cameraAspectRatio = (9 / 16); // 기본값
+        // sensorRatio 계산 (previewSize 기준)
+        double sensorRatio = 16.0 / 9.0; // 기본값
+        Size? rawPreviewSize;
         if (!_useMockCamera &&
             _cameraController != null &&
             _cameraController!.value.isInitialized) {
-          final actualRatio = _cameraController!.value.aspectRatio;
-          if (actualRatio > 0) {
-            cameraAspectRatio = actualRatio;
+          rawPreviewSize = _cameraController!.value.previewSize;
+          if (rawPreviewSize != null) {
+            sensorRatio =
+                math.max(rawPreviewSize.width, rawPreviewSize.height) /
+                math.min(rawPreviewSize.width, rawPreviewSize.height);
             debugPrint(
-              '[Petgram] 📐 _buildCameraStack: 실제 카메라 비율 사용 - $cameraAspectRatio (${(1 / cameraAspectRatio).toStringAsFixed(3)}:1)',
-            );
-          } else {
-            debugPrint(
-              '[Petgram] ⚠️ _buildCameraStack: 카메라 비율이 0이거나 유효하지 않음, 기본값 사용',
+              '[Petgram] 📐 _buildCameraStack: sensorRatio=$sensorRatio, rawPreviewSize=${rawPreviewSize.width}x${rawPreviewSize.height}',
             );
           }
         } else {
@@ -3442,20 +3445,20 @@ class _HomePageState extends State<HomePage> {
                   previewBoxW = previewBoxH * targetRatio;
                 }
               } else if (targetRatio < 1.0) {
-                // 세로가 더 긴 비율 (3:4 등): 세로를 기준으로 계산
-                previewBoxH = maxHeight;
-                previewBoxW = previewBoxH * targetRatio;
+                // 세로가 더 긴 비율 (3:4 등): 가로를 기준으로 계산 (고정)
+                previewBoxW = maxWidth;
+                previewBoxH = previewBoxW / targetRatio;
 
-                if (previewBoxW > maxWidth) {
-                  previewBoxW = maxWidth;
-                  previewBoxH = previewBoxW / targetRatio;
+                if (previewBoxH > maxHeight) {
+                  previewBoxH = maxHeight;
+                  previewBoxW = previewBoxH * targetRatio;
                 }
               } else {
-                // 1:1 비율: 가로와 세로 중 작은 쪽을 기준
-                if (maxWidth < maxHeight) {
-                  previewBoxW = maxWidth;
-                  previewBoxH = previewBoxW; // 1:1이므로 같음
-                } else {
+                // 1:1 비율: 가로를 기준으로 계산 (고정)
+                previewBoxW = maxWidth;
+                previewBoxH = previewBoxW; // 1:1이므로 같음
+
+                if (previewBoxH > maxHeight) {
                   previewBoxH = maxHeight;
                   previewBoxW = previewBoxH; // 1:1이므로 같음
                 }
@@ -3465,9 +3468,23 @@ class _HomePageState extends State<HomePage> {
               final double offsetX = (maxWidth - previewBoxW) / 2;
               final double offsetY = (maxHeight - previewBoxH) / 2;
 
+              // sensorRatio 계산 (previewSize 기준)
+              double sensorRatio = 16.0 / 9.0; // 기본값 (세로가 긴 경우)
+              Size? rawPreviewSize;
+              if (!_useMockCamera &&
+                  _cameraController != null &&
+                  _cameraController!.value.isInitialized) {
+                rawPreviewSize = _cameraController!.value.previewSize;
+                if (rawPreviewSize != null) {
+                  sensorRatio =
+                      math.max(rawPreviewSize.width, rawPreviewSize.height) /
+                      math.min(rawPreviewSize.width, rawPreviewSize.height);
+                }
+              }
+
               // 디버그 로그
               debugPrint(
-                '[Petgram] 📐 preview layout - cameraAspectRatio=$cameraAspectRatio, targetRatio=$targetRatio, box=${previewBoxW}x${previewBoxH}',
+                '[Petgram] 📐 preview layout - sensorRatio=$sensorRatio, targetRatio=$targetRatio, box=${previewBoxW}x${previewBoxH}, rawPreviewSize=${rawPreviewSize?.width}x${rawPreviewSize?.height}',
               );
 
               // 오버레이 계산은 더 이상 필요 없음 (프리뷰 박스가 이미 targetRatio를 따름)
@@ -3497,7 +3514,7 @@ class _HomePageState extends State<HomePage> {
                     child: Container(color: const Color(0xFFFFF0F5)),
                   ),
                   // 카메라 프리뷰 중앙 배치
-                  // 프리뷰 박스는 targetRatio 기반, 내부 카메라 콘텐츠는 cameraAspectRatio 유지
+                  // 프리뷰 박스는 targetRatio 기반, 내부 카메라 콘텐츠는 sensorRatio 유지
                   Positioned(
                     left: offsetX,
                     top: offsetY,
@@ -3506,104 +3523,150 @@ class _HomePageState extends State<HomePage> {
                     child: ClipRect(
                       child: FittedBox(
                         fit: BoxFit.cover, // 비율 유지한 채 박스 꽉 채우기 (크롭 허용)
-                        child: SizedBox(
-                          // 카메라 비율을 정확히 유지하기 위한 SizedBox
-                          // cameraAspectRatio는 width/height 비율
-                          width: previewBoxH * cameraAspectRatio,
-                          height: previewBoxH,
-                          child: AspectRatio(
-                            aspectRatio:
-                                cameraAspectRatio, // 실제 카메라 비율 사용 (왜곡 방지)
-                            child: Stack(
-                              key: ValueKey(
-                                'camera_stack_${_aspectMode}_${_brightnessValue}_${_showFocusIndicator}',
-                              ),
-                              fit: StackFit.expand,
-                              clipBehavior: Clip.hardEdge,
-                              children: [
-                                // 1. 카메라 프리뷰 또는 초기화 중 표시
-                                Positioned.fill(
-                                  child: RepaintBoundary(
-                                    key: ValueKey('camera_preview'),
-                                    child: Builder(
-                                      builder: (context) {
-                                        debugPrint(
-                                          '[Petgram] 🎥 Rendering preview: isCameraInitializing=$isCameraInitializing, canUseCamera=$canUseCamera',
-                                        );
-                                        if (isCameraInitializing &&
-                                            canUseCamera) {
-                                          debugPrint(
-                                            '[Petgram] ⏳ Showing loading indicator',
-                                          );
-                                          return Container(
-                                            color: Colors.black,
-                                            child: const Center(
-                                              child: CircularProgressIndicator(
-                                                color: kMainPink,
-                                              ),
-                                            ),
-                                          );
-                                        } else {
-                                          debugPrint(
-                                            '[Petgram] 📷 Showing camera/mock preview',
-                                          );
-                                          // 필터와 밝기 적용
-                                          Widget preview =
-                                              _buildFilteredWidgetLive(
-                                                filter,
-                                                source,
-                                              );
-                                          // UI 줌 적용 (FilterPage처럼)
-                                          if (_uiZoomScale != 1.0 ||
-                                              _zoomOffset != Offset.zero) {
-                                            preview = Transform.scale(
-                                              scale: _uiZoomScale,
-                                              child: Transform.translate(
-                                                offset: _zoomOffset,
-                                                child: preview,
-                                              ),
+                        alignment: Alignment.center,
+                        child: Builder(
+                          builder: (context) {
+                            // sensorRatio와 previewBoxW/previewBoxH를 비교하여 SizedBox 크기 계산
+                            double contentW;
+                            double contentH;
+
+                            // previewBox의 비율
+                            final double previewBoxRatio =
+                                previewBoxW / previewBoxH;
+
+                            // 센서의 실제 비율 계산
+                            // 목업도 같은 경로를 타므로 동일한 로직 사용
+                            // 나중에 필요하면 목업만 BoxFit.contain으로 분리 가능
+                            double sensorAspectRatio;
+                            if (rawPreviewSize != null) {
+                              // 센서의 실제 비율 (width/height)
+                              sensorAspectRatio =
+                                  rawPreviewSize.width / rawPreviewSize.height;
+                            } else {
+                              // 기본값: 세로가 긴 경우 (9:16)
+                              // 목업 이미지의 실제 비율을 가져와서 사용할 수도 있음
+                              sensorAspectRatio = 9.0 / 16.0;
+                            }
+
+                            // 센서 비율과 previewBox 비율 비교
+                            if (sensorAspectRatio > previewBoxRatio) {
+                              // 센서가 더 넓음: 높이를 previewBoxH에 맞추고 너비 계산
+                              contentH = previewBoxH;
+                              contentW = previewBoxH * sensorAspectRatio;
+                            } else {
+                              // 센서가 더 좁음: 너비를 previewBoxW에 맞추고 높이 계산
+                              contentW = previewBoxW;
+                              contentH = previewBoxW / sensorAspectRatio;
+                            }
+
+                            // AspectRatio는 센서의 실제 비율 사용
+                            final double aspectRatioForAspectRatioWidget =
+                                sensorAspectRatio;
+
+                            debugPrint(
+                              '[Petgram] 📐 Camera content: ${contentW}x${contentH}, sensorAspectRatio=$sensorAspectRatio, previewBoxRatio=$previewBoxRatio, aspectRatio=$aspectRatioForAspectRatioWidget',
+                            );
+
+                            return SizedBox(
+                              width: contentW,
+                              height: contentH,
+                              child: AspectRatio(
+                                aspectRatio: aspectRatioForAspectRatioWidget,
+                                child: Stack(
+                                  key: ValueKey(
+                                    'camera_stack_${_aspectMode}_${_brightnessValue}_${_showFocusIndicator}',
+                                  ),
+                                  fit: StackFit.expand,
+                                  clipBehavior: Clip.hardEdge,
+                                  children: [
+                                    // 1. 카메라 프리뷰 또는 초기화 중 표시
+                                    Positioned.fill(
+                                      child: RepaintBoundary(
+                                        key: ValueKey('camera_preview'),
+                                        child: Builder(
+                                          builder: (context) {
+                                            debugPrint(
+                                              '[Petgram] 🎥 Rendering preview: isCameraInitializing=$isCameraInitializing, canUseCamera=$canUseCamera',
                                             );
-                                          }
-                                          return preview;
-                                        }
-                                      },
-                                    ),
-                                  ),
-                                ),
-                                // 2. 격자 라인 오버레이 (프리뷰 박스 전체에 표시)
-                                if (_showGridLines)
-                                  Positioned.fill(
-                                    key: ValueKey('grid_lines_${_aspectMode}'),
-                                    child: _buildGridLines(
-                                      previewBoxW,
-                                      previewBoxH,
-                                      frameTopOffset,
-                                    ),
-                                  ),
-                                // 3. 프레임 오버레이 (프리뷰 박스 기준)
-                                if (_frameEnabled && _petList.isNotEmpty)
-                                  Positioned.fill(
-                                    key: ValueKey('frame_overlay'),
-                                    child: IgnorePointer(
-                                      ignoring: true,
-                                      child: _buildFramePreviewOverlay(
-                                        maxWidth, // 전체 화면 너비
-                                        maxHeight, // 전체 화면 높이
-                                        frameTopOffset,
-                                        offsetY, // 프리뷰 박스 상단 (화면 기준)
-                                        offsetY +
-                                            previewBoxH, // 프리뷰 박스 하단 (화면 기준)
-                                        previewBoxW,
-                                        previewBoxH,
-                                        offsetX,
-                                        offsetY,
+                                            if (isCameraInitializing &&
+                                                canUseCamera) {
+                                              debugPrint(
+                                                '[Petgram] ⏳ Showing loading indicator',
+                                              );
+                                              return Container(
+                                                color: Colors.black,
+                                                child: const Center(
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        color: kMainPink,
+                                                      ),
+                                                ),
+                                              );
+                                            } else {
+                                              debugPrint(
+                                                '[Petgram] 📷 Showing camera/mock preview',
+                                              );
+                                              // 필터와 밝기 적용
+                                              Widget preview =
+                                                  _buildFilteredWidgetLive(
+                                                    filter,
+                                                    source,
+                                                  );
+                                              // UI 줌 적용 (FilterPage처럼)
+                                              if (_uiZoomScale != 1.0 ||
+                                                  _zoomOffset != Offset.zero) {
+                                                preview = Transform.scale(
+                                                  scale: _uiZoomScale,
+                                                  child: Transform.translate(
+                                                    offset: _zoomOffset,
+                                                    child: preview,
+                                                  ),
+                                                );
+                                              }
+                                              return preview;
+                                            }
+                                          },
+                                        ),
                                       ),
                                     ),
-                                  ),
-                              ],
-                            ), // Stack 닫기
-                          ), // AspectRatio 닫기
-                        ), // SizedBox 닫기
+                                    // 2. 격자 라인 오버레이 (프리뷰 박스 전체에 표시)
+                                    if (_showGridLines)
+                                      Positioned.fill(
+                                        key: ValueKey(
+                                          'grid_lines_${_aspectMode}',
+                                        ),
+                                        child: _buildGridLines(
+                                          previewBoxW,
+                                          previewBoxH,
+                                          frameTopOffset,
+                                        ),
+                                      ),
+                                    // 3. 프레임 오버레이 (프리뷰 박스 기준)
+                                    if (_frameEnabled && _petList.isNotEmpty)
+                                      Positioned.fill(
+                                        key: ValueKey('frame_overlay'),
+                                        child: IgnorePointer(
+                                          ignoring: true,
+                                          child: _buildFramePreviewOverlay(
+                                            maxWidth, // 전체 화면 너비
+                                            maxHeight, // 전체 화면 높이
+                                            frameTopOffset,
+                                            offsetY, // 프리뷰 박스 상단 (화면 기준)
+                                            offsetY +
+                                                previewBoxH, // 프리뷰 박스 하단 (화면 기준)
+                                            previewBoxW,
+                                            previewBoxH,
+                                            offsetX,
+                                            offsetY,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ), // Stack 닫기
+                              ), // AspectRatio 닫기
+                            ); // SizedBox 닫기 (return 문 종료)
+                          }, // builder function 닫기
+                        ), // Builder 닫기
                       ), // FittedBox 닫기
                     ), // ClipRect 닫기
                   ), // Positioned 닫기
@@ -3734,42 +3797,16 @@ class _HomePageState extends State<HomePage> {
     // 촬영본에서: overlayTop / imageHeight = normalizedTop
     // 프리뷰에서: normalizedTop * previewHeight = topBarHeight
 
-    // 1. 촬영본과 동일한 방식으로 overlayTop 계산 (가상의 이미지 크기 기준)
-    // 프리뷰 박스는 이미 targetRatio에 맞춰져 있으므로, 실제 카메라 이미지 크기를 가정
-    final double targetRatio = aspectRatioOf(_aspectMode);
-
-    // 실제 카메라 이미지 크기 가정 (프리뷰 박스 너비를 기준으로)
-    // 카메라 이미지는 보통 세로가 더 길므로, 프리뷰 박스 너비를 기준으로 높이 계산
-    final double assumedImageWidth = previewWidth;
-    final double assumedImageHeight =
-        assumedImageWidth / (_cameraController?.value.aspectRatio ?? (9 / 16));
-
-    // 2. 촬영본과 동일한 overlayTop 계산
-    final double targetHeight = assumedImageWidth / targetRatio;
-    double overlayTop = 0;
-    double overlayBottom = 0;
-    if (targetHeight < assumedImageHeight) {
-      overlayTop = (assumedImageHeight - targetHeight) / 2;
-      overlayBottom = (assumedImageHeight - targetHeight) / 2;
-    }
-
-    // 3. 정규화된 비율 계산
-    final double normalizedTop = overlayTop / assumedImageHeight;
-
-    // 4. 프리뷰 박스 높이에 정규화 비율 적용
-    // 프리뷰 박스는 이미 크롭된 영역(crop 영역)을 보여주므로,
-    // overlayTop 이후의 위치를 프리뷰 박스 내부 좌표로 변환
-    final double topBarHeight = normalizedTop * previewHeight;
-
-    // 5. frameMargin 추가 (촬영본과 동일)
+    // 프리뷰 박스는 이미 크롭된 영역이므로, 프레임 위치를 previewBox 내부 로컬 좌표로 직접 계산
+    // 프레임은 크롭된 이미지 상단에서 frameMargin만큼 아래에 배치
     final double frameMargin = previewWidth * 0.02;
-    final double finalTopBarHeight = topBarHeight + frameMargin;
+    final double finalTopBarHeight = frameMargin;
 
     // 하단 프레임 위치: 프리뷰 박스 하단 (프리뷰 박스 내부 기준, 로컬 좌표)
     final double bottomBarHeight = previewHeight; // 프리뷰 박스 하단 = previewHeight
 
     debugPrint(
-      '[Petgram] 🔍 FramePreviewOverlay (정규화): assumedImage=${assumedImageWidth}x${assumedImageHeight}, overlayTop=$overlayTop, normalizedTop=$normalizedTop, topBarHeight=$topBarHeight, finalTopBarHeight=$finalTopBarHeight, previewBox=${previewWidth}x${previewHeight}',
+      '[Petgram] 🔍 FramePreviewOverlay: previewBox=${previewWidth}x${previewHeight}, frameMargin=$frameMargin, finalTopBarHeight=$finalTopBarHeight',
     );
 
     return CustomPaint(
@@ -7613,7 +7650,7 @@ class FramePreviewPainter extends CustomPainter {
     final double bottomInfoPadding = chipPadding * 1.5;
     // 하단 바 높이(80px)와 여유 공간을 줄여서 하단 문구를 더 아래로 배치
     final double bottomBarSpace =
-        80.0 + 10.0; // 하단 바 높이 + 여유 공간 (20.0 -> 10.0으로 줄임)
+        80.0 + 5.0; // 하단 바 높이 + 여유 공간 (10.0 -> 5.0으로 줄여서 더 아래로)
 
     // bottomBarHeight는 실제 촬영 영역의 하단 경계 (화면 기준)
     // 하단 문구는 촬영 영역 하단에서 여유 공간을 두고 표시
@@ -8032,10 +8069,10 @@ class FramePainter extends CustomPainter {
     // bottomBarSpace를 이미지 크기에 비례하도록 계산
     // 프리뷰에서는 화면 기준 100px이지만, 저장 이미지에서는 이미지 높이의 비율로 계산
     // 일반적인 화면 높이(약 800-900px)를 기준으로 100px은 약 11-12%에 해당
-    // 안전하게 이미지 높이의 8%를 사용하되, 최소값은 chipHeight의 2배로 설정 (10% -> 8%로 줄여서 더 아래로)
-    final double minBottomSpace = chipHeight * 2.0;
+    // 안전하게 이미지 높이의 5%를 사용하되, 최소값은 chipHeight의 1.5배로 설정 (8% -> 5%로 줄여서 더 아래로)
+    final double minBottomSpace = chipHeight * 1.5;
     final double proportionalBottomSpace =
-        size.height * 0.08; // 0.1 -> 0.08로 줄임
+        size.height * 0.05; // 0.08 -> 0.05로 줄여서 더 아래로
     final double bottomBarSpace = proportionalBottomSpace > minBottomSpace
         ? proportionalBottomSpace
         : minBottomSpace;
