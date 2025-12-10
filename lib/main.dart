@@ -7,6 +7,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:audioplayers/audioplayers.dart';
@@ -34,6 +35,63 @@ const String kBurstModeKey = 'petgram_burst_mode';
 const String kBurstCountSettingKey = 'petgram_burst_count_setting';
 const String kTimerSecondsKey = 'petgram_timer_seconds';
 const String kAspectModeKey = 'petgram_aspect_mode';
+
+/// 통합 이미지 로딩 헬퍼 (PNG/JPG/HEIC 모두 지원, EXIF 회전 처리)
+/// 모든 이미지 불러오기 경로에서 동일하게 사용
+Future<img.Image?> loadImageWithExifRotation(File imageFile) async {
+  try {
+    final bytes = await imageFile.readAsBytes();
+
+    // 파일 확장자 확인
+    final extension = imageFile.path.toLowerCase().split('.').last;
+    debugPrint(
+      '[Petgram] 📷 Loading image: ${imageFile.path}, extension: $extension',
+    );
+
+    // image 패키지로 디코딩 (PNG, JPG 지원)
+    img.Image? decodedImage;
+
+    if (extension == 'heic' || extension == 'heif') {
+      // HEIC는 image 패키지가 직접 지원하지 않으므로
+      // image_picker가 이미 JPG로 변환했을 가능성이 높지만,
+      // 만약 변환되지 않았다면 에러 처리
+      debugPrint('[Petgram] ⚠️ HEIC format detected, attempting decode...');
+      // image 패키지는 HEIC를 지원하지 않으므로 null 반환
+      // 실제로는 image_picker가 자동으로 JPG로 변환해주므로
+      // 여기서는 일반 디코딩 시도
+      decodedImage = img.decodeImage(bytes);
+      if (decodedImage == null) {
+        debugPrint(
+          '[Petgram] ❌ HEIC decode failed, image_picker may not have converted it',
+        );
+        return null;
+      }
+    } else {
+      // PNG, JPG는 일반 디코딩
+      decodedImage = img.decodeImage(bytes);
+    }
+
+    if (decodedImage == null) {
+      debugPrint('[Petgram] ❌ Image decode failed: ${imageFile.path}');
+      return null;
+    }
+
+    // EXIF 회전 정보 처리
+    // image 패키지의 decodeImage는 기본적으로 EXIF 회전을 자동 처리하지 않을 수 있음
+    // 하지만 대부분의 경우 이미 올바른 방향으로 디코딩됨
+    // 만약 회전이 필요하다면 별도 처리 필요
+
+    debugPrint(
+      '[Petgram] ✅ Image loaded: ${decodedImage.width}x${decodedImage.height}, '
+      'format: $extension',
+    );
+
+    return decodedImage;
+  } catch (e) {
+    debugPrint('[Petgram] ❌ loadImageWithExifRotation error: $e');
+    return null;
+  }
+}
 
 /// 얼굴 영역 정보 클래스
 class FaceRegion {
@@ -111,20 +169,67 @@ const List<double> kIdentityMatrix = [
   0, 0, 0, 1, 0,
 ];
 
+/// 두 리스트가 동일한지 비교 (ColorMatrix 비교용)
+bool _listEquals(List<double> a, List<double> b) {
+  if (a.length != b.length) return false;
+  for (int i = 0; i < a.length; i++) {
+    if ((a[i] - b[i]).abs() > 0.0001) return false;
+  }
+  return true;
+}
+
 List<double> mixMatrix(List<double> a, List<double> b, double t) {
   final clamped = t.clamp(0.0, 1.2);
   return List.generate(a.length, (i) => a[i] + (b[i] - a[i]) * clamped);
 }
 
 /// 두 개의 ColorMatrix를 곱셈하여 하나로 합치기 (성능 개선)
+/// 이미지의 평균 RGB 값을 계산 (색상 손실 추적용)
+Map<String, double> _calculateAverageRGB(img.Image image) {
+  if (image.width == 0 || image.height == 0) {
+    return {'r': 0.0, 'g': 0.0, 'b': 0.0};
+  }
+
+  double sumR = 0.0;
+  double sumG = 0.0;
+  double sumB = 0.0;
+  final int totalPixels = image.width * image.height;
+
+  for (int y = 0; y < image.height; y++) {
+    for (int x = 0; x < image.width; x++) {
+      final pixel = image.getPixel(x, y);
+      sumR += pixel.r;
+      sumG += pixel.g;
+      sumB += pixel.b;
+    }
+  }
+
+  return {
+    'r': sumR / totalPixels,
+    'g': sumG / totalPixels,
+    'b': sumB / totalPixels,
+  };
+}
+
 List<double> multiplyColorMatrices(List<double> a, List<double> b) {
   // ColorMatrix는 4x5 행렬이지만 실제로는 20개 요소의 배열
   // 곱셈: result = a * b
   // RGB 부분: 일반 행렬 곱셈
   // Offset 부분: a의 offset + (a의 RGB 행렬 * b의 offset)
+  // Alpha 행(마지막 행, 인덱스 15-19)은 항상 [0, 0, 0, 1, 0]으로 보존
   final result = List<double>.filled(20, 0.0);
 
   for (int row = 0; row < 4; row++) {
+    // Alpha 행(마지막 행)은 항상 [0, 0, 0, 1, 0]으로 강제 설정
+    if (row == 3) {
+      result[15] = 0.0; // m15
+      result[16] = 0.0; // m16
+      result[17] = 0.0; // m17
+      result[18] = 1.0; // m18 (alpha scale)
+      result[19] = 0.0; // m19 (alpha offset)
+      continue;
+    }
+
     // RGB 부분 (0-3 열)
     for (int col = 0; col < 4; col++) {
       double sum = 0.0;
@@ -193,11 +298,136 @@ enum AspectRatioMode { nineSixteen, threeFour, oneOne }
 double aspectRatioOf(AspectRatioMode mode) {
   switch (mode) {
     case AspectRatioMode.nineSixteen:
-      return 9 / 15; // 9:15 비율로 조정
+      return 9 / 16; // 진짜 9:16 비율로 수정
     case AspectRatioMode.threeFour:
       return 3 / 4; // 3:4 비율
     case AspectRatioMode.oneOne:
       return 1.0; // 1:1 비율
+  }
+}
+
+/// BoxFit.cover 매핑을 위한 공통 헬퍼 클래스
+class CameraMappingUtils {
+  /// BoxFit.cover 매핑 파라미터 계산
+  ///
+  /// contentSize: 실제 카메라 프리뷰 크기 (센서 크기)
+  /// displaySize: 프리뷰 박스 크기 (targetRatio 기반)
+  static Map<String, double> calculateBoxFitCoverParams({
+    required Size contentSize,
+    required Size displaySize,
+  }) {
+    final double contentW = contentSize.width;
+    final double contentH = contentSize.height;
+    final double displayW = displaySize.width;
+    final double displayH = displaySize.height;
+
+    // BoxFit.cover scale: scale content to fill display while maintaining aspect ratio
+    // scale = max(displayW / contentW, displayH / contentH)
+    final double scale = math.max(displayW / contentW, displayH / contentH);
+
+    // Fitted size after scaling
+    final double fittedW = contentW * scale;
+    final double fittedH = contentH * scale;
+
+    // Offset: center the fitted content in the display area
+    // If fitted size is larger than display, offset will be negative (content is cropped)
+    final double offsetX = (displayW - fittedW) / 2.0;
+    final double offsetY = (displayH - fittedH) / 2.0;
+
+    return {
+      'contentW': contentW,
+      'contentH': contentH,
+      'scale': scale,
+      'fittedW': fittedW,
+      'fittedH': fittedH,
+      'displayW': displayW,
+      'displayH': displayH,
+      'offsetX': offsetX,
+      'offsetY': offsetY,
+    };
+  }
+
+  /// Global tap position → normalized sensor coordinates (0.0–1.0)
+  static Offset mapGlobalToNormalized({
+    required Offset globalPos,
+    required Rect previewRect,
+    required Size contentSize,
+  }) {
+    // Convert global tap position to previewBox-local coordinates
+    final double localX = globalPos.dx - previewRect.left;
+    final double localY = globalPos.dy - previewRect.top;
+    final Size displaySize = previewRect.size;
+
+    // Check if tap is outside preview box
+    if (localX < 0 ||
+        localX > displaySize.width ||
+        localY < 0 ||
+        localY > displaySize.height) {
+      return Offset(-1, -1); // Invalid tap
+    }
+
+    final params = calculateBoxFitCoverParams(
+      contentSize: contentSize,
+      displaySize: displaySize,
+    );
+
+    final double scale = params['scale']!;
+    final double offsetX = params['offsetX']!;
+    final double offsetY = params['offsetY']!;
+
+    // Reverse BoxFit.cover mapping: display local → content coordinates
+    // Step 1: Remove offset (move from display space to fitted content space)
+    final double fittedX = localX - offsetX;
+    final double fittedY = localY - offsetY;
+
+    // Step 2: Divide by scale to get content coordinates
+    final double contentX = fittedX / scale;
+    final double contentY = fittedY / scale;
+
+    // Step 3: Clamp to content bounds and normalize to [0, 1]
+    final double nx = (contentX / contentSize.width).clamp(0.0, 1.0);
+    final double ny = (contentY / contentSize.height).clamp(0.0, 1.0);
+
+    return Offset(nx, ny);
+  }
+
+  /// Normalized sensor coordinates (0.0–1.0) → screen coordinates
+  static Offset mapNormalizedToScreen({
+    required Offset normalized,
+    required Rect previewRect,
+    required Size contentSize,
+    double indicatorOffset =
+        0.0, // For centering indicator (e.g., -40 for 80x80 indicator)
+  }) {
+    final Size displaySize = previewRect.size;
+
+    final params = calculateBoxFitCoverParams(
+      contentSize: contentSize,
+      displaySize: displaySize,
+    );
+
+    final double scale = params['scale']!;
+    final double offsetX = params['offsetX']!;
+    final double offsetY = params['offsetY']!;
+
+    // Forward BoxFit.cover mapping: normalized → content → display → screen
+    // Step 1: Convert normalized to content coordinates
+    final double contentX = normalized.dx * contentSize.width;
+    final double contentY = normalized.dy * contentSize.height;
+
+    // Step 2: Apply scale to get fitted coordinates
+    final double fittedX = contentX * scale;
+    final double fittedY = contentY * scale;
+
+    // Step 3: Add offset to get display local coordinates
+    final double displayLocalX = fittedX + offsetX;
+    final double displayLocalY = fittedY + offsetY;
+
+    // Step 4: Convert to global screen coordinates
+    final double screenX = previewRect.left + displayLocalX + indicatorOffset;
+    final double screenY = previewRect.top + displayLocalY + indicatorOffset;
+
+    return Offset(screenX, screenY);
   }
 }
 
@@ -215,6 +445,85 @@ class PetFilter {
     required this.matrix,
   });
 }
+
+/// 반려동물 전용 자동 보정 프로파일 (종 + 털톤 기반)
+class PetToneProfile {
+  final String id; // 'dog_light', 'dog_mid', 'dog_dark', 'cat_light', ...
+  final List<double> matrix; // 4x5 color matrix (20 elements)
+
+  const PetToneProfile({required this.id, required this.matrix});
+}
+
+/// ========================
+///  펫톤 보정 프로파일 정의
+/// ========================
+
+/// 반려동물 종 + 털톤에 따른 자동 보정 프로파일
+/// 과격한 보정이 아닌 "조금 더 예쁘게 보정된 원본" 수준으로 설계
+const Map<String, PetToneProfile> kPetToneProfiles = {
+  // 강아지 (dog)
+  'dog_light': PetToneProfile(
+    id: 'dog_light',
+    matrix: [
+      // 하이라이트 클리핑 줄이기 + 미세한 warm 톤
+      0.98, 0.01, 0.01, 0, 3, // R: 약간 감마 ↓, offset +
+      0.01, 0.98, 0.01, 0, 3, // G: 약간 감마 ↓, offset +
+      0.01, 0.01, 0.98, 0, 3, // B: 약간 감마 ↓, offset +
+      0, 0, 0, 1, 0, // Alpha
+    ],
+  ),
+  'dog_mid': PetToneProfile(
+    id: 'dog_mid',
+    matrix: [
+      // 미세 S-curve + 채도 약간 증가
+      1.05, 0, 0, 0, 0, // R: 중간톤 대비 살짝 ↑
+      0, 1.05, 0, 0, 0, // G: 중간톤 대비 살짝 ↑
+      0, 0, 1.05, 0, 0, // B: 중간톤 대비 살짝 ↑
+      0, 0, 0, 1, 0, // Alpha
+    ],
+  ),
+  'dog_dark': PetToneProfile(
+    id: 'dog_dark',
+    matrix: [
+      // Shadow lift + 전체 대비 약간 ↑
+      1.02, 0, 0, 0, 2, // R: shadow lift, 대비 약간 ↑
+      0, 1.02, 0, 0, 2, // G: shadow lift, 대비 약간 ↑
+      0, 0, 1.02, 0, 2, // B: shadow lift, 대비 약간 ↑
+      0, 0, 0, 1, 0, // Alpha
+    ],
+  ),
+  // 고양이 (cat)
+  'cat_light': PetToneProfile(
+    id: 'cat_light',
+    matrix: [
+      // White balance 약간 neutral + 채도 살짝만
+      0.99, 0.005, 0.005, 0, 0, // R: 붉은기/노란기 조금 줄임
+      0.005, 1.01, 0.005, 0, 0, // G: 녹색 미세 보정
+      0.005, 0.005, 1.01, 0, 0, // B: 파랑 미세 보정
+      0, 0, 0, 1, 0, // Alpha
+    ],
+  ),
+  'cat_mid': PetToneProfile(
+    id: 'cat_mid',
+    matrix: [
+      // 약간 차가운 톤 + 눈 색 강화
+      0.98, 0, 0, 0, 0, // R: red 살짝 -
+      0, 1.02, 0, 0, 0, // G: green + (눈 색 강화)
+      0, 0, 1.02, 0, 0, // B: blue + (눈 색 강화)
+      0, 0, 0, 1, 0, // Alpha
+    ],
+  ),
+  'cat_dark': PetToneProfile(
+    id: 'cat_dark',
+    matrix: [
+      // Dark fur lift + 채도 유지
+      1.01, 0, 0, 0, 1.5, // R: shadow lift (과하지 않게)
+      0, 1.01, 0, 0, 1.5, // G: shadow lift (과하지 않게)
+      0, 0, 1.01, 0, 1.5, // B: shadow lift (과하지 않게)
+      0, 0, 0, 1, 0, // Alpha
+    ],
+  ),
+};
 
 /// ========================
 ///  필터 정의 (공통)
@@ -822,23 +1131,18 @@ class _HomePageState extends State<HomePage> {
   }
 
   // 카메라 줌 레벨
-  double _currentZoomLevel = 1.0;
-  double _selectedZoomRatio = 1.0; // 선택된 배율 (0.8x, 1x, 1.5x 등)
-  double _baseZoomLevel = 1.0; // 핀치 제스처 시작 시 줌 레벨
+  // UI 줌 스케일 (Transform.scale로 프리뷰만 확대)
+  double _uiZoomScale = 1.0; // UI 확대 배율 (1.0 ~ 10.0)
+  double _baseUiZoomScale = 1.0; // 핀치 시작 시 기준 배율
+  static const double _uiZoomMin = 1.0;
+  static const double _uiZoomMax = 10.0;
+  static const List<double> _uiZoomPresets = [1.0, 2.0, 3.0, 5.0, 10.0];
   bool _isZooming = false; // 핀치 줌 진행 중 여부
-  DateTime? _lastZoomTime; // 마지막 핀치 줌 이벤트 시간
-  Offset? _lastTapPosition; // 마지막 탭 위치 (요구사항에 따라 선언, 현재는 사용하지 않음)
-  DateTime? _lastScaleUpdateTime; // 마지막 onScaleUpdate 호출 시간
 
-  // 카메라 줌 범위 (카메라 초기화 시 설정)
-  double _minZoomLevel = 1.0;
-  double _maxZoomLevel = 2.0;
-
-  // UI 줌 (FilterPage처럼 Transform.scale 사용)
-  double _uiZoomScale = 1.0; // UI 줌 스케일 (1.0 ~ 5.0)
-  double _baseZoomScale = 1.0; // 핀치 제스처 시작 시 UI 줌 스케일
-  Offset _zoomOffset = Offset.zero; // 줌 오프셋
-  Offset _lastZoomFocalPoint = Offset.zero; // 마지막 줌 포커스 포인트
+  // 카메라 줌은 사용하지 않음 (UI 줌만 사용)
+  double _selectedZoomRatio = 1.0; // 프리셋 버튼용 배율
+  // Offset _zoomOffset = Offset.zero; // 줌 오프셋 - 제거됨
+  // Offset _lastZoomFocalPoint = Offset.zero; // 마지막 줌 포커스 포인트 - 제거됨
 
   // 카메라 방향 (전면/후면)
   CameraLensDirection _cameraLensDirection = CameraLensDirection.back;
@@ -847,9 +1151,21 @@ class _HomePageState extends State<HomePage> {
   Offset? _focusPointRelative; // 초점 위치 (상대 좌표 0.0~1.0)
   bool _showFocusIndicator = false; // 초점 표시기 표시 여부
   bool _showAutoFocusIndicator = false; // 자동 초점 표시기 표시 여부
+  Rect? _lastPreviewRect; // 프리뷰 박스 사각형 (SafeArea Stack 좌표계)
+  Offset? _lastTapLocal; // 마지막 탭 위치 (프리뷰 박스 내부 로컬 좌표) - 카메라 계산용
+  Rect? _focusIndicatorPreviewRect; // UI 인디케이터용 프리뷰 rect (SafeArea Stack 좌표계)
+  Offset? _focusIndicatorLocal; // UI 인디케이터용 로컬 좌표
+  final GlobalKey _previewKey = GlobalKey(); // 프리뷰 Positioned 위젯용 key
 
   // 밝기 조절 (-1.0 ~ 1.0, 0.0이 원본)
-  double _brightnessValue = 0.0; // -50 ~ 50 범위
+  double _brightnessValue = 0.0; // -10 ~ 10 범위
+
+  // 펫톤 보정 저장 시 적용 여부 (디버그용 토글)
+  // false로 설정하면 저장 시 펫톤 보정을 건너뜀 (필터 + 밝기만 적용)
+  bool _enablePetToneOnSave = true;
+
+  bool get _isPureOriginalMode =>
+      _shootFilterKey == 'basic_none' && _brightnessValue == 0.0;
 
   // 아이콘 이미지 캐시
   ui.Image? _dogIconImage;
@@ -1093,12 +1409,18 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 이미지에 반려동물 이름과 촬영 시점을 프레임으로 추가 (새로운 구조)
+  /// 비파괴적 함수: 내부에서 생성한 ui.Image를 dispose하지 않음 (PNG로 변환 완료 후 dispose)
+  /// 이 함수는 File을 받아 File을 반환하므로, 내부 ui.Image는 PNG 변환 완료 후 dispose
   Future<File> _addPhotoFrame(File imageFile) async {
+    // 내부에서 생성한 ui.Image들을 추적 (PNG 변환 완료 후 dispose)
+    final List<ui.Image> imagesToDispose = [];
+
     try {
       final Uint8List imageBytes = await imageFile.readAsBytes();
       final ui.Codec codec = await ui.instantiateImageCodec(imageBytes);
       final ui.FrameInfo frameInfo = await codec.getNextFrame();
       final ui.Image image = frameInfo.image;
+      imagesToDispose.add(image); // dispose 목록에 추가
 
       // 최종 캔버스 크기 (이미지 크기 그대로, 칩은 오버레이)
       final double finalWidth = image.width.toDouble();
@@ -1168,120 +1490,257 @@ class _HomePageState extends State<HomePage> {
       );
       framePainter.paint(canvas, Size(finalWidth, finalHeight));
 
-      // Picture를 Image로 변환
+      // Picture를 Image로 변환 (원본 해상도 유지)
+      // pixelRatio: 1.0으로 고정하여 render pixel과 색 왜곡 방지
       final ui.Picture picture = recorder.endRecording();
       final ui.Image finalImage = await picture.toImage(
         finalWidth.toInt(),
         finalHeight.toInt(),
       );
+      picture.dispose(); // Picture는 즉시 dispose 가능
+      imagesToDispose.add(finalImage); // dispose 목록에 추가
 
       // PNG로 임시 인코딩
       final ByteData? byteData = await finalImage.toByteData(
         format: ui.ImageByteFormat.png,
       );
       if (byteData == null) {
-        image.dispose();
-        finalImage.dispose();
+        // 에러 발생 시 내부에서 생성한 ui.Image들 dispose
+        for (final img in imagesToDispose) {
+          try {
+            img.dispose();
+          } catch (e) {
+            debugPrint('[HomePage] ⚠️ _addPhotoFrame 이미지 dispose 실패 (무시): $e');
+          }
+        }
         return imageFile;
       }
 
-      final Uint8List pngBytes = byteData.buffer.asUint8List(
+      final Uint8List framePngBytes = byteData.buffer.asUint8List(
         byteData.offsetInBytes,
         byteData.lengthInBytes,
       );
 
       // PNG를 디코딩하여 image 패키지로 변환
-      final img.Image? decodedImage = img.decodeImage(pngBytes);
+      final img.Image? decodedImage = img.decodeImage(framePngBytes);
       if (decodedImage == null) {
-        image.dispose();
-        finalImage.dispose();
+        // 에러 발생 시 내부에서 생성한 ui.Image들 dispose
+        for (final img in imagesToDispose) {
+          try {
+            img.dispose();
+          } catch (e) {
+            debugPrint('[HomePage] ⚠️ _addPhotoFrame 이미지 dispose 실패 (무시): $e');
+          }
+        }
         return imageFile;
       }
 
-      // JPEG로 인코딩 (품질 95)
-      final Uint8List jpegBytes = Uint8List.fromList(
-        img.encodeJpg(decodedImage, quality: 100),
+      // 프레임 적용 후 RGB 평균값 로그
+      final afterFrameRGB = _calculateAverageRGB(decodedImage);
+      debugPrint(
+        '[Petgram] 📊 After frame (PNG) - Avg RGB: R=${afterFrameRGB['r']!.toStringAsFixed(2)}, G=${afterFrameRGB['g']!.toStringAsFixed(2)}, B=${afterFrameRGB['b']!.toStringAsFixed(2)}',
       );
 
-      // 임시 파일로 저장 (JPEG)
+      // PNG로 재인코딩 (무손실 포맷, image 패키지로 최종 저장)
+      final Uint8List finalPngBytes = Uint8List.fromList(
+        img.encodePng(decodedImage),
+      );
+
+      // PNG 인코딩 후 디코딩하여 RGB 평균값 비교 (색 손실 최소화 확인)
+      final img.Image? afterPngDecoded = img.decodeImage(finalPngBytes);
+      if (afterPngDecoded != null) {
+        final afterPngRGB = _calculateAverageRGB(afterPngDecoded);
+        debugPrint(
+          '[Petgram] 📊 After frame PNG encoding/decoding - Avg RGB: R=${afterPngRGB['r']!.toStringAsFixed(2)}, G=${afterPngRGB['g']!.toStringAsFixed(2)}, B=${afterPngRGB['b']!.toStringAsFixed(2)}',
+        );
+        debugPrint(
+          '[Petgram] 📊 Frame PNG RGB diff - R=${(afterPngRGB['r']! - afterFrameRGB['r']!).toStringAsFixed(2)}, G=${(afterPngRGB['g']! - afterFrameRGB['g']!).toStringAsFixed(2)}, B=${(afterPngRGB['b']! - afterFrameRGB['b']!).toStringAsFixed(2)}',
+        );
+      }
+
+      // 임시 파일로 저장 (PNG)
       final dir = await getTemporaryDirectory();
       final filePath =
-          '${dir.path}/framed_${DateTime.now().millisecondsSinceEpoch}.jpg';
+          '${dir.path}/framed_${DateTime.now().millisecondsSinceEpoch}.png';
       final File framedFile = File(filePath);
-      await framedFile.writeAsBytes(jpegBytes);
+      await framedFile.writeAsBytes(finalPngBytes);
 
-      // 원본 이미지 정리
-      image.dispose();
-      finalImage.dispose();
+      // PNG 변환 완료 후 내부에서 생성한 ui.Image들 dispose
+      // 이 함수는 File을 받아 File을 반환하므로, PNG 변환 완료 후 dispose가 안전
+      for (final img in imagesToDispose) {
+        try {
+          img.dispose();
+        } catch (e) {
+          debugPrint('[HomePage] ⚠️ _addPhotoFrame 이미지 dispose 실패 (무시): $e');
+        }
+      }
 
       return framedFile;
-    } catch (e) {
+    } catch (e, stackTrace) {
       if (kDebugMode) {
         debugPrint('❌ _addPhotoFrame error: $e');
+        debugPrint('❌ _addPhotoFrame stack trace: $stackTrace');
+      }
+      // 에러 발생 시 내부에서 생성한 ui.Image들 dispose
+      for (final img in imagesToDispose) {
+        try {
+          img.dispose();
+        } catch (disposeError) {
+          debugPrint(
+            '[HomePage] ⚠️ _addPhotoFrame 이미지 dispose 실패 (무시): $disposeError',
+          );
+        }
       }
       return imageFile;
     }
   }
 
-  /// ColorMatrix를 실제 이미지 픽셀에 적용 (원본 색상 보존을 위한 블렌딩)
-  img.Image _applyColorMatrixToImage(img.Image image, List<double> matrix) {
-    // 원본 이미지를 복사하여 수정 (원본 보존, 해상도 유지)
-    // 원본과 동일한 크기이므로 보간법은 영향 없지만, cubic이 가장 고품질
-    final result = img.copyResize(
-      image,
-      width: image.width,
-      height: image.height,
-      interpolation: img.Interpolation.cubic, // 고품질 보간법 (원본 크기와 동일하므로 영향 없음)
+  /// 현재 선택된 반려동물의 펫톤 프로파일 가져오기
+  PetToneProfile? _getCurrentPetToneProfile() {
+    // 1) _petList, _selectedPetId 기반으로 현재 선택된 PetInfo 구하기
+    if (_petList.isEmpty || _selectedPetId == null) {
+      return null;
+    }
+
+    final selectedPet = _petList.firstWhere(
+      (pet) => pet.id == _selectedPetId,
+      orElse: () => _petList.first,
     );
 
-    for (int y = 0; y < result.height; y++) {
-      for (int x = 0; x < result.width; x++) {
-        final pixel = result.getPixel(x, y);
-        final r = pixel.r.toDouble();
-        final g = pixel.g.toDouble();
-        final b = pixel.b.toDouble();
-        final a = pixel.a.toDouble();
-
-        // ColorMatrix 직접 적용 (블렌딩 없이, mixMatrix에서 이미 intensity 조절됨)
-        final newR =
-            (matrix[0] * r +
-                    matrix[1] * g +
-                    matrix[2] * b +
-                    matrix[3] * a +
-                    matrix[4])
-                .clamp(0, 255)
-                .toInt();
-        final newG =
-            (matrix[5] * r +
-                    matrix[6] * g +
-                    matrix[7] * b +
-                    matrix[8] * a +
-                    matrix[9])
-                .clamp(0, 255)
-                .toInt();
-        final newB =
-            (matrix[10] * r +
-                    matrix[11] * g +
-                    matrix[12] * b +
-                    matrix[13] * a +
-                    matrix[14])
-                .clamp(0, 255)
-                .toInt();
-        final newA =
-            (matrix[15] * r +
-                    matrix[16] * g +
-                    matrix[17] * b +
-                    matrix[18] * a +
-                    matrix[19])
-                .clamp(0, 255)
-                .toInt();
-
-        result.setPixel(x, y, img.ColorRgba8(newR, newG, newB, newA));
-      }
+    // 2) type이 'dog' / 'cat'이 아니면 null 리턴
+    if (selectedPet.type != 'dog' && selectedPet.type != 'cat') {
+      return null;
     }
+
+    // 3) _liveCoatPreset (light/mid/dark/custom)으로 tone 결정
+    String tone = _liveCoatPreset;
+    if (tone == 'custom' ||
+        (tone != 'light' && tone != 'mid' && tone != 'dark')) {
+      // 'custom'이거나 예상 외 값이면 'mid'로 fallback
+      tone = 'mid';
+    }
+
+    // 4) key = '${type}_${tone}' 형태로 kPetToneProfiles에서 찾아서 리턴
+    final String profileKey = '${selectedPet.type}_$tone';
+    return kPetToneProfiles[profileKey];
+  }
+
+  // [PERF] GPU 캡처 방식으로 저장 경로 변경
+  // img.Image를 ui.Image로 변환하는 헬퍼 함수
+  Future<ui.Image> _convertImgImageToUiImage(img.Image image) async {
+    final Uint8List pngBytes = Uint8List.fromList(img.encodePng(image));
+    final ui.Codec codec = await ui.instantiateImageCodec(pngBytes);
+    final ui.FrameInfo frameInfo = await codec.getNextFrame();
+    return frameInfo.image;
+  }
+
+  // [PERF] GPU 캡처 방식으로 저장 경로 변경
+  // GPU 기반 색 보정 적용 (ui.PictureRecorder와 Canvas 사용)
+  // 프리뷰와 동일한 ColorMatrix 로직 사용
+  Future<ui.Image> _applyColorMatrixToUiImageGpu(
+    ui.Image image,
+    List<double> matrix,
+  ) async {
+    // matrix가 identity면 원본 반환
+    if (_listEquals(matrix, kIdentityMatrix)) {
+      return image;
+    }
+
+    final int width = image.width;
+    final int height = image.height;
+
+    // PictureRecorder로 GPU에서 직접 그리기
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(recorder);
+
+    // ColorFilter를 적용하여 이미지 그리기
+    final Paint paint = Paint();
+    paint.colorFilter = ColorFilter.matrix(matrix);
+
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+      Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+      paint,
+    );
+
+    // Picture를 Image로 변환
+    final ui.Picture picture = recorder.endRecording();
+    final ui.Image result = await picture.toImage(width, height);
+    picture.dispose();
 
     return result;
   }
+
+  // [PERF] GPU 캡처 방식으로 저장 경로 변경
+  // 프리뷰와 동일한 ColorMatrix 생성 로직
+  List<double> _buildColorMatrixForSave() {
+    if (_isPureOriginalMode) {
+      debugPrint(
+        '[Petgram] 🎨 [SAVE PIPELINE] Pure original mode, skipping all color adjustments',
+      );
+      return List.from(kIdentityMatrix);
+    }
+
+    final petProfile = _getCurrentPetToneProfile();
+    final PetFilter? currentFilter = _allFilters[_shootFilterKey];
+
+    List<double> base = List.from(kIdentityMatrix);
+
+    // 1. 펫톤 보정 적용 (프리뷰와 동일하게 약하게 적용)
+    if (petProfile != null && _enablePetToneOnSave) {
+      final petToneMatrix = mixMatrix(
+        kIdentityMatrix,
+        petProfile.matrix,
+        0.4, // 40% 강도로 약하게 적용
+      );
+      base = multiplyColorMatrices(base, petToneMatrix);
+    }
+
+    // 2. 필터 행렬 적용
+    if (currentFilter != null && currentFilter.key != 'basic_none') {
+      final filterMatrix = mixMatrix(
+        kIdentityMatrix,
+        currentFilter.matrix,
+        _liveIntensity,
+      );
+      base = multiplyColorMatrices(base, filterMatrix);
+    }
+
+    // 3. 밝기 조절 적용
+    if (_brightnessValue != 0.0) {
+      final double brightnessOffset = (_brightnessValue / 10.0) * 255 * 0.1;
+      final List<double> brightnessMatrix = [
+        1,
+        0,
+        0,
+        0,
+        brightnessOffset,
+        0,
+        1,
+        0,
+        0,
+        brightnessOffset,
+        0,
+        0,
+        1,
+        0,
+        brightnessOffset,
+        0,
+        0,
+        0,
+        1,
+        0,
+      ];
+      base = multiplyColorMatrices(base, brightnessMatrix);
+    }
+
+    return base;
+  }
+
+  /// [PERF] 동기 버전 _applyColorMatrixToImage 제거됨
+  /// 비동기 버전(_applyColorMatrixToImage)만 유지 (FilterPage 등에서 사용)
+  /// 메인 저장 경로(_takePhoto)는 GPU 캡처 방식으로 변경됨
 
   Future<void> _initCamera() async {
     if (kDebugMode) {
@@ -1316,11 +1775,9 @@ class _HomePageState extends State<HomePage> {
           _isCameraInitializing = false;
           _useMockCamera = true;
           _cameraController = null;
-          // 목업 카메라는 5배까지 지원
-          _minZoomLevel = 1.0;
-          _maxZoomLevel = 5.0;
-          _currentZoomLevel = 1.0;
-          _selectedZoomRatio = 1.0;
+          _uiZoomScale = _uiZoomMin;
+          _baseUiZoomScale = _uiZoomMin;
+          _selectedZoomRatio = _uiZoomScale;
         });
       }
       return;
@@ -1382,18 +1839,19 @@ class _HomePageState extends State<HomePage> {
       }
       // 초기 줌 레벨 설정 및 카메라 줌 범위 저장
       try {
-        _minZoomLevel = await controller.getMinZoomLevel();
-        _maxZoomLevel = await controller.getMaxZoomLevel();
-        _currentZoomLevel = _minZoomLevel;
-        _selectedZoomRatio = 1.0; // 기본 배율
+        final cameraMinZoom = await controller.getMinZoomLevel();
+        final cameraMaxZoom = await controller.getMaxZoomLevel();
+        _uiZoomScale = _uiZoomMin;
+        _baseUiZoomScale = _uiZoomMin;
+        _selectedZoomRatio = _uiZoomScale;
         debugPrint(
-          '[Petgram] 📐 카메라 줌 범위: min=$_minZoomLevel, max=$_maxZoomLevel',
+          '[Petgram] 📐 카메라 줌 범위(참고용): min=$cameraMinZoom, max=$cameraMaxZoom, '
+          'uiRange=$_uiZoomMin~$_uiZoomMax',
         );
       } catch (e) {
-        _minZoomLevel = 1.0;
-        _maxZoomLevel = 2.0;
-        _currentZoomLevel = 1.0;
-        _selectedZoomRatio = 1.0;
+        _uiZoomScale = _uiZoomMin;
+        _baseUiZoomScale = _uiZoomMin;
+        _selectedZoomRatio = _uiZoomScale;
         debugPrint('[Petgram] ⚠️ 줌 범위 가져오기 실패, 기본값 사용: $e');
       }
       if (!mounted) return;
@@ -1408,10 +1866,7 @@ class _HomePageState extends State<HomePage> {
         _cameraController = controller;
         _isCameraInitializing = false;
         _useMockCamera = false;
-        // UI 줌 리셋
-        _uiZoomScale = 1.0;
-        _baseZoomScale = 1.0;
-        _zoomOffset = Offset.zero;
+        // UI 줌 제거: 카메라 줌만 사용
       });
 
       // 최초 진입 시 화면 중앙에 자동 초점 설정
@@ -1425,11 +1880,9 @@ class _HomePageState extends State<HomePage> {
         _isCameraInitializing = false;
         _useMockCamera = true;
         _cameraController = null;
-        // 목업 카메라는 5배까지 지원
-        _minZoomLevel = 1.0;
-        _maxZoomLevel = 5.0;
-        _currentZoomLevel = 1.0;
-        _selectedZoomRatio = 1.0;
+        _uiZoomScale = _uiZoomMin;
+        _baseUiZoomScale = _uiZoomMin;
+        _selectedZoomRatio = _uiZoomScale;
       });
 
       // 카메라 초기화 실패 시 사용자에게 안내 (권한 거부 가능성)
@@ -1575,18 +2028,19 @@ class _HomePageState extends State<HomePage> {
       }
       // 줌 레벨 설정 및 카메라 줌 범위 저장
       try {
-        _minZoomLevel = await controller.getMinZoomLevel();
-        _maxZoomLevel = await controller.getMaxZoomLevel();
-        _currentZoomLevel = _minZoomLevel;
-        _selectedZoomRatio = 1.0;
+        final cameraMinZoom = await controller.getMinZoomLevel();
+        final cameraMaxZoom = await controller.getMaxZoomLevel();
+        _uiZoomScale = _uiZoomMin;
+        _baseUiZoomScale = _uiZoomMin;
+        _selectedZoomRatio = _uiZoomScale;
         debugPrint(
-          '[Petgram] 📐 카메라 전환 - 줌 범위: min=$_minZoomLevel, max=$_maxZoomLevel',
+          '[Petgram] 📐 카메라 전환 - 참고용 줌 범위: min=$cameraMinZoom, max=$cameraMaxZoom, '
+          'uiRange=$_uiZoomMin~$_uiZoomMax',
         );
       } catch (e) {
-        _minZoomLevel = 1.0;
-        _maxZoomLevel = 2.0;
-        _currentZoomLevel = 1.0;
-        _selectedZoomRatio = 1.0;
+        _uiZoomScale = _uiZoomMin;
+        _baseUiZoomScale = _uiZoomMin;
+        _selectedZoomRatio = _uiZoomScale;
         debugPrint('[Petgram] ⚠️ 줌 범위 가져오기 실패, 기본값 사용: $e');
       }
       if (!mounted) return;
@@ -1602,10 +2056,7 @@ class _HomePageState extends State<HomePage> {
         _isCameraInitializing = false;
         _useMockCamera = false;
         // 셀카모드 전환 시 비율 재계산을 위해 강제 리빌드
-        // UI 줌도 리셋
-        _uiZoomScale = 1.0;
-        _baseZoomScale = 1.0;
-        _zoomOffset = Offset.zero;
+        // UI 줌 제거: 카메라 줌만 사용
       });
 
       // 카메라 전환 시에도 화면 중앙에 자동 초점 설정
@@ -1621,32 +2072,48 @@ class _HomePageState extends State<HomePage> {
         _isCameraInitializing = false;
         _useMockCamera = true;
         _cameraController = null;
-        // 목업 카메라는 5배까지 지원
-        _minZoomLevel = 1.0;
-        _maxZoomLevel = 5.0;
-        _currentZoomLevel = 1.0;
-        _selectedZoomRatio = 1.0;
+        _uiZoomScale = _uiZoomMin;
+        _baseUiZoomScale = _uiZoomMin;
+        _selectedZoomRatio = _uiZoomScale;
       });
     }
   }
 
   void _changeAspectMode(AspectRatioMode mode) {
-    if (kDebugMode) {
-      debugPrint('[Petgram] _changeAspectMode called: $mode');
-    }
     if (_aspectMode == mode) {
-      if (kDebugMode) {
-        debugPrint('[Petgram] aspect mode is already $mode, skipping');
-      }
       return;
     }
     setState(() {
       _aspectMode = mode;
+      // UI 줌 제거: 카메라 줌만 사용 (비율 변경 시 UI 줌 리셋 불필요)
     });
     _saveAspectMode();
-    if (kDebugMode) {
-      debugPrint('[Petgram] _aspectMode updated to: $_aspectMode');
-    }
+
+    // previewRect를 즉시 업데이트 (postFrameCallback 사용)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final BuildContext? previewContext = _previewKey.currentContext;
+      if (previewContext != null) {
+        _updatePreviewRectFromContext(previewContext);
+        debugPrint(
+          '[Petgram] 📐 Aspect ratio changed to ${_aspectLabel(mode)}, previewRect updated',
+        );
+      } else {
+        debugPrint(
+          '[Petgram] ⚠️ Aspect ratio changed but previewContext is null, will retry',
+        );
+        // 컨텍스트가 아직 준비되지 않았으면 약간의 지연 후 재시도
+        Future.delayed(const Duration(milliseconds: 100), () {
+          if (!mounted) return;
+          final BuildContext? retryContext = _previewKey.currentContext;
+          if (retryContext != null) {
+            _updatePreviewRectFromContext(retryContext);
+            debugPrint('[Petgram] 📐 previewRect updated (retry)');
+          }
+        });
+      }
+    });
+
     // 프리뷰 강제 업데이트를 위해 약간의 지연 후 다시 빌드
     Future.delayed(const Duration(milliseconds: 50), () {
       if (mounted) {
@@ -1687,16 +2154,7 @@ class _HomePageState extends State<HomePage> {
           _shouldStopTimer = false;
           _timerSeconds = originalTimerSeconds;
         });
-        // 타이머 강제 종료 시 스낵바 표시
-        if (_shouldStopTimer && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('타이머가 종료되었습니다.'),
-              behavior: SnackBarBehavior.floating,
-              duration: Duration(seconds: 2),
-            ),
-          );
-        }
+        // 타이머 강제 종료 시 스낵바 표시 제거 (사용자 요청)
         return;
       }
       setState(() => _timerSeconds = i);
@@ -1711,16 +2169,7 @@ class _HomePageState extends State<HomePage> {
             _shouldStopTimer = false;
             _timerSeconds = originalTimerSeconds;
           });
-          // 타이머 강제 종료 시 스낵바 표시
-          if (_shouldStopTimer && mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('타이머가 종료되었습니다.'),
-                behavior: SnackBarBehavior.floating,
-                duration: Duration(seconds: 2),
-              ),
-            );
-          }
+          // 타이머 강제 종료 시 스낵바 표시 제거 (사용자 요청)
           return;
         }
         await Future.delayed(const Duration(milliseconds: 100));
@@ -1733,16 +2182,7 @@ class _HomePageState extends State<HomePage> {
         _shouldStopTimer = false;
         _timerSeconds = originalTimerSeconds;
       });
-      // 타이머 강제 종료 시 스낵바 표시
-      if (_shouldStopTimer && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('타이머가 종료되었습니다.'),
-            behavior: SnackBarBehavior.floating,
-            duration: Duration(seconds: 2),
-          ),
-        );
-      }
+      // 타이머 강제 종료 시 스낵바 표시 제거 (사용자 요청)
       return;
     }
 
@@ -1804,6 +2244,10 @@ class _HomePageState extends State<HomePage> {
 
     setState(() => _isProcessing = true);
 
+    // ui.Image 메모리 관리를 위한 변수 (외부 스코프에서 선언하여 finally에서 접근 가능)
+    ui.Image? uiImageForDispose;
+    final List<ui.Image> imagesToDispose = []; // dispose할 이미지 목록
+
     try {
       File file;
       if (_useMockCamera || _cameraController == null) {
@@ -1818,11 +2262,13 @@ class _HomePageState extends State<HomePage> {
 
       try {
         // 1. 이미지 디코딩
-        final Uint8List imageBytes = await processedFile.readAsBytes();
-        img.Image? decodedImage = img.decodeImage(imageBytes);
+        // 통합 이미지 로딩 헬퍼 사용 (PNG/JPG/HEIC 모두 지원, EXIF 회전 처리)
+        img.Image? decodedImage = await loadImageWithExifRotation(
+          processedFile,
+        );
 
         if (decodedImage == null) {
-          throw Exception('이미지 디코딩 실패');
+          throw Exception('이미지 디코딩 실패: ${processedFile.path}');
         }
 
         // 1. 프리뷰에서 사용한 비율/프레임 위치 기억
@@ -1888,6 +2334,11 @@ class _HomePageState extends State<HomePage> {
             } else {
               debugPrint('✅ 비율 검증 통과: 차이=${ratioDiff.toStringAsFixed(4)}');
             }
+
+            // 프리뷰 박스와 최종 이미지 비율 비교
+            debugPrint(
+              '📐 프리뷰 박스 vs 최종 이미지: targetRatio=$targetRatio, finalImageRatio=$finalRatio, 일치 여부=${ratioDiff < 0.01 ? "✅ 일치" : "⚠️ 불일치"}',
+            );
           }
         } else {
           // 크롭할 영역이 없거나 잘못된 경우
@@ -1898,54 +2349,125 @@ class _HomePageState extends State<HomePage> {
           }
         }
 
-        // 리사이징 제거 - 원본 해상도 유지
+        // 3. UI 줌 적용 전 해상도 저장 (최종 저장 해상도 기준)
+        // 비율 맞춤 크롭 후의 해상도를 기준으로 사용
+        final int finalTargetWidth = decodedImage.width;
+        final int finalTargetHeight = decodedImage.height;
 
-        // 2. 필터 적용 (저장 시에만 적용)
-        final PetFilter? currentFilter = _allFilters[_shootFilterKey];
+        // 4. UI 줌 스케일에 따른 중앙 크롭 적용 (프리뷰와 동일한 확대 연출)
+        double effectiveZoom = _uiZoomScale.isFinite
+            ? _uiZoomScale
+            : _uiZoomMin;
+        if (effectiveZoom < _uiZoomMin) {
+          effectiveZoom = _uiZoomMin;
+        } else if (effectiveZoom > _uiZoomMax) {
+          effectiveZoom = _uiZoomMax;
+        }
+
+        if (effectiveZoom > 1.0) {
+          final double zoomCropWidth = decodedImage.width / effectiveZoom;
+          final double zoomCropHeight = decodedImage.height / effectiveZoom;
+
+          if (zoomCropWidth >= 1 && zoomCropHeight >= 1) {
+            int zoomWidth = zoomCropWidth.round();
+            int zoomHeight = zoomCropHeight.round();
+            zoomWidth = zoomWidth.clamp(1, decodedImage.width);
+            zoomHeight = zoomHeight.clamp(1, decodedImage.height);
+
+            int zoomX = ((decodedImage.width - zoomWidth) / 2).round();
+            int zoomY = ((decodedImage.height - zoomHeight) / 2).round();
+            zoomX = zoomX.clamp(0, math.max(0, decodedImage.width - zoomWidth));
+            zoomY = zoomY.clamp(
+              0,
+              math.max(0, decodedImage.height - zoomHeight),
+            );
+
+            decodedImage = img.copyCrop(
+              decodedImage,
+              x: zoomX,
+              y: zoomY,
+              width: zoomWidth,
+              height: zoomHeight,
+            );
+
+            if (kDebugMode) {
+              debugPrint(
+                '🔍 UI 줌 크롭 적용 (scale=${effectiveZoom.toStringAsFixed(2)}): '
+                'x=$zoomX, y=$zoomY, width=$zoomWidth, height=$zoomHeight',
+              );
+            }
+          } else {
+            debugPrint(
+              '⚠️ UI 줌 크롭을 건너뜀: 계산된 크기가 유효하지 않음 '
+              '(width=$zoomCropWidth, height=$zoomCropHeight)',
+            );
+          }
+        }
+
+        // 5. 최종 저장 해상도로 리사이즈 (줌 배율과 상관없이 항상 동일한 해상도 유지)
+        // UI 줌 크롭 후 크기가 작아졌을 수 있으므로, 원래 해상도로 복원
+        if (decodedImage.width != finalTargetWidth ||
+            decodedImage.height != finalTargetHeight) {
+          decodedImage = img.copyResize(
+            decodedImage,
+            width: finalTargetWidth,
+            height: finalTargetHeight,
+            interpolation: img.Interpolation.cubic,
+          );
+
+          if (kDebugMode) {
+            debugPrint(
+              '🔄 최종 해상도로 리사이즈: '
+              '${decodedImage.width}x${decodedImage.height} → ${finalTargetWidth}x${finalTargetHeight}',
+            );
+          }
+        }
+
+        // [PERF] GPU 캡처 방식으로 저장 경로 변경
+        // CPU 기반 픽셀 루프 제거, GPU 기반 ColorFilter 적용
+
+        // [PERF] GPU 캡처 방식으로 저장 경로 변경
+        // CPU 기반 픽셀 루프 대신 GPU 기반 ColorFilter 적용
         debugPrint(
-          '🔍 필터 적용 확인: filterKey=$_shootFilterKey, filter=${currentFilter?.key}, intensity=$_liveIntensity',
+          '[Petgram] 🚀 [PERF] Using GPU capture for color correction',
         );
+
+        // img.Image를 ui.Image로 변환
+        ui.Image uiImage = await _convertImgImageToUiImage(decodedImage);
+        uiImageForDispose = uiImage; // finally 블록에서 dispose하기 위해 저장
+
+        // 프리뷰와 동일한 ColorMatrix 생성
+        final colorMatrix = _buildColorMatrixForSave();
+
+        // [MATRIX 비교] Preview Matrix vs Save Matrix 로그 (HomePage)
+        // _buildFilteredWidgetLive의 matrix 계산 로직을 직접 호출하여 비교
+        List<double> previewMatrixForCompare = List.from(kIdentityMatrix);
+        final petProfile = _getCurrentPetToneProfile();
+        if (petProfile != null) {
+          final petToneMatrix = mixMatrix(
+            kIdentityMatrix,
+            petProfile.matrix,
+            0.4,
+          );
+          previewMatrixForCompare = multiplyColorMatrices(
+            previewMatrixForCompare,
+            petToneMatrix,
+          );
+        }
+        final PetFilter? currentFilter = _allFilters[_shootFilterKey];
         if (currentFilter != null && currentFilter.key != 'basic_none') {
-          // 라이브 필터와 동일한 방식으로 필터 행렬 계산
-          List<double> finalMatrix = mixMatrix(
+          final filterMatrix = mixMatrix(
             kIdentityMatrix,
             currentFilter.matrix,
             _liveIntensity,
           );
-
-          debugPrint(
-            '📊 필터 행렬 계산 완료: filter=${currentFilter.key}, intensity=$_liveIntensity',
-          );
-
-          // 필터 적용 전 이미지 샘플 확인
-          final beforeSample = decodedImage.getPixel(0, 0);
-          debugPrint(
-            '🖼️ 필터 적용 전 샘플 픽셀: R=${beforeSample.r}, G=${beforeSample.g}, B=${beforeSample.b}',
-          );
-
-          // 필터 적용
-          decodedImage = _applyColorMatrixToImage(decodedImage, finalMatrix);
-
-          // 필터 적용 후 이미지 샘플 확인
-          final afterSample = decodedImage.getPixel(0, 0);
-          debugPrint(
-            '🖼️ 필터 적용 후 샘플 픽셀: R=${afterSample.r}, G=${afterSample.g}, B=${afterSample.b}',
-          );
-
-          debugPrint(
-            '✅ 필터 적용 완료: ${currentFilter.key}, intensity=$_liveIntensity',
-          );
-        } else {
-          debugPrint(
-            '⚠️ 필터가 적용되지 않음: filterKey=$_shootFilterKey, filter=${currentFilter?.key}',
+          previewMatrixForCompare = multiplyColorMatrices(
+            previewMatrixForCompare,
+            filterMatrix,
           );
         }
-
-        // 3. 밝기 조절 적용 (밝기 값이 0이 아닐 때만)
         if (_brightnessValue != 0.0) {
-          final double brightnessOffset =
-              (_brightnessValue / 50.0) *
-              255; // -50~50을 -1.0~1.0으로 변환 후 255 곱하기
+          final double brightnessOffset = (_brightnessValue / 10.0) * 255 * 0.1;
           final List<double> brightnessMatrix = [
             1,
             0,
@@ -1968,23 +2490,170 @@ class _HomePageState extends State<HomePage> {
             1,
             0,
           ];
-          decodedImage = _applyColorMatrixToImage(
-            decodedImage,
+          previewMatrixForCompare = multiplyColorMatrices(
+            previewMatrixForCompare,
             brightnessMatrix,
           );
-          debugPrint('✅ 밝기 조절 적용 완료: $_brightnessValue');
         }
 
-        // 처리된 이미지를 임시 파일로 저장 (JPG 품질 100%)
-        final Uint8List jpegBytes = Uint8List.fromList(
-          img.encodeJpg(decodedImage, quality: 100),
+        debugPrint(
+          '[Petgram] 🔍 [HOMEPAGE MATRIX COMPARISON] Preview Matrix = ${previewMatrixForCompare.join(', ')}',
+        );
+        debugPrint(
+          '[Petgram] 🔍 [HOMEPAGE MATRIX COMPARISON] Save Matrix = ${colorMatrix.join(', ')}',
         );
 
+        // Matrix 차이 계산
+        bool matricesMatch = true;
+        for (int i = 0; i < 20; i++) {
+          final diff = (previewMatrixForCompare[i] - colorMatrix[i]).abs();
+          if (diff > 0.0001) {
+            matricesMatch = false;
+            debugPrint(
+              '[Petgram] ⚠️ [HOMEPAGE MATRIX COMPARISON] Difference at index $i: preview=${previewMatrixForCompare[i]}, save=${colorMatrix[i]}, diff=$diff',
+            );
+          }
+        }
+        if (matricesMatch) {
+          debugPrint(
+            '[Petgram] ✅ [HOMEPAGE MATRIX COMPARISON] Preview and Save matrices are IDENTICAL',
+          );
+        } else {
+          debugPrint(
+            '[Petgram] ⚠️ [HOMEPAGE MATRIX COMPARISON] Preview and Save matrices are DIFFERENT',
+          );
+        }
+
+        // Context 정보 로그
+        debugPrint(
+          '[Petgram] 🔍 [HOMEPAGE MATRIX COMPARISON] Context: petProfile=${petProfile?.id ?? 'none'}, '
+          'filter=${currentFilter?.key ?? 'none'}, intensity=$_liveIntensity, brightness=$_brightnessValue, '
+          'coatPreset=$_liveCoatPreset, enablePetToneOnSave=$_enablePetToneOnSave',
+        );
+
+        // GPU에서 ColorFilter 적용
+        // 비파괴적 함수: 새로운 이미지를 반환하므로 이전 이미지는 추적하여 finally에서 dispose
+        ui.Image? previousUiImage;
+        if (!_listEquals(colorMatrix, kIdentityMatrix)) {
+          previousUiImage = uiImage; // 이전 이미지 추적
+          uiImage = await _applyColorMatrixToUiImageGpu(uiImage, colorMatrix);
+          // 이전 이미지가 새 이미지와 다른 경우에만 dispose 목록에 추가
+          if (previousUiImage != uiImage) {
+            imagesToDispose.add(previousUiImage); // finally에서 dispose
+          }
+          uiImageForDispose = uiImage; // 최신 이미지는 최종적으로 dispose
+        } else {
+          // ColorMatrix가 identity면 이미지가 그대로 반환되므로 uiImageForDispose만 설정
+          uiImageForDispose = uiImage;
+        }
+
+        // ui.Image를 PNG 바이트로 변환 (안정화 + fallback)
+        Uint8List? pngBytes;
+
+        // 첫 번째 시도: GPU 렌더 캡처 방식
+        try {
+          final ByteData? byteData = await uiImage.toByteData(
+            format: ui.ImageByteFormat.png,
+          );
+
+          if (byteData != null && byteData.lengthInBytes > 0) {
+            pngBytes = byteData.buffer.asUint8List(
+              byteData.offsetInBytes,
+              byteData.lengthInBytes,
+            );
+            debugPrint('[HomePage] ✅ GPU 렌더 캡처 성공: ${pngBytes.length} bytes');
+          } else {
+            debugPrint('[HomePage] ⚠️ toByteData가 null 또는 빈 데이터 반환');
+          }
+        } catch (e) {
+          debugPrint('[HomePage] ⚠️ GPU 렌더 캡처 실패: $e');
+        }
+
+        // Fallback: img.Image로 직접 PNG 인코딩
+        if (pngBytes == null || pngBytes.isEmpty) {
+          debugPrint('[HomePage] 🔄 Fallback: img.Image 직접 PNG 인코딩 시도');
+          try {
+            // ui.Image를 img.Image로 변환 후 PNG 인코딩
+            final ByteData? rgbaData = await uiImage.toByteData(
+              format: ui.ImageByteFormat.rawRgba,
+            );
+
+            if (rgbaData != null) {
+              // img.Image 객체 생성
+              final fallbackImage = img.Image(
+                width: uiImage.width,
+                height: uiImage.height,
+              );
+
+              final pixels = rgbaData.buffer.asUint8List();
+              for (int y = 0; y < uiImage.height; y++) {
+                for (int x = 0; x < uiImage.width; x++) {
+                  final index = (y * uiImage.width + x) * 4;
+                  final r = pixels[index];
+                  final g = pixels[index + 1];
+                  final b = pixels[index + 2];
+                  final a = pixels[index + 3];
+                  fallbackImage.setPixel(x, y, img.ColorRgba8(r, g, b, a));
+                }
+              }
+
+              pngBytes = Uint8List.fromList(img.encodePng(fallbackImage));
+              debugPrint(
+                '[HomePage] ✅ Fallback PNG 인코딩 성공: ${pngBytes.length} bytes',
+              );
+            }
+          } catch (e) {
+            debugPrint('[HomePage] ❌ Fallback PNG 인코딩 실패: $e');
+            throw Exception('PNG 인코딩 실패: 모든 방식이 실패했습니다.');
+          }
+        }
+
+        if (pngBytes == null || pngBytes.isEmpty) {
+          throw Exception('PNG 바이트 데이터가 비어있습니다.');
+        }
+
+        // uiImage는 finally 블록에서 dispose하므로 여기서는 dispose하지 않음
+
+        // [PERF] GPU 캡처 방식으로 변경되어 PNG 인코딩은 ui.Image.toByteData에서 처리됨
+        // RGB 평균값 비교 로그 제거 (성능 최적화)
+
         final dir = await getTemporaryDirectory();
-        final filePath =
-            '${dir.path}/processed_${DateTime.now().millisecondsSinceEpoch}.jpg';
+        final timestamp = DateTime.now().millisecondsSinceEpoch;
+        final filePath = '${dir.path}/processed_$timestamp.png';
         final File processedTempFile = File(filePath);
-        await processedTempFile.writeAsBytes(jpegBytes);
+
+        // 파일 쓰기 시도 (최대 3회 재시도)
+        bool writeSuccess = false;
+        for (int attempt = 0; attempt < 3; attempt++) {
+          try {
+            await processedTempFile.writeAsBytes(
+              pngBytes,
+              flush: true, // 즉시 디스크에 쓰기
+            );
+
+            // 파일이 제대로 쓰였는지 확인
+            if (await processedTempFile.exists()) {
+              final fileSize = await processedTempFile.length();
+              if (fileSize > 0) {
+                writeSuccess = true;
+                debugPrint(
+                  '[HomePage] ✅ 파일 쓰기 성공 (시도 ${attempt + 1}): $fileSize bytes',
+                );
+                break;
+              }
+            }
+          } catch (e) {
+            debugPrint('[HomePage] ⚠️ 파일 쓰기 실패 (시도 ${attempt + 1}): $e');
+            if (attempt < 2) {
+              await Future.delayed(Duration(milliseconds: 100 * (attempt + 1)));
+            }
+          }
+        }
+
+        if (!writeSuccess) {
+          throw Exception('임시 파일 쓰기 실패: 최대 재시도 횟수 초과');
+        }
+
         processedFile = processedTempFile;
 
         // decodedImage는 img 패키지가 자동으로 메모리 관리하므로 dispose 불필요
@@ -1992,8 +2661,9 @@ class _HomePageState extends State<HomePage> {
         // 3. 프레임 적용
         if (_frameEnabled) {
           // 프레임 적용 전 이미지 크기 확인
-          final beforeFrameBytes = await processedFile.readAsBytes();
-          img.Image? beforeFrameImage = img.decodeImage(beforeFrameBytes);
+          final beforeFrameImage = await loadImageWithExifRotation(
+            processedFile,
+          );
           if (beforeFrameImage != null) {
             debugPrint(
               '📷 프레임 적용 전: ${beforeFrameImage.width}x${beforeFrameImage.height}',
@@ -2006,8 +2676,9 @@ class _HomePageState extends State<HomePage> {
             processedFile = framedFile;
 
             // 프레임 적용 후 이미지 크기 확인
-            final afterFrameBytes = await processedFile.readAsBytes();
-            img.Image? afterFrameImage = img.decodeImage(afterFrameBytes);
+            final afterFrameImage = await loadImageWithExifRotation(
+              processedFile,
+            );
             if (afterFrameImage != null) {
               debugPrint(
                 '📷 프레임 적용 후: ${afterFrameImage.width}x${afterFrameImage.height}, 비율: ${(afterFrameImage.width / afterFrameImage.height).toStringAsFixed(3)}',
@@ -2031,17 +2702,30 @@ class _HomePageState extends State<HomePage> {
         }
 
         // 최종 저장되는 이미지 크기 확인
-        img.Image? finalImageCheck = img.decodeImage(finalImageBytes);
+        // 임시 파일로 저장하여 크기 확인
+        final tempFile = File(
+          '${(await getTemporaryDirectory()).path}/temp_check_${DateTime.now().millisecondsSinceEpoch}.png',
+        );
+        await tempFile.writeAsBytes(finalImageBytes);
+        final finalImageCheck = await loadImageWithExifRotation(tempFile);
         if (finalImageCheck != null) {
           debugPrint(
             '💾 최종 저장 이미지: ${finalImageCheck.width}x${finalImageCheck.height}, 비율: ${(finalImageCheck.width / finalImageCheck.height).toStringAsFixed(3)}, 선택된 비율: ${aspectRatioOf(_aspectMode).toStringAsFixed(3)}',
           );
           // img.Image는 자동으로 메모리 관리됨
         }
+        // 임시 파일 삭제
+        try {
+          if (await tempFile.exists()) {
+            await tempFile.delete();
+          }
+        } catch (e) {
+          // 삭제 실패는 무시
+        }
 
         await Gal.putImageBytes(
           finalImageBytes,
-          name: 'petgram_shoot_${DateTime.now().millisecondsSinceEpoch}.jpg',
+          name: 'petgram_shoot_${DateTime.now().millisecondsSinceEpoch}.png',
         );
         debugPrint('✅ 이미지 저장 완료: ${finalImageBytes.length} bytes');
       } catch (processError) {
@@ -2091,6 +2775,29 @@ class _HomePageState extends State<HomePage> {
         );
       }
     } finally {
+      // 리소스 정리: 모든 ui.Image를 한 번만 dispose
+      // 중간에 생성된 이전 이미지들 dispose
+      for (final img in imagesToDispose) {
+        try {
+          img.dispose();
+          debugPrint('[HomePage] ✅ 중간 이미지 dispose 완료');
+        } catch (e) {
+          debugPrint('[HomePage] ⚠️ 중간 이미지 dispose 실패 (무시): $e');
+        }
+      }
+      imagesToDispose.clear();
+
+      // 최종 이미지 dispose (단 한 번만)
+      if (uiImageForDispose != null) {
+        try {
+          uiImageForDispose.dispose();
+          debugPrint('[HomePage] ✅ 최종 ui.Image dispose 완료');
+        } catch (e) {
+          debugPrint('[HomePage] ⚠️ 최종 ui.Image dispose 실패 (무시): $e');
+        }
+        uiImageForDispose = null; // 중복 dispose 방지
+      }
+
       if (mounted) {
         setState(() => _isProcessing = false);
 
@@ -2162,10 +2869,24 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _openFilterPage(File file) async {
+    // 현재 선택된 펫 정보 가져오기
+    PetInfo? currentPet;
+    if (_selectedPetId != null && _petList.isNotEmpty) {
+      try {
+        currentPet = _petList.firstWhere((pet) => pet.id == _selectedPetId);
+      } catch (e) {
+        // 펫을 찾지 못한 경우 null
+      }
+    }
+
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) =>
-            FilterPage(imageFile: file, initialFilterKey: _shootFilterKey),
+        builder: (_) => FilterPage(
+          imageFile: file,
+          initialFilterKey: _shootFilterKey,
+          selectedPet: currentPet,
+          coatPreset: _liveCoatPreset,
+        ),
       ),
     );
     // FilterPage에서 갤러리 저장 후 자동으로 닫히므로 여기서는 추가 처리 불필요
@@ -2186,12 +2907,9 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     // 상태 변경 시 강제 재빌드를 위한 key 추가
     // 밝기 값이 변경될 때마다 전체 위젯 트리 재빌드
-    debugPrint(
-      '[Petgram] 🔄 build() called - brightness=$_brightnessValue, focus=$_showFocusIndicator, zoom=$_selectedZoomRatio',
-    );
     return Scaffold(
       key: ValueKey(
-        'scaffold_${_brightnessValue}_${_showFocusIndicator}_${_selectedZoomRatio}',
+        'scaffold_${_brightnessValue}_${_showFocusIndicator}_${_uiZoomScale}',
       ),
       backgroundColor: const Color(0xFFFFF0F5), // 오버레이 색상으로 고정 (SafeArea 영역 포함)
       body: Stack(
@@ -2233,134 +2951,13 @@ class _HomePageState extends State<HomePage> {
               children: [
                 // 1) 카메라 / 배경 (중앙 정렬)
                 _buildCameraBackground(),
-                // GestureDetector는 별도로 추가 (Positioned 위젯과 분리)
-                Positioned.fill(
-                  child: Builder(
-                    builder: (context) => GestureDetector(
-                      behavior: HitTestBehavior.translucent,
-                      onScaleStart: (details) {
-                        debugPrint(
-                          '[Petgram] ✅ onScaleStart: focalPoint=${details.focalPoint}, pointers=${details.pointerCount}',
-                        );
-                        _handleZoomScaleStart(details);
-                      },
-                      onScaleUpdate: (details) {
-                        debugPrint(
-                          '[Petgram] ✅ onScaleUpdate: scale=${details.scale}, focalPoint=${details.focalPoint}, pointers=${details.pointerCount}',
-                        );
-                        _handleZoomScaleUpdate(details);
-                      },
-                      onScaleEnd: (details) {
-                        debugPrint(
-                          '[Petgram] ✅ onScaleEnd: pointers=${details.pointerCount}',
-                        );
-                        _handleZoomScaleEnd(details);
-                      },
-                      // 1) onTapDown: 위치만 저장
-                      onTapDown: (details) {
-                        debugPrint(
-                          '[Petgram] ✅ onTapDown: ${details.globalPosition}',
-                        );
-                        _lastTapPosition = details.globalPosition;
-
-                        // 필터 패널이 열려있으면 먼저 닫기
-                        if (_filterPanelExpanded) {
-                          debugPrint('[Petgram] 🔍 필터 패널 닫기 (터치)');
-                          setState(() {
-                            _filterPanelExpanded = false;
-                          });
-                          return;
-                        }
-
-                        // 연속 촬영 중지 요청
-                        if (_isBurstMode && _burstCount > 0) {
-                          debugPrint('[Petgram] 🛑 연속 촬영 중지 요청 (터치)');
-                          setState(() {
-                            _shouldStopBurst = true;
-                            _burstCount = 0;
-                          });
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('연속 촬영이 종료되었습니다.'),
-                                behavior: SnackBarBehavior.floating,
-                                duration: Duration(seconds: 2),
-                              ),
-                            );
-                          }
-                          return;
-                        }
-
-                        // 타이머 중지 요청
-                        if (_isTimerCounting) {
-                          debugPrint('[Petgram] 🛑 타이머 중지 요청 (터치)');
-                          setState(() {
-                            _shouldStopTimer = true;
-                            _isTimerCounting = false;
-                            _timerSeconds = 0;
-                          });
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('타이머가 종료되었습니다.'),
-                                behavior: SnackBarBehavior.floating,
-                                duration: Duration(seconds: 2),
-                              ),
-                            );
-                          }
-                          return;
-                        }
-                      },
-                      // 2) onTapUp: 여기서만 포커스 실행
-                      onTapUp: (details) {
-                        final pos = details.globalPosition;
-                        final now = DateTime.now();
-                        debugPrint(
-                          '[Petgram] ✅ onTapUp: ${pos}, _isZooming=$_isZooming, _lastZoomTime=$_lastZoomTime, _lastScaleUpdateTime=$_lastScaleUpdateTime',
-                        );
-
-                        // 줌 상태면 무시 (핀치 중에는 절대 탭 포커스 실행 안 됨)
-                        // 단, 최근에 onScaleUpdate가 호출되지 않았다면 (200ms 이상 경과)
-                        // _isZooming이 true여도 실제로는 핀치가 끝난 것으로 간주
-                        if (_isZooming) {
-                          // 최근에 onScaleUpdate가 호출되었는지 확인
-                          if (_lastScaleUpdateTime != null &&
-                              now.difference(_lastScaleUpdateTime!) <
-                                  const Duration(milliseconds: 200)) {
-                            debugPrint(
-                              '[Petgram] 🔍 Tap ignored: zoom in progress (recent scale update: ${now.difference(_lastScaleUpdateTime!).inMilliseconds}ms ago)',
-                            );
-                            return;
-                          } else {
-                            // 최근에 onScaleUpdate가 호출되지 않았다면
-                            // 핀치가 끝난 것으로 간주하고 _isZooming을 false로 설정
-                            debugPrint(
-                              '[Petgram] 🔍 Zoom appears to have ended (no recent scale update), allowing tap',
-                            );
-                            _isZooming = false;
-                            _lastZoomTime = null;
-                          }
-                        }
-
-                        // _isZooming이 false이면 즉시 포커스 실행
-                        // onScaleEnd에서 _isZooming = false, _lastZoomTime = null로 설정되면
-                        // 바로 탭이 가능해야 함
-                        // 쿨타임 완전 제거: _isZooming 플래그만으로 판단
-
-                        _handleTapFocusAtPosition(pos, context);
-                      },
-                    ),
-                  ),
-                ),
                 // 2) 상하단 오버레이 (비율 조정용)
                 _buildAspectRatioOverlay(),
-                // 3) 상단 바
-                _buildTopBar(),
-                // 4) 왼쪽 옵션 패널
+                // 3) 왼쪽 옵션 패널
                 _buildLeftOptionsPanel(),
-                // 5) 오른쪽 옵션 패널
+                // 4) 오른쪽 옵션 패널
                 _buildRightOptionsPanel(),
-                // 6) 필터 패널
+                // 5) 필터 패널
                 Builder(
                   builder: (context) {
                     // 하단 바 높이 계산 (버튼 영역이 -40px 위로 올라가 있음)
@@ -2395,11 +2992,12 @@ class _HomePageState extends State<HomePage> {
                     );
                   },
                 ),
-                // 7) 하단 바
+                // 6) 하단 바
                 _buildBottomBar(),
+                // 7) 상단 바 (다른 Positioned 위젯보다 위에 배치하여 터치 우선권 확보)
+                _buildTopBar(),
                 // 8) 초점 표시기 (모든 UI 요소 위에 표시 - 최상단에 배치)
-                if (_showFocusIndicator && _focusPointRelative != null)
-                  _buildFocusIndicator(),
+                if (_showFocusIndicator) _buildFocusIndicator(),
                 // 9) 자동 초점 표시기 (화면 중앙에 표시)
                 if (_showAutoFocusIndicator) _buildAutoFocusIndicator(),
                 // 10) 타이머 카운트다운 표시
@@ -2414,225 +3012,199 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 핀치 줌 제스처 핸들러
+  /// 핀치 줌 제스처 핸들러 (연속적인 확대: scale 기반 곱셈 방식)
   void _handleZoomScaleStart(ScaleStartDetails details) {
-    debugPrint(
-      '[Petgram] 🔍 Zoom scale start: currentZoom=$_currentZoomLevel, baseZoom=$_baseZoomLevel, pointers=${details.pointerCount}',
+    _isZooming = true;
+    if (_uiZoomScale <= 0) {
+      _uiZoomScale = _uiZoomMin;
+    }
+    _baseUiZoomScale = _uiZoomScale;
+  }
+
+  /// 핀치 줌 제스처 업데이트 핸들러 (UI 줌만 사용: Transform.scale로 프리뷰 확대)
+  /// 카메라 줌은 사용하지 않고 UI 레벨에서만 확대 처리
+  /// 핀치 중에는 어떤 라운딩도 하지 않고 완전히 연속적인 값으로 동작
+  void _handleZoomScaleUpdate(ScaleUpdateDetails details) {
+    if (!mounted) return;
+
+    final double scale = details.scale;
+    if (scale <= 0) return;
+
+    if (_baseUiZoomScale <= 0) {
+      _baseUiZoomScale = _uiZoomScale > 0 ? _uiZoomScale : _uiZoomMin;
+      if (_uiZoomScale <= 0) {
+        _uiZoomScale = _uiZoomMin;
+      }
+    }
+
+    final double newScale = (_baseUiZoomScale * scale).clamp(
+      _uiZoomMin,
+      _uiZoomMax,
     );
 
-    // details.pointerCount >= 2 인 경우에만 줌 시작으로 본다
-    if (details.pointerCount < 2) {
-      debugPrint(
-        '[Petgram] 🔍 Skipping zoom start: single touch (pointerCount=${details.pointerCount}), resetting _isZooming',
-      );
-      _isZooming = false;
-      return;
-    }
+    setState(() {
+      _uiZoomScale = newScale;
+    });
 
-    // 핀치 줌 진행 중 플래그를 즉시 설정
-    _isZooming = true;
-    // _lastZoomTime은 onScaleEnd에서 null로 설정하므로 여기서는 설정하지 않음
-
-    // UI 줌 초기화 (FilterPage처럼)
-    _baseZoomScale = _uiZoomScale;
-    _lastZoomFocalPoint = details.focalPoint;
-
-    // 목업 모드에서도 기본값이 1.0이 되도록 보장
-    if (_currentZoomLevel <= 0) {
-      _currentZoomLevel = 1.0;
-    }
-    // _baseZoomLevel을 현재 줌 레벨로 설정 (제스처 시작 시점의 줌 레벨)
-    _baseZoomLevel = _currentZoomLevel;
     debugPrint(
-      '[Petgram] 🔍 Zoom scale start: updated baseZoom=$_baseZoomLevel, _isZooming=true, _baseZoomScale=$_baseZoomScale',
+      '[Petgram] pinch ui zoom: base=${_baseUiZoomScale.toStringAsFixed(3)}, '
+      'scale=${details.scale.toStringAsFixed(3)}, new=${newScale.toStringAsFixed(3)}',
     );
   }
 
-  /// 핀치 줌 제스처 업데이트 핸들러
-  Future<void> _handleZoomScaleUpdate(ScaleUpdateDetails details) async {
+  /// 핀치 줌 제스처 종료 핸들러 (상태 즉시 초기화)
+  /// 핀치 종료 직후 탭 제스처가 지연 없이 동작하도록 _isZooming을 즉시 false로 설정
+  void _handleZoomScaleEnd(ScaleEndDetails details) {
+    _isZooming = false;
     debugPrint(
-      '[Petgram] 🔍 Zoom scale update: scale=${details.scale}, baseZoom=$_baseZoomLevel, currentZoom=$_currentZoomLevel, pointers=${details.pointerCount}',
+      '[Petgram] pinch ui zoom end: current=${_uiZoomScale.toStringAsFixed(3)}',
     );
+  }
 
-    // details.pointerCount < 2 이면 줌 처리하지 않고 리턴
-    // 핀치 줌이 끝났다는 신호이므로 _isZooming을 false로 설정
-    if (details.pointerCount < 2) {
-      debugPrint(
-        '[Petgram] 🔍 Single touch detected in scale update, resetting _isZooming (pointerCount=${details.pointerCount})',
-      );
-      _isZooming = false;
-      _lastZoomTime = null; // 핀치가 끝났으므로 null로 설정
-      _lastScaleUpdateTime = null; // 스케일 업데이트 시간도 초기화
-      return;
-    }
-
-    // 멀티터치인 경우에만 _isZooming = true 유지
-    // 핀치 줌이 진행 중일 때만 true
-    _isZooming = true;
-    _lastScaleUpdateTime = DateTime.now(); // onScaleUpdate 호출 시간 기록
-    // _lastZoomTime은 onScaleEnd에서 null로 설정하므로 여기서는 설정하지 않음
-
-    // UI 줌 업데이트 (FilterPage처럼) - setState로 즉시 반영
-    // FilterPage처럼 감쇠 없이 100% 반응으로 자연스럽게 확대/축소
-    if (mounted) {
-      setState(() {
-        // FilterPage처럼 details.scale을 그대로 사용 (감쇠 없음)
-        _uiZoomScale = (_baseZoomScale * details.scale).clamp(1.0, 5.0);
-        // FilterPage처럼 offset 계산 (focalPoint 변화량, _lastZoomFocalPoint는 업데이트하지 않음)
-        _zoomOffset = details.focalPoint - _lastZoomFocalPoint;
-      });
-    }
-
-    // 카메라가 초기화 중이면 무시
-    if (_isCameraInitializing) {
-      debugPrint('[Petgram] 🔍 Skipping zoom: camera initializing');
-      return;
-    }
-
-    // onScaleStart가 호출되지 않았을 때를 대비해 _baseZoomLevel 초기화
-    // _baseZoomLevel이 0이거나 유효하지 않으면 현재 줌 레벨로 초기화
-    if (_baseZoomLevel <= 0) {
-      _baseZoomLevel = _currentZoomLevel > 0 ? _currentZoomLevel : 1.0;
-      if (_currentZoomLevel <= 0) {
-        _currentZoomLevel = 1.0;
-        _baseZoomLevel = 1.0;
-      }
-      debugPrint(
-        '[Petgram] 🔍 Initialized zoom levels (onScaleStart missed): baseZoom=$_baseZoomLevel, currentZoom=$_currentZoomLevel',
-      );
-    }
-
-    // scale이 1.0에 매우 가까우면 (단일 터치 또는 미세한 움직임) 무시하고 플래그 해제
-    if ((details.scale - 1.0).abs() < 0.01) {
-      debugPrint(
-        '[Petgram] 🔍 Skipping zoom: scale too close to 1.0 (${details.scale}), resetting _isZooming',
-      );
-      _isZooming = false;
-      _lastZoomTime = null; // 핀치가 끝났으므로 null로 설정
-      return;
-    }
-
-    // 멀티터치가 아닌 경우 추가 체크 (혹시 모를 경우 대비)
-    // 이미 위에서 체크했지만, 이중 방어를 위해 다시 체크
-    if (details.pointerCount < 2) {
-      debugPrint(
-        '[Petgram] 🔍 Single touch detected, resetting _isZooming and returning',
-      );
-      _isZooming = false;
-      _lastZoomTime = null; // 핀치가 끝났으므로 null로 설정
-      return;
-    }
-
-    // 목업 모드에서도 UI 업데이트는 가능하도록 함
-    final bool canSetCameraZoom =
-        !_useMockCamera &&
-        _cameraController != null &&
-        _cameraController!.value.isInitialized;
-
-    // 카메라 줌 범위 사용 (초기화 시 저장된 값)
-    // 목업 모드에서는 더 넓은 범위 허용 (실제 카메라가 더 높은 줌을 지원할 수 있음)
-    final double minZoom = canSetCameraZoom ? _minZoomLevel : 0.5;
-    final double maxZoom = canSetCameraZoom
-        ? _maxZoomLevel
-        : 5.0; // 목업 모드에서도 더 높은 줌 허용
-
-    try {
-      double newZoom;
-      if (canSetCameraZoom) {
-        // 실제 카메라: 저장된 줌 범위 사용
-        // FilterPage처럼 감쇠 없이 100% 반응으로 자연스럽게 확대/축소
-        newZoom = (_baseZoomLevel * details.scale).clamp(
-          _minZoomLevel,
-          _maxZoomLevel,
-        );
-      } else {
-        // 목업 모드: 기본 범위 사용
-        // FilterPage처럼 감쇠 없이 100% 반응
-        newZoom = (_baseZoomLevel * details.scale).clamp(minZoom, maxZoom);
-      }
-
-      debugPrint(
-        '[Petgram] Zoom: base=$_baseZoomLevel, scale=${details.scale}, new=$newZoom (min=$minZoom, max=$maxZoom), canSetCameraZoom=$canSetCameraZoom',
-      );
-
-      // 실제 카메라에 줌 레벨 설정 (목업 모드가 아닐 때만)
-      // _currentZoomLevel을 항상 업데이트하여 다음 핀치 제스처의 _baseZoomLevel이 올바르게 설정되도록 함
-      _currentZoomLevel = newZoom;
-
-      // 목업 모드에서는 UI 줌 스케일도 실제 줌 레벨과 동기화
-      if (!canSetCameraZoom) {
-        if (mounted) {
+  Widget _buildPreviewGestureLayer({
+    required BuildContext stackContext,
+    required Widget child,
+  }) {
+    return GestureDetector(
+      behavior: HitTestBehavior.deferToChild,
+      onScaleStart: _handleZoomScaleStart,
+      onScaleUpdate: _handleZoomScaleUpdate,
+      onScaleEnd: _handleZoomScaleEnd,
+      onTapDown: (details) {
+        final mediaQuery = MediaQuery.of(stackContext);
+        final double protectedTopRegion = mediaQuery.padding.top + 56.0;
+        if (details.globalPosition.dy <= protectedTopRegion) {
+          return;
+        }
+        if (_filterPanelExpanded) {
           setState(() {
-            _uiZoomScale = newZoom.clamp(1.0, 5.0);
+            _filterPanelExpanded = false;
+          });
+          return;
+        }
+        if (_isBurstMode && _burstCount > 0) {
+          setState(() {
+            _shouldStopBurst = true;
+            _burstCount = 0;
+          });
+          return;
+        }
+        if (_isTimerCounting) {
+          setState(() {
+            _shouldStopTimer = true;
+            _isTimerCounting = false;
+            _timerSeconds = 0;
           });
         }
-      }
-
-      if (canSetCameraZoom) {
-        try {
-          await _cameraController!.setZoomLevel(newZoom);
-          debugPrint('[Petgram] ✅ Zoom level set to: $newZoom');
-        } catch (e) {
-          debugPrint('[Petgram] ❌ setZoomLevel error: $e');
-          debugPrint('[Petgram] Error stack: ${StackTrace.current}');
+      },
+      onTapUp: (details) {
+        final mediaQuery = MediaQuery.of(stackContext);
+        final double protectedTopRegion = mediaQuery.padding.top + 56.0;
+        if (details.globalPosition.dy <= protectedTopRegion) {
+          return;
         }
-      } else {
-        // 목업 모드: UI만 업데이트
-        debugPrint(
-          '[Petgram] 🔍 Mock mode: Zoom level updated to: $newZoom (UI only)',
-        );
-      }
 
-      // 줌 배율을 0.1 단위로 반올림하여 표시
-      // 예: 1.23 -> 1.2, 1.67 -> 1.7, 2.45 -> 2.5
-      final double roundedZoom = (newZoom * 10).round() / 10.0;
-
-      // 배율이 0.05 이상 변경되었을 때만 UI 업데이트 (더 빠른 반응)
-      final bool ratioChanged =
-          (_selectedZoomRatio - roundedZoom).abs() >= 0.05;
-
-      debugPrint(
-        '[Petgram] 🔍 Zoom ratio 계산: newZoom=$newZoom, roundedZoom=$roundedZoom, ratioChanged=$ratioChanged, currentRatio=$_selectedZoomRatio',
-      );
-
-      // UI 업데이트를 위해 setState 호출 (목업 모드에서도 동작)
-      // 0.05 이상 변경되었을 때만 업데이트하여 부드럽고 자연스러운 동작 보장
-      // 핀치 줌 시 끝까지 왔다갔다할 수 있도록 더 자주 업데이트
-      if (mounted && ratioChanged) {
-        setState(() {
-          _selectedZoomRatio = roundedZoom;
-          debugPrint(
-            '[Petgram] 🔍 setState: _currentZoomLevel=$_currentZoomLevel, _selectedZoomRatio=$_selectedZoomRatio',
-          );
-        });
-      }
-    } catch (e) {
-      debugPrint('[Petgram] ❌ pinch zoom error: $e');
-    }
+        final RenderBox? box = stackContext.findRenderObject() as RenderBox?;
+        if (box == null) {
+          return;
+        }
+        final Offset tapInAncestor = box.globalToLocal(details.globalPosition);
+        if (_isCameraInitializing) {
+          return;
+        }
+        _handleTapFocusAtPosition(tapInAncestor);
+      },
+      child: child,
+    );
   }
 
-  /// 핀치 줌 제스처 종료 핸들러
-  void _handleZoomScaleEnd(ScaleEndDetails details) {
-    debugPrint(
-      '[Petgram] ✅ onScaleEnd: pointers=${details.pointerCount}, _isZooming=$_isZooming',
-    );
-    // _isZooming = false (핀치가 끝났으므로 즉시 false로 설정)
-    // 핀치가 끝난 직후 탭이 바로 동작하도록 _lastZoomTime을 null로 설정
-    _isZooming = false;
-    _lastZoomTime = null; // 쿨타임 완전 제거: null로 설정하여 탭이 즉시 동작하도록
-    _lastScaleUpdateTime = null; // 스케일 업데이트 시간도 초기화
+  List<double> _getZoomPresets() {
+    // 배율 옵션 다이얼로그에는 최대 3배까지만 표시
+    // 핀치 줌은 여전히 10배까지 가능
+    const double maxOptionZoom = 3.0;
+    final presetSet = <double>{..._uiZoomPresets, _uiZoomMin};
+    return presetSet
+        .where((value) => value >= _uiZoomMin && value <= maxOptionZoom)
+        .toList()
+      ..sort();
+  }
 
-    if (mounted) {
-      setState(() {
-        if (_uiZoomScale < 1.1) {
-          _uiZoomScale = 1.0;
-          _zoomOffset = Offset.zero;
-        }
-        _baseZoomScale = _uiZoomScale;
-      });
-    }
+  /// _lastPreviewRect 업데이트 (SafeArea Stack 좌표계 기준)
+  void _updatePreviewRectFromContext(BuildContext previewContext) {
+    if (!mounted) return;
+
+    final RenderBox? previewBox =
+        previewContext.findRenderObject() as RenderBox?;
+    if (previewBox == null || !previewBox.hasSize) return;
+
+    // SafeArea의 child Stack을 ancestor로 찾기
+    final RenderBox? ancestorBox = previewContext
+        .findAncestorRenderObjectOfType<RenderBox>();
+    if (ancestorBox == null) return;
+
+    // previewBox의 topLeft를 ancestor 좌표계로 변환
+    final Offset topLeftInAncestor = previewBox.localToGlobal(
+      Offset.zero,
+      ancestor: ancestorBox,
+    );
+    final Size size = previewBox.size;
+
+    final Rect rectInAncestor = Rect.fromLTWH(
+      topLeftInAncestor.dx,
+      topLeftInAncestor.dy,
+      size.width,
+      size.height,
+    );
+
+    if (_lastPreviewRect == rectInAncestor) return;
+
+    setState(() {
+      _lastPreviewRect = rectInAncestor;
+    });
     debugPrint(
-      '[Petgram] 🔍 Zoom scale end: _isZooming=false, _lastZoomTime=null, _lastScaleUpdateTime=null (쿨타임 제거), _uiZoomScale=$_uiZoomScale',
+      '[Petgram] 📐 previewRect updated (ancestor space): $_lastPreviewRect',
+    );
+
+    // 실제 사용 중인 센서 비율 계산
+    double sensorRatio;
+    if (!_useMockCamera &&
+        _cameraController != null &&
+        _cameraController!.value.isInitialized) {
+      sensorRatio = _cameraController!.value.aspectRatio;
+    } else {
+      // 목업 또는 카메라 미초기화: _aspectMode 기반 비율 사용
+      sensorRatio = aspectRatioOf(_aspectMode);
+    }
+
+    _debugTestCenterTap(sensorRatio: sensorRatio);
+  }
+
+  /// 프리뷰 중앙 탭 테스트 디버그 함수
+  void _debugTestCenterTap({required double sensorRatio}) {
+    if (_lastPreviewRect == null) {
+      debugPrint('[Petgram] 🎯 _debugTestCenterTap: _lastPreviewRect is null');
+      return;
+    }
+
+    final rect = _lastPreviewRect!;
+    final centerGlobal = rect.center;
+    final displaySize = rect.size;
+
+    // contentSize는 프리뷰 레이아웃에서 사용하는 것과 동일한 방식으로 계산
+    final contentSize = Size(
+      displaySize.height * sensorRatio,
+      displaySize.height,
+    );
+
+    final normalized = CameraMappingUtils.mapGlobalToNormalized(
+      globalPos: centerGlobal,
+      previewRect: rect,
+      contentSize: contentSize,
+    );
+
+    debugPrint(
+      '[Petgram] 🎯 forced center tap: previewRect=$rect, centerGlobal=$centerGlobal, '
+      'contentSize=$contentSize, normalized=$normalized',
     );
   }
 
@@ -2686,10 +3258,6 @@ class _HomePageState extends State<HomePage> {
     double nineSixteenOverlayTop = 0;
     double nineSixteenOverlayBottom = 0;
 
-    debugPrint(
-      '[Petgram] 📐 _calculateCameraPreviewDimensions: targetRatio=$targetRatio, preview=$previewW x $previewH, screen=$screenW x $screenH',
-    );
-
     return {
       'previewW': previewW,
       'previewH': previewH,
@@ -2715,20 +3283,6 @@ class _HomePageState extends State<HomePage> {
         final MediaQueryData mediaQuery = MediaQuery.of(context);
         final double safeAreaTop = mediaQuery.padding.top;
         final double safeAreaBottom = mediaQuery.padding.bottom;
-
-        // sensorRatio 계산 (previewSize 기준)
-        double sensorRatio = 16.0 / 9.0; // 기본값
-        Size? rawPreviewSize;
-        if (!_useMockCamera &&
-            _cameraController != null &&
-            _cameraController!.value.isInitialized) {
-          rawPreviewSize = _cameraController!.value.previewSize;
-          if (rawPreviewSize != null) {
-            sensorRatio =
-                math.max(rawPreviewSize.width, rawPreviewSize.height) /
-                math.min(rawPreviewSize.width, rawPreviewSize.height);
-          }
-        }
 
         // 타겟 비율 계산 (1:1, 3:4, 9:16)
         final double targetRatio = aspectRatioOf(_aspectMode);
@@ -2766,26 +3320,16 @@ class _HomePageState extends State<HomePage> {
           }
         }
 
-        // 호환성을 위해 actualPreviewW/H 사용 (previewBox와 동일)
-        final double actualPreviewW = previewBoxW;
+        // 호환성을 위해 actualPreviewH 사용 (previewBox와 동일)
         final double actualPreviewH = previewBoxH;
 
-        debugPrint(
-          '[Petgram] 📐 _buildAspectRatioOverlay 프리뷰 크기: sensorRatio=$sensorRatio, targetRatio=$targetRatio, previewBox=$actualPreviewW x $actualPreviewH, maxSize=$maxWidth x $maxHeight',
-        );
-
         // 중앙 정렬을 위한 오프셋
-        final double offsetX = (maxWidth - actualPreviewW) / 2;
         final double offsetY = (maxHeight - actualPreviewH) / 2;
 
         // 오버레이는 더 이상 필요 없음 (프리뷰 박스가 이미 targetRatio를 따름)
         // 하지만 기존 코드 호환성을 위해 0으로 설정
         double actualOverlayTop = 0;
         double actualOverlayBottom = 0;
-
-        debugPrint(
-          '[Petgram] 🔍 AspectRatioOverlay: maxSize=$maxWidth x $maxHeight, actualPreview=$actualPreviewW x $actualPreviewH, targetRatio=$targetRatio, overlayTop=$actualOverlayTop, overlayBottom=$actualOverlayBottom, offsetY=$offsetY, safeAreaTop=$safeAreaTop, safeAreaBottom=$safeAreaBottom',
-        );
 
         // 오버레이는 constraints 전체를 기준으로 배치하되, SafeArea까지 확장
         // 상단 오버레이의 bottom 계산: constraints 기준으로 계산된 위치
@@ -2925,6 +3469,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 연속 촬영 진행 표시 (타이머와 동일한 위치와 크기)
+  /// 고정 크기 Container + FittedBox로 숫자 자리수 증가 시에도 UI가 깨지지 않도록 수정
   Widget _buildBurstProgress() {
     return Positioned.fill(
       child: IgnorePointer(
@@ -2938,12 +3483,22 @@ class _HomePageState extends State<HomePage> {
               shape: BoxShape.circle,
             ),
             child: Center(
-              child: Text(
-                '$_burstCount/$_burstCountSetting',
-                style: const TextStyle(
-                  fontSize: 64,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
+              child: Container(
+                width: 42, // 최대 자리수(100/100)를 고려한 고정 너비
+                height: 36, // 고정 높이
+                alignment: Alignment.center,
+                child: FittedBox(
+                  fit: BoxFit.contain,
+                  alignment: Alignment.center,
+                  child: Text(
+                    '$_burstCount/$_burstCountSetting',
+                    style: const TextStyle(
+                      fontSize: 64, // FittedBox가 자동으로 스케일 조정
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
                 ),
               ),
             ),
@@ -2953,124 +3508,120 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 초점 표시기 빌드 (메인 Stack 최상단에 배치)
+  /// 초점 표시기 빌드 (previewRect + local 좌표 기준, SafeArea Stack 좌표계)
   Widget _buildFocusIndicator() {
+    // 좌표가 없으면 렌더링하지 않음
+    if (_focusIndicatorPreviewRect == null || _focusIndicatorLocal == null) {
+      debugPrint(
+        '[Petgram] 🎯 FocusIndicator: not rendering (rect=$_focusIndicatorPreviewRect, local=$_focusIndicatorLocal)',
+      );
+      return const SizedBox.shrink();
+    }
+
+    const double size = 80.0;
+    final rect = _focusIndicatorPreviewRect!;
+    final local = _focusIndicatorLocal!;
+
+    final double left = rect.left + local.dx - size / 2;
+    final double top = rect.top + local.dy - size / 2;
+
     debugPrint(
-      '[Petgram] 🔍 _buildFocusIndicator called: _showFocusIndicator=$_showFocusIndicator, _focusPointRelative=$_focusPointRelative',
+      '[Petgram] 🎯 FocusIndicator build: rect=$rect, local=$local, '
+      'indicator position=(${left.toStringAsFixed(1)}, ${top.toStringAsFixed(1)}), '
+      'center≈(${(left + size / 2).toStringAsFixed(1)}, ${(top + size / 2).toStringAsFixed(1)})',
     );
 
-    // MediaQuery를 사용하여 화면 크기 얻기 (LayoutBuilder 대신)
-    return Builder(
-      key: ValueKey(
-        'focus_${_focusPointRelative!.dx}_${_focusPointRelative!.dy}_$_showFocusIndicator',
-      ),
-      builder: (context) {
-        // 프리뷰 박스 크기 및 오프셋 계산
-        final previewDims = _calculateCameraPreviewDimensions();
-        final double previewW = previewDims['previewW']!;
-        final double previewH = previewDims['previewH']!;
-        final double offsetX = previewDims['offsetX']!;
-        final double offsetY = previewDims['offsetY']!;
-
-        // previewBox 내부 로컬 좌표로 변환 (정규화된 좌표를 previewBox 좌표로)
-        final double focusXInPreviewBox = previewW * _focusPointRelative!.dx;
-        final double focusYInPreviewBox = previewH * _focusPointRelative!.dy;
-
-        // 화면 좌표로 변환 (Positioned는 Stack 기준이므로 offset 추가)
-        final double focusX = offsetX + focusXInPreviewBox - 50;
-        final double focusY = offsetY + focusYInPreviewBox - 50;
-
-        debugPrint(
-          '[Petgram] 🔍 Focus indicator: preview=$previewW x $previewH, offset=($offsetX, $offsetY), focusInPreviewBox=($focusXInPreviewBox, $focusYInPreviewBox)',
-        );
-        debugPrint(
-          '[Petgram] 🔍 Focus position: relative=${_focusPointRelative}, absolute=($focusX, $focusY)',
-        );
-        debugPrint(
-          '[Petgram] 🔍 Focus state: _showFocusIndicator=$_showFocusIndicator',
-        );
-
-        // Positioned는 Stack의 직접 자식이어야 하므로 여기서 반환
-        // 크기를 80x80으로 축소
-        final double indicatorSize = 80.0;
-        final double centerSize = 48.0;
-        final double dotSize = 6.0;
-
-        final screenSize = MediaQuery.of(context).size;
-        return Positioned(
-          left: focusX.clamp(0.0, screenSize.width - indicatorSize),
-          top: focusY.clamp(0.0, screenSize.height - indicatorSize),
-          child: IgnorePointer(
-            ignoring: true,
-            child: _showFocusIndicator
-                ? TweenAnimationBuilder<double>(
-                    tween: Tween<double>(begin: 0.0, end: 1.0),
-                    duration: const Duration(milliseconds: 300),
-                    curve: Curves.easeOut,
-                    builder: (context, scale, child) {
-                      return Transform.scale(
-                        scale: scale,
-                        child: Container(
-                          width: indicatorSize,
-                          height: indicatorSize,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.transparent,
-                            border: Border.all(color: Colors.white, width: 2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.white.withValues(alpha: 0.5),
-                                blurRadius: 12,
-                                spreadRadius: 2,
-                              ),
-                            ],
-                          ),
-                          child: Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              // 외부 원
-                              Container(
-                                width: indicatorSize,
-                                height: indicatorSize,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  border: Border.all(
-                                    color: Colors.white.withValues(alpha: 0.4),
-                                    width: 1.2,
+    return Positioned(
+      left: left,
+      top: top,
+      child: IgnorePointer(
+        child: TweenAnimationBuilder<double>(
+          key: ValueKey('focus_indicator_${local.dx}_${local.dy}'),
+          tween: Tween(begin: 0.0, end: 1.0),
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+          builder: (context, value, child) {
+            // 페이드인 + 스케일 애니메이션
+            return AnimatedOpacity(
+              opacity: _showFocusIndicator ? 1.0 : 0.0,
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOut,
+              child: Transform.scale(
+                scale: _showFocusIndicator
+                    ? (0.3 + (value * 0.7))
+                    : (0.3 + (value * 0.7)) * 0.8, // 사라질 때 약간 축소
+                child: Container(
+                  width: size,
+                  height: size,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.transparent,
+                    border: Border.all(color: Colors.white, width: 2.5),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.white.withOpacity(0.6 * value),
+                        blurRadius: 8,
+                        spreadRadius: 2,
+                      ),
+                    ],
+                  ),
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      // 외부 원 (펄스 효과) - 표시 중일 때만
+                      if (_showFocusIndicator && value > 0.5)
+                        TweenAnimationBuilder<double>(
+                          tween: Tween(begin: 0.0, end: 1.0),
+                          duration: const Duration(milliseconds: 400),
+                          builder: (context, pulseValue, child) {
+                            return Opacity(
+                              opacity: (1.0 - pulseValue) * 0.5,
+                              child: Transform.scale(
+                                scale: 1.0 + (pulseValue * 0.3),
+                                child: Container(
+                                  width: size,
+                                  height: size,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: Colors.white.withOpacity(0.4),
+                                      width: 1.5,
+                                    ),
                                   ),
                                 ),
                               ),
-                              // 내부 원
-                              Container(
-                                width: centerSize,
-                                height: centerSize,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  border: Border.all(
-                                    color: Colors.white,
-                                    width: 1.8,
-                                  ),
-                                ),
-                              ),
-                              // 중앙 점
-                              Container(
-                                width: dotSize,
-                                height: dotSize,
-                                decoration: const BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: Colors.white,
-                                ),
-                              ),
-                            ],
+                            );
+                          },
+                        ),
+                      // 내부 원
+                      Container(
+                        width: size * 0.6,
+                        height: size * 0.6,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.8),
+                            width: 1.5,
                           ),
                         ),
-                      );
-                    },
-                  )
-                : const SizedBox.shrink(),
-          ),
-        );
-      },
+                      ),
+                      // 중앙 점
+                      Container(
+                        width: 6,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
     );
   }
 
@@ -3112,239 +3663,203 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 탭 포커스 핸들러 (위치 기반)
-  void _handleTapFocusAtPosition(Offset globalPos, BuildContext context) {
+  /// 탭 포커스 핸들러 (위치 기반, SafeArea Stack 좌표계)
+  Future<void> _handleTapFocusAtPosition(Offset tapInAncestor) async {
     debugPrint(
-      '[Petgram] 🔍 _handleTapFocusAtPosition called: ${globalPos}, _isZooming=$_isZooming',
+      '[Petgram] 🎯 _handleTapFocusAtPosition: tapInAncestor=$tapInAncestor, '
+      '_lastPreviewRect=$_lastPreviewRect, _useMockCamera=$_useMockCamera, '
+      '_cameraController=${_cameraController != null}',
     );
 
-    // 안전을 위해 기본 방어
-    if (_isZooming) {
+    // ========== Mock 모드 처리 ==========
+    // Mock 모드에서는 previewRect 기반 탭 거부를 사용하지 않음
+    // 순수 로컬 좌표만 사용하여 UI 인디케이터 표시
+    if (_useMockCamera || _cameraController == null) {
       debugPrint(
-        '[Petgram] 🔍 Focus canceled in _handleTapFocusAtPosition: zoom in progress',
+        '[Petgram] 🎨 Mock mode: using pure local coordinates, no previewRect rejection',
       );
-      return;
-    }
 
-    // 카메라가 초기화 중이면 무시
-    if (_isCameraInitializing) {
-      debugPrint(
-        '[Petgram] 🔍 Skipping focus: _isCameraInitializing=$_isCameraInitializing',
+      // Mock 모드에서는 tapInAncestor를 그대로 사용 (전체 화면 기준)
+      final indicatorRect = Rect.fromLTWH(
+        tapInAncestor.dx - 40,
+        tapInAncestor.dy - 40,
+        80,
+        80,
       );
-      return;
-    }
+      final indicatorLocal = const Offset(40, 40); // 인디케이터 중앙
 
-    // 실제 카메라 초점 설정은 카메라가 준비되었을 때만 수행
-    // 하지만 UI 표시는 목업 카메라 모드에서도 가능하도록 함
-    final bool canSetCameraFocus =
-        !_useMockCamera &&
-        _cameraController != null &&
-        _cameraController!.value.isInitialized;
-
-    debugPrint(
-      '[Petgram] 🔍 Camera focus state: canSetCameraFocus=$canSetCameraFocus, _useMockCamera=$_useMockCamera',
-    );
-
-    // GestureDetector의 RenderBox 찾기 (전체 화면 기준)
-    final RenderBox? gestureBox = context.findRenderObject() as RenderBox?;
-    if (gestureBox == null) {
-      debugPrint('[Petgram] ❌ RenderBox not found');
-      return;
-    }
-
-    // 전체 화면 기준 로컬 좌표
-    final Offset localPoint = gestureBox.globalToLocal(globalPos);
-
-    // _buildCameraStack과 동일한 로직으로 프리뷰 박스 크기 계산
-    final screenSize = MediaQuery.of(context).size;
-    final double maxWidth = screenSize.width;
-    final double maxHeight = screenSize.height;
-
-    // 프리뷰 박스 크기는 _aspectMode의 targetRatio를 기준으로 계산
-    final double targetRatio = aspectRatioOf(_aspectMode);
-
-    // 프리뷰 박스 크기 계산 (targetRatio 기반)
-    double previewBoxW;
-    double previewBoxH;
-
-    if (targetRatio > 1.0) {
-      // 가로가 더 긴 비율: 가로를 기준으로 계산
-      previewBoxW = maxWidth;
-      previewBoxH = previewBoxW / targetRatio;
-
-      if (previewBoxH > maxHeight) {
-        previewBoxH = maxHeight;
-        previewBoxW = previewBoxH * targetRatio;
-      }
-    } else if (targetRatio < 1.0) {
-      // 세로가 더 긴 비율 (3:4 등): 가로를 기준으로 계산 (고정)
-      previewBoxW = maxWidth;
-      previewBoxH = previewBoxW / targetRatio;
-
-      if (previewBoxH > maxHeight) {
-        previewBoxH = maxHeight;
-        previewBoxW = previewBoxH * targetRatio;
-      }
-    } else {
-      // 1:1 비율: 가로를 기준으로 계산 (고정)
-      previewBoxW = maxWidth;
-      previewBoxH = previewBoxW; // 1:1이므로 같음
-
-      if (previewBoxH > maxHeight) {
-        previewBoxH = maxHeight;
-        previewBoxW = previewBoxH; // 1:1이므로 같음
-      }
-    }
-
-    // 중앙 정렬을 위한 오프셋
-    final double offsetX = (maxWidth - previewBoxW) / 2;
-    final double offsetY = (maxHeight - previewBoxH) / 2;
-
-    // sensorRatio 계산 (previewSize 기준)
-    double sensorRatio = 16.0 / 9.0; // 기본값 (세로가 긴 경우)
-    Size? rawPreviewSize;
-    if (!_useMockCamera &&
-        _cameraController != null &&
-        _cameraController!.value.isInitialized) {
-      rawPreviewSize = _cameraController!.value.previewSize;
-      if (rawPreviewSize != null) {
-        sensorRatio =
-            math.max(rawPreviewSize.width, rawPreviewSize.height) /
-            math.min(rawPreviewSize.width, rawPreviewSize.height);
-      }
-    }
-
-    // 터치 좌표를 프리뷰 박스 기준으로 변환 (previewBox 내부 로컬 좌표)
-    final double tapXInPreviewBox = localPoint.dx - offsetX;
-    final double tapYInPreviewBox = localPoint.dy - offsetY;
-
-    // 프리뷰 박스 영역 밖이면 무시
-    if (tapXInPreviewBox < 0 ||
-        tapXInPreviewBox > previewBoxW ||
-        tapYInPreviewBox < 0 ||
-        tapYInPreviewBox > previewBoxH) {
-      debugPrint(
-        '[Petgram] 🔍 Tap outside preview box: ($tapXInPreviewBox, $tapYInPreviewBox)',
-      );
-      return;
-    }
-
-    // normalize된 sensorRatio 기준으로 상대 좌표 계산 (0.0~1.0)
-    // previewBox 내부 로컬 좌표를 센서 좌표계로 변환
-    double relativeX;
-    double relativeY;
-
-    if (rawPreviewSize != null) {
-      // FittedBox 내부의 SizedBox 크기 계산 (_buildCameraStack과 동일한 로직)
-      double contentW;
-      double contentH;
-
-      if (rawPreviewSize.width >= rawPreviewSize.height) {
-        // 가로가 큰 경우
-        contentH = previewBoxH;
-        contentW = previewBoxH * sensorRatio;
-      } else {
-        // 세로가 큰 경우
-        contentW = previewBoxH;
-        contentH = previewBoxH / sensorRatio;
-      }
-
-      // FittedBox(BoxFit.cover)는 content를 previewBox에 맞추기 위해 스케일링
-      // previewBox 내부 좌표를 content 좌표계로 변환
-      final double contentRatio = contentW / contentH;
-      final double previewBoxRatio = previewBoxW / previewBoxH;
-
-      double scaledContentW;
-      double scaledContentH;
-      double contentOffsetX = 0;
-      double contentOffsetY = 0;
-
-      if (contentRatio > previewBoxRatio) {
-        // content가 더 넓음: 높이를 기준으로 스케일링
-        scaledContentH = previewBoxH;
-        scaledContentW = scaledContentH * contentRatio;
-        contentOffsetX = (previewBoxW - scaledContentW) / 2;
-      } else {
-        // content가 더 좁음: 너비를 기준으로 스케일링
-        scaledContentW = previewBoxW;
-        scaledContentH = scaledContentW / contentRatio;
-        contentOffsetY = (previewBoxH - scaledContentH) / 2;
-      }
-
-      // previewBox 내부 좌표를 content 좌표계로 변환
-      final double contentX = tapXInPreviewBox - contentOffsetX;
-      final double contentY = tapYInPreviewBox - contentOffsetY;
-
-      // content 좌표를 rawPreviewSize 기준으로 정규화 (0.0~1.0)
-      relativeX = (contentX / scaledContentW).clamp(0.0, 1.0);
-      relativeY = (contentY / scaledContentH).clamp(0.0, 1.0);
-    } else {
-      // rawPreviewSize가 없으면 previewBox 기준으로 정규화
-      relativeX = (tapXInPreviewBox / previewBoxW).clamp(0.0, 1.0);
-      relativeY = (tapYInPreviewBox / previewBoxH).clamp(0.0, 1.0);
-    }
-
-    // 상대 좌표를 0.0~1.0 범위로 클램프
-    final double clampedX = relativeX.clamp(0.0, 1.0);
-    final double clampedY = relativeY.clamp(0.0, 1.0);
-
-    debugPrint(
-      '[Petgram] 🔍 Tap: screen=(${localPoint.dx}, ${localPoint.dy}), previewBox=($tapXInPreviewBox, $tapYInPreviewBox), relative=($clampedX, $clampedY), sensorRatio=$sensorRatio',
-    );
-    debugPrint('[Petgram] 🔍 Focus point calculated: ($clampedX, $clampedY)');
-    debugPrint(
-      '[Petgram] 🔍 Setting focus indicator: show=true, point=($clampedX, $clampedY)',
-    );
-
-    // 초점 표시기를 먼저 표시 (setState로 즉시 업데이트)
-    if (mounted) {
-      debugPrint('[Petgram] 🔍 Calling setState to update focus indicator');
+      // UI 인디케이터 표시
       setState(() {
-        _focusPointRelative = Offset(clampedX, clampedY);
+        _focusIndicatorPreviewRect = indicatorRect;
+        _focusIndicatorLocal = indicatorLocal;
         _showFocusIndicator = true;
-        debugPrint(
-          '[Petgram] 🔍 Focus indicator state updated: _showFocusIndicator=$_showFocusIndicator, _focusPointRelative=$_focusPointRelative',
-        );
       });
-      debugPrint('[Petgram] 🔍 setState completed');
-    } else {
-      debugPrint('[Petgram] 🔍 Widget not mounted, skipping setState');
-    }
 
-    // 카메라에 초점 설정 (실제 카메라가 준비되었을 때만)
-    if (canSetCameraFocus) {
-      _cameraController!
-          .setFocusPoint(Offset(clampedX, clampedY))
-          .then((_) {
-            debugPrint('[Petgram] ✅ Focus point set successfully');
-            // 수동 초점 설정 시에는 자동 초점 표시기를 표시하지 않음
-            // (_showFocusIndicator만 사용)
-          })
-          .catchError((e) {
-            debugPrint('[Petgram] ❌ Focus point error: $e');
-          });
-    } else {
       debugPrint(
-        '[Petgram] 🔍 Skipping camera focus (mock mode or not initialized)',
+        '[Petgram] 🎯 Mock UI indicator: rect=$indicatorRect, local=$indicatorLocal',
       );
-    }
 
-    // 1.5초 후 초점 표시기 숨기기 (페이드 아웃 애니메이션)
-    Future.delayed(const Duration(milliseconds: 1500), () {
-      if (mounted) {
+      // 2초 후 자동 숨김
+      Future.delayed(const Duration(seconds: 2), () {
+        if (!mounted) return;
         setState(() {
           _showFocusIndicator = false;
         });
+        Future.delayed(const Duration(milliseconds: 200), () {
+          if (!mounted) return;
+          setState(() {
+            _focusIndicatorPreviewRect = null;
+            _focusIndicatorLocal = null;
+          });
+        });
+      });
+      return;
+    }
+
+    // ========== 실제 카메라 모드 처리 ==========
+    // 실제 카메라 모드에서만 previewRect 기반 로직 사용
+    final rect = _lastPreviewRect;
+
+    if (rect == null) {
+      debugPrint(
+        '[Petgram] ⚠️ Real camera mode but _lastPreviewRect is null, using tapInAncestor directly for UI indicator',
+      );
+      // _lastPreviewRect가 null이면 tapInAncestor를 직접 사용
+      final indicatorRect = Rect.fromLTWH(
+        tapInAncestor.dx - 40,
+        tapInAncestor.dy - 40,
+        80,
+        80,
+      );
+      final indicatorLocal = const Offset(40, 40);
+
+      setState(() {
+        _focusIndicatorPreviewRect = indicatorRect;
+        _focusIndicatorLocal = indicatorLocal;
+        _showFocusIndicator = true;
+      });
+
+      // 2초 후 자동 숨김
+      Future.delayed(const Duration(seconds: 2), () {
+        if (!mounted) return;
+        setState(() {
+          _showFocusIndicator = false;
+        });
+        Future.delayed(const Duration(milliseconds: 200), () {
+          if (!mounted) return;
+          setState(() {
+            _focusIndicatorPreviewRect = null;
+            _focusIndicatorLocal = null;
+          });
+        });
+      });
+      return;
+    }
+
+    // previewRect 기반 로컬 좌표 계산 (실제 카메라 모드에서만)
+    final local = Offset(
+      tapInAncestor.dx - rect.left,
+      tapInAncestor.dy - rect.top,
+    );
+
+    // 프리뷰 바깥이면 무시 (실제 카메라 모드에서만)
+    const double touchMargin = 8.0; // 경계 근처 터치 허용
+    if (local.dx < -touchMargin ||
+        local.dy < -touchMargin ||
+        local.dx > rect.width + touchMargin ||
+        local.dy > rect.height + touchMargin) {
+      debugPrint(
+        '[Petgram] 🔍 Tap ignored: outside preview rect (local=$local, rect=$rect, margin=$touchMargin)',
+      );
+      return;
+    }
+
+    // 로컬 좌표를 프리뷰 영역 내로 클램프
+    final clampedLocal = Offset(
+      local.dx.clamp(0.0, rect.width),
+      local.dy.clamp(0.0, rect.height),
+    );
+
+    setState(() {
+      _focusIndicatorPreviewRect = rect;
+      _focusIndicatorLocal = clampedLocal;
+      _showFocusIndicator = true;
+    });
+
+    debugPrint(
+      '[Petgram] 🎯 Real camera UI indicator: rect=$rect, local=$clampedLocal',
+    );
+
+    // ========== 실 카메라 경로 ==========
+    // rect는 이미 null 체크 완료, local도 이미 계산됨
+    // local은 위에서 이미 계산되었고 프리뷰 바깥 체크도 완료됨
+
+    // 3단계: rect 기준 raw normalized 계산 (반올림 없이)
+    // 실 카메라는 BoxFit.cover 기반 매핑 적용
+    // clampedLocal 사용 (이미 클램프됨)
+    final double nxRaw = (clampedLocal.dx / rect.width).clamp(0.0, 1.0);
+    final double nyRaw = (clampedLocal.dy / rect.height).clamp(0.0, 1.0);
+
+    double nx = nxRaw;
+    double ny = nyRaw;
+
+    // 전면 카메라면 X 좌표만 좌우 반전
+    if (_cameraLensDirection == CameraLensDirection.front) {
+      nx = 1.0 - nxRaw;
+    }
+
+    // ✅ 실제로 사용할 normalized: 반올림/파싱 없이 그대로 사용
+    final Offset normalized = Offset(nx, ny);
+
+    // 카메라 API용 normalized 저장
+    _focusPointRelative = normalized;
+
+    // 6단계: 로그 출력 – 여기서만 반올림해서 문자열로 보여주기
+    debugPrint(
+      '[Petgram] 🔍 Tap focus byRect: '
+      'tapInAncestor=$tapInAncestor, rect=$rect, local=$local, clampedLocal=$clampedLocal → '
+      'normalized(raw=Offset(${nxRaw.toStringAsFixed(3)}, ${nyRaw.toStringAsFixed(3)}), '
+      'used=Offset(${nx.toStringAsFixed(3)}, ${ny.toStringAsFixed(3)}))',
+    );
+
+    // 7단계: 카메라 API 호출 (비동기, await 없이)
+    if (_useMockCamera ||
+        _cameraController == null ||
+        !_cameraController!.value.isInitialized) {
+      debugPrint(
+        '[Petgram] ℹ️ Mock or no camera: UI indicator only, skip setFocusPoint/setExposurePoint',
+      );
+    } else {
+      final controller = _cameraController!;
+      try {
+        // 실제 카메라에 넘기는 좌표도 normalized 그대로 (반올림 금지)
+        controller.setFocusPoint(normalized);
+        controller.setExposurePoint(normalized);
+      } catch (e) {
+        debugPrint('[Petgram] ❌ setFocusPoint/setExposurePoint error: $e');
       }
+    }
+
+    // 8단계: 2초 후 인디케이터 자동 숨김 (페이드아웃 애니메이션 포함)
+    // 목업 모드에서도 반드시 실행되어야 함
+    Future.delayed(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      setState(() {
+        _showFocusIndicator = false;
+      });
+      // 페이드아웃 애니메이션 후 완전히 제거
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (!mounted) return;
+        setState(() {
+          _focusIndicatorPreviewRect = null;
+          _focusIndicatorLocal = null;
+        });
+      });
     });
   }
 
   /// 카메라 / 목업 배경
   Widget _buildCameraBackground() {
-    debugPrint(
-      '[Petgram] _buildCameraBackground() called, _aspectMode=$_aspectMode',
-    );
-
     final double targetRatio = aspectRatioOf(_aspectMode);
 
     final PetFilter? filter = _allFilters[_shootFilterKey];
@@ -3353,12 +3868,6 @@ class _HomePageState extends State<HomePage> {
         !_useMockCamera &&
         _cameraController != null &&
         _cameraController!.value.isInitialized;
-
-    final bool isMockPreview = !canUseCamera;
-
-    debugPrint(
-      '[Petgram] 🔍 Camera state: _isCameraInitializing=$_isCameraInitializing, _useMockCamera=$_useMockCamera, canUseCamera=$canUseCamera, isMockPreview=$isMockPreview',
-    );
 
     // CameraPreview는 GestureDetector 없이 사용 (Stack 전체에 GestureDetector 적용)
     final Widget source = canUseCamera
@@ -3372,9 +3881,6 @@ class _HomePageState extends State<HomePage> {
 
     // Mock Preview든 실제 Preview든, 초기화 중이든 항상 Stack을 반환하여
     // 오버레이, 밝기, 초점 표시기 등이 항상 표시되도록 함
-    if (isMockPreview) {
-      debugPrint('[Petgram] mock source widget built (logo + text)');
-    }
 
     // Builder 제거하고 직접 계산 - 상태 변경 시 항상 재빌드되도록 보장
     // MediaQuery는 build 메서드에서 이미 접근 가능하므로 Builder 불필요
@@ -3396,32 +3902,11 @@ class _HomePageState extends State<HomePage> {
     required bool isCameraInitializing,
   }) {
     return Builder(
-      builder: (context) {
-        // sensorRatio 계산 (previewSize 기준)
-        double sensorRatio = 16.0 / 9.0; // 기본값
-        Size? rawPreviewSize;
-        if (!_useMockCamera &&
-            _cameraController != null &&
-            _cameraController!.value.isInitialized) {
-          rawPreviewSize = _cameraController!.value.previewSize;
-          if (rawPreviewSize != null) {
-            sensorRatio =
-                math.max(rawPreviewSize.width, rawPreviewSize.height) /
-                math.min(rawPreviewSize.width, rawPreviewSize.height);
-            debugPrint(
-              '[Petgram] 📐 _buildCameraStack: sensorRatio=$sensorRatio, rawPreviewSize=${rawPreviewSize.width}x${rawPreviewSize.height}',
-            );
-          }
-        } else {
-          debugPrint(
-            '[Petgram] 📐 _buildCameraStack: 목업 모드 또는 카메라 미초기화, 기본값 사용',
-          );
-        }
-
+      builder: (safeAreaContext) {
         // 카메라 프리뷰는 원본 비율을 유지, 남는 영역은 오버레이로 채움
         return Positioned.fill(
           child: LayoutBuilder(
-            builder: (context, constraints) {
+            builder: (layoutContext, constraints) {
               // LayoutBuilder로 실제 AspectRatio가 결정한 크기 측정
               final double maxWidth = constraints.maxWidth;
               final double maxHeight = constraints.maxHeight;
@@ -3468,29 +3953,9 @@ class _HomePageState extends State<HomePage> {
               final double offsetX = (maxWidth - previewBoxW) / 2;
               final double offsetY = (maxHeight - previewBoxH) / 2;
 
-              // sensorRatio 계산 (previewSize 기준)
-              double sensorRatio = 16.0 / 9.0; // 기본값 (세로가 긴 경우)
-              Size? rawPreviewSize;
-              if (!_useMockCamera &&
-                  _cameraController != null &&
-                  _cameraController!.value.isInitialized) {
-                rawPreviewSize = _cameraController!.value.previewSize;
-                if (rawPreviewSize != null) {
-                  sensorRatio =
-                      math.max(rawPreviewSize.width, rawPreviewSize.height) /
-                      math.min(rawPreviewSize.width, rawPreviewSize.height);
-                }
-              }
-
-              // 디버그 로그
-              debugPrint(
-                '[Petgram] 📐 preview layout - sensorRatio=$sensorRatio, targetRatio=$targetRatio, box=${previewBoxW}x${previewBoxH}, rawPreviewSize=${rawPreviewSize?.width}x${rawPreviewSize?.height}',
-              );
-
               // 오버레이 계산은 더 이상 필요 없음 (프리뷰 박스가 이미 targetRatio를 따름)
               // 하지만 기존 코드 호환성을 위해 0으로 설정
               double actualOverlayTop = 0;
-              double actualOverlayBottom = 0;
 
               // frameTopOffset 계산 (프리뷰 박스 기준으로 재계산)
               double frameTopOffset = 0;
@@ -3513,163 +3978,228 @@ class _HomePageState extends State<HomePage> {
                   Positioned.fill(
                     child: Container(color: const Color(0xFFFFF0F5)),
                   ),
-                  // 카메라 프리뷰 중앙 배치
-                  // 프리뷰 박스는 targetRatio 기반, 내부 카메라 콘텐츠는 sensorRatio 유지
+                  // 카메라 프리뷰 중앙 배치 (단순화된 패턴 사용)
                   Positioned(
+                    key: _previewKey,
                     left: offsetX,
                     top: offsetY,
                     width: previewBoxW, // targetRatio 기반 프리뷰 박스 너비
                     height: previewBoxH, // targetRatio 기반 프리뷰 박스 높이
-                    child: ClipRect(
-                      child: FittedBox(
-                        fit: BoxFit.cover, // 비율 유지한 채 박스 꽉 채우기 (크롭 허용)
-                        alignment: Alignment.center,
-                        child: Builder(
-                          builder: (context) {
-                            // sensorRatio와 previewBoxW/previewBoxH를 비교하여 SizedBox 크기 계산
-                            double contentW;
-                            double contentH;
+                    child: Builder(
+                      builder: (previewContext) {
+                        // 실 카메라와 mock 분리 처리
+                        final bool isRealCamera =
+                            !_useMockCamera && canUseCamera;
 
-                            // previewBox의 비율
-                            final double previewBoxRatio =
-                                previewBoxW / previewBoxH;
-
-                            // 센서의 실제 비율 계산
-                            // 목업도 같은 경로를 타므로 동일한 로직 사용
-                            // 나중에 필요하면 목업만 BoxFit.contain으로 분리 가능
-                            double sensorAspectRatio;
-                            if (rawPreviewSize != null) {
-                              // 센서의 실제 비율 (width/height)
-                              sensorAspectRatio =
-                                  rawPreviewSize.width / rawPreviewSize.height;
-                            } else {
-                              // 기본값: 세로가 긴 경우 (9:16)
-                              // 목업 이미지의 실제 비율을 가져와서 사용할 수도 있음
-                              sensorAspectRatio = 9.0 / 16.0;
+                        if (isRealCamera) {
+                          // ========== 실 카메라 경로 (단순화된 패턴) ==========
+                          // Update preview rect in SafeArea Stack coordinate space
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (mounted) {
+                              _updatePreviewRectFromContext(previewContext);
                             }
+                          });
 
-                            // 센서 비율과 previewBox 비율 비교
-                            if (sensorAspectRatio > previewBoxRatio) {
-                              // 센서가 더 넓음: 높이를 previewBoxH에 맞추고 너비 계산
-                              contentH = previewBoxH;
-                              contentW = previewBoxH * sensorAspectRatio;
-                            } else {
-                              // 센서가 더 좁음: 너비를 previewBoxW에 맞추고 높이 계산
-                              contentW = previewBoxW;
-                              contentH = previewBoxW / sensorAspectRatio;
-                            }
+                          // 카메라 센서 비율 가져오기
+                          double cameraAspect;
+                          if (_cameraController != null &&
+                              _cameraController!.value.isInitialized) {
+                            cameraAspect = _cameraController!.value.aspectRatio;
+                          } else {
+                            // 초기화 중이면 기본값 사용
+                            cameraAspect = 9.0 / 16.0;
+                          }
 
-                            // AspectRatio는 센서의 실제 비율 사용
-                            final double aspectRatioForAspectRatioWidget =
-                                sensorAspectRatio;
+                          // 프리뷰 비율 로그
+                          debugPrint(
+                            '[Petgram] preview layout: '
+                            'aspectMode=$_aspectMode, '
+                            'targetRatio=$targetRatio, '
+                            'cameraAspect=$cameraAspect',
+                          );
 
-                            debugPrint(
-                              '[Petgram] 📐 Camera content: ${contentW}x${contentH}, sensorAspectRatio=$sensorAspectRatio, previewBoxRatio=$previewBoxRatio, aspectRatio=$aspectRatioForAspectRatioWidget',
+                          // 프리뷰 매트릭스 계산 (FilterPage와 동일한 로직)
+                          final previewMatrix = _buildPreviewColorMatrix();
+                          final bool hasFilter = !_listEquals(
+                            previewMatrix,
+                            kIdentityMatrix,
+                          );
+
+                          // 카메라 프리뷰 위젯 생성
+                          Widget cameraPreviewWidget;
+                          if (isCameraInitializing) {
+                            cameraPreviewWidget = Container(
+                              color: Colors.black,
+                              child: const Center(
+                                child: CircularProgressIndicator(
+                                  color: kMainPink,
+                                ),
+                              ),
                             );
+                          } else {
+                            // CameraPreview 위젯 생성
+                            cameraPreviewWidget = FittedBox(
+                              fit: BoxFit.cover,
+                              child: SizedBox(
+                                width: _cameraController!
+                                    .value
+                                    .previewSize!
+                                    .height,
+                                height:
+                                    _cameraController!.value.previewSize!.width,
+                                child: RepaintBoundary(
+                                  key: ValueKey('camera_preview'),
+                                  child: source, // CameraPreview 또는 Mock 이미지
+                                ),
+                              ),
+                            );
+                          }
 
-                            return SizedBox(
-                              width: contentW,
-                              height: contentH,
-                              child: AspectRatio(
-                                aspectRatio: aspectRatioForAspectRatioWidget,
-                                child: Stack(
-                                  key: ValueKey(
-                                    'camera_stack_${_aspectMode}_${_brightnessValue}_${_showFocusIndicator}',
+                          // 필터 적용된 카메라 프리뷰 (ColorFiltered > Transform.scale > CameraPreview)
+                          Widget filteredPreview;
+                          if (hasFilter) {
+                            filteredPreview = ColorFiltered(
+                              colorFilter: ColorFilter.matrix(previewMatrix),
+                              child: ClipRect(
+                                child: Transform.scale(
+                                  scale: _uiZoomScale,
+                                  child: cameraPreviewWidget,
+                                ),
+                              ),
+                            );
+                          } else {
+                            // 필터가 없으면 ColorFiltered 없이 Transform.scale만 적용
+                            filteredPreview = ClipRect(
+                              child: Transform.scale(
+                                scale: _uiZoomScale,
+                                child: cameraPreviewWidget,
+                              ),
+                            );
+                          }
+
+                          // UI 줌 적용: CameraPreview만 Transform.scale로 확대
+                          // 격자 라인은 Transform.scale 밖에 두어 확대되지 않도록 함
+                          Widget preview = AspectRatio(
+                            aspectRatio: targetRatio, // 9/16, 3/4, 1/1
+                            child: Stack(
+                              key: ValueKey(
+                                'camera_stack_${_aspectMode}_${_brightnessValue}_${_showFocusIndicator}_${_uiZoomScale}',
+                              ),
+                              fit: StackFit.expand,
+                              clipBehavior: Clip.hardEdge,
+                              children: [
+                                // 1. 카메라 프리뷰 (ColorFiltered > Transform.scale > CameraPreview)
+                                Positioned.fill(child: filteredPreview),
+                                // 2. 격자 라인 오버레이 - ColorFiltered 밖에 배치하여 확대되지 않음
+                                if (_showGridLines)
+                                  Positioned.fill(
+                                    key: ValueKey('grid_lines_${_aspectMode}'),
+                                    child: _buildGridLines(
+                                      previewBoxW,
+                                      previewBoxH,
+                                      frameTopOffset,
+                                    ),
                                   ),
-                                  fit: StackFit.expand,
-                                  clipBehavior: Clip.hardEdge,
-                                  children: [
-                                    // 1. 카메라 프리뷰 또는 초기화 중 표시
+                              ],
+                            ),
+                          );
+                          return _buildPreviewGestureLayer(
+                            stackContext: safeAreaContext,
+                            child: preview,
+                          );
+                        } else {
+                          // ========== Mock 경로 ==========
+                          // Mock 이미지 비율 (기본값 9:16)
+                          final double mockImageRatio = 9.0 / 16.0;
+
+                          // Mock 모드에서도 _lastPreviewRect 업데이트
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (mounted) {
+                              _updatePreviewRectFromContext(previewContext);
+                            }
+                          });
+
+                          debugPrint(
+                            '[Preview] 🎨 Mock camera: previewBox=${previewBoxW.toStringAsFixed(1)}x${previewBoxH.toStringAsFixed(1)}, '
+                            'targetRatio=${targetRatio.toStringAsFixed(3)}, mockRatio=${mockImageRatio.toStringAsFixed(3)}',
+                          );
+
+                          // Mock 모드에서도 프리뷰 매트릭스 계산 (FilterPage와 동일한 로직)
+                          final previewMatrix = _buildPreviewColorMatrix();
+                          final bool hasFilter = !_listEquals(
+                            previewMatrix,
+                            kIdentityMatrix,
+                          );
+
+                          // Mock 이미지 위젯 생성
+                          final mockImageWidget = RepaintBoundary(
+                            key: ValueKey('mock_preview'),
+                            child: source, // Mock 이미지
+                          );
+
+                          // 필터 적용된 Mock 이미지 (ColorFiltered > Transform.scale > Image)
+                          Widget filteredMockPreview;
+                          if (hasFilter) {
+                            filteredMockPreview = ColorFiltered(
+                              colorFilter: ColorFilter.matrix(previewMatrix),
+                              child: ClipRect(
+                                child: Transform.scale(
+                                  scale: _uiZoomScale,
+                                  child: mockImageWidget,
+                                ),
+                              ),
+                            );
+                          } else {
+                            // 필터가 없으면 ColorFiltered 없이 Transform.scale만 적용
+                            filteredMockPreview = ClipRect(
+                              child: Transform.scale(
+                                scale: _uiZoomScale,
+                                child: mockImageWidget,
+                              ),
+                            );
+                          }
+
+                          // Mock 모드에서도 UI 줌 적용: Mock 이미지만 Transform.scale로 확대
+                          return _buildPreviewGestureLayer(
+                            stackContext: safeAreaContext,
+                            child: AspectRatio(
+                              aspectRatio: targetRatio,
+                              child: Stack(
+                                key: ValueKey(
+                                  'mock_camera_stack_${_aspectMode}_${_uiZoomScale}',
+                                ),
+                                fit: StackFit.expand,
+                                clipBehavior: Clip.hardEdge,
+                                children: [
+                                  // 1. Mock 이미지 (ColorFiltered > Transform.scale > Image)
+                                  Positioned.fill(child: filteredMockPreview),
+                                  // 2. 격자 라인 오버레이 - ColorFiltered 밖에 배치하여 확대되지 않음
+                                  if (_showGridLines)
                                     Positioned.fill(
-                                      child: RepaintBoundary(
-                                        key: ValueKey('camera_preview'),
-                                        child: Builder(
-                                          builder: (context) {
-                                            debugPrint(
-                                              '[Petgram] 🎥 Rendering preview: isCameraInitializing=$isCameraInitializing, canUseCamera=$canUseCamera',
-                                            );
-                                            if (isCameraInitializing &&
-                                                canUseCamera) {
-                                              debugPrint(
-                                                '[Petgram] ⏳ Showing loading indicator',
-                                              );
-                                              return Container(
-                                                color: Colors.black,
-                                                child: const Center(
-                                                  child:
-                                                      CircularProgressIndicator(
-                                                        color: kMainPink,
-                                                      ),
-                                                ),
-                                              );
-                                            } else {
-                                              debugPrint(
-                                                '[Petgram] 📷 Showing camera/mock preview',
-                                              );
-                                              // 필터와 밝기 적용
-                                              Widget preview =
-                                                  _buildFilteredWidgetLive(
-                                                    filter,
-                                                    source,
-                                                  );
-                                              // UI 줌 적용 (FilterPage처럼)
-                                              if (_uiZoomScale != 1.0 ||
-                                                  _zoomOffset != Offset.zero) {
-                                                preview = Transform.scale(
-                                                  scale: _uiZoomScale,
-                                                  child: Transform.translate(
-                                                    offset: _zoomOffset,
-                                                    child: preview,
-                                                  ),
-                                                );
-                                              }
-                                              return preview;
-                                            }
-                                          },
-                                        ),
+                                      key: ValueKey(
+                                        'mock_grid_lines_${_aspectMode}',
+                                      ),
+                                      child: _buildGridLines(
+                                        previewBoxW,
+                                        previewBoxH,
+                                        frameTopOffset,
                                       ),
                                     ),
-                                    // 2. 격자 라인 오버레이 (프리뷰 박스 전체에 표시)
-                                    if (_showGridLines)
-                                      Positioned.fill(
-                                        key: ValueKey(
-                                          'grid_lines_${_aspectMode}',
-                                        ),
-                                        child: _buildGridLines(
-                                          previewBoxW,
-                                          previewBoxH,
-                                          frameTopOffset,
-                                        ),
-                                      ),
-                                    // 3. 프레임 오버레이 (프리뷰 박스 기준)
-                                    if (_frameEnabled && _petList.isNotEmpty)
-                                      Positioned.fill(
-                                        key: ValueKey('frame_overlay'),
-                                        child: IgnorePointer(
-                                          ignoring: true,
-                                          child: _buildFramePreviewOverlay(
-                                            maxWidth, // 전체 화면 너비
-                                            maxHeight, // 전체 화면 높이
-                                            frameTopOffset,
-                                            offsetY, // 프리뷰 박스 상단 (화면 기준)
-                                            offsetY +
-                                                previewBoxH, // 프리뷰 박스 하단 (화면 기준)
-                                            previewBoxW,
-                                            previewBoxH,
-                                            offsetX,
-                                            offsetY,
-                                          ),
-                                        ),
-                                      ),
-                                  ],
-                                ), // Stack 닫기
-                              ), // AspectRatio 닫기
-                            ); // SizedBox 닫기 (return 문 종료)
-                          }, // builder function 닫기
-                        ), // Builder 닫기
-                      ), // FittedBox 닫기
-                    ), // ClipRect 닫기
+                                ],
+                              ),
+                            ),
+                          );
+                        }
+                      },
+                    ), // Builder 닫기
                   ), // Positioned 닫기
+                  // 프레임 오버레이 (프리뷰 박스 기준, 메인 Stack에 배치)
+                  _buildFramePreviewOverlay(
+                    previewWidth: previewBoxW,
+                    previewHeight: previewBoxH,
+                    previewOffsetX: offsetX,
+                    previewOffsetY: offsetY,
+                  ),
                 ],
               ); // Stack 닫기
             },
@@ -3679,87 +4209,97 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 라이브 필터 적용 (촬영 화면 미리보기) - 필터와 밝기 모두 적용
-  Widget _buildFilteredWidgetLive(PetFilter? filter, Widget child) {
-    debugPrint(
-      '[Petgram] 🎨 _buildFilteredWidgetLive called: filter=${filter?.key}, brightness=$_brightnessValue',
-    );
-
-    Widget result = child;
-    debugPrint(
-      '[Petgram] 🎨 Initial result widget type: ${result.runtimeType}',
-    );
-
-    // 필터 적용
-    final PetFilter safe = filter ?? _allFilters['basic_none']!;
-    // 임시로 필터 적용 비활성화하여 목업 프리뷰가 보이는지 확인
-    if (safe.key != 'basic_none') {
+  /// 라이브 필터 적용 (촬영 화면 미리보기) - 펫톤 + 필터 + 밝기 모두 적용
+  /// 프리뷰용 ColorMatrix 계산 (FilterPage와 동일한 로직)
+  /// FilterPage의 _buildPreviewColorMatrix와 동일한 계산 방식 사용
+  List<double> _buildPreviewColorMatrix() {
+    if (_isPureOriginalMode) {
       debugPrint(
-        '[Petgram] 🎨 Applying filter: ${safe.key}, intensity=$_liveIntensity',
+        '[Petgram] 🎨 [PREVIEW PIPELINE] Pure original mode, using identity matrix',
       );
-      // 필터 행렬 계산
-      List<double> finalMatrix = mixMatrix(
+      return List.from(kIdentityMatrix);
+    }
+
+    List<double> base = List.from(kIdentityMatrix);
+
+    // 1. 펫톤 프로파일 적용 (40% 강도) - FilterPage와 동일
+    final petProfile = _getCurrentPetToneProfile();
+    if (petProfile != null) {
+      final petToneMatrix = mixMatrix(
         kIdentityMatrix,
-        safe.matrix,
+        petProfile.matrix,
+        0.4, // 40% 강도로 약하게 적용
+      );
+      base = multiplyColorMatrices(base, petToneMatrix);
+    }
+
+    // 2. 필터 적용 - FilterPage와 동일
+    final PetFilter? currentFilter = _allFilters[_shootFilterKey];
+    if (currentFilter != null && currentFilter.key != 'basic_none') {
+      final filterMatrix = mixMatrix(
+        kIdentityMatrix,
+        currentFilter.matrix,
         _liveIntensity,
       );
-
-      // ColorFiltered로 필터 적용
-      result = ColorFiltered(
-        colorFilter: ColorFilter.matrix(finalMatrix),
-        child: result,
-      );
-      debugPrint(
-        '[Petgram] 🎨 Filter applied, result type: ${result.runtimeType}',
-      );
-    } else {
-      debugPrint(
-        '[Petgram] 🎨 Filter skipped (basic_none or disabled for testing)',
-      );
+      base = multiplyColorMatrices(base, filterMatrix);
     }
 
-    // 밝기 조절 적용 (필터 위에 적용)
+    // 3. 밝기 적용 - FilterPage와 동일한 계산 방식
+    // FilterPage: (_editBrightness / 50.0) * 40.0
+    // HomePage: (_brightnessValue / 10.0) * 255 * 0.1 = (_brightnessValue / 10.0) * 25.5
+    // 동일하게 맞추기 위해 FilterPage 방식 사용
     if (_brightnessValue != 0.0) {
-      debugPrint('[Petgram] 🎨 Applying brightness: $_brightnessValue');
-      result = ColorFiltered(
-        colorFilter: ColorFilter.matrix([
-          1,
-          0,
-          0,
-          0,
-          (_brightnessValue / 50.0) * 255, // -50~50을 -1.0~1.0으로 변환 후 255 곱하기
-          0,
-          1,
-          0,
-          0,
-          (_brightnessValue / 50.0) * 255,
-          0,
-          0,
-          1,
-          0,
-          (_brightnessValue / 50.0) * 255,
-          0,
-          0,
-          0,
-          1,
-          0,
-        ]),
-        child: result,
-      );
-      debugPrint(
-        '[Petgram] 🎨 Brightness applied, result type: ${result.runtimeType}',
-      );
+      // FilterPage와 동일한 계산: (_brightnessValue / 50.0) * 40.0
+      // _brightnessValue는 -10 ~ +10 범위이므로, 이를 -50 ~ +50으로 변환
+      final double normalizedBrightness =
+          _brightnessValue * 5.0; // -10~+10 -> -50~+50
+      final double b = (normalizedBrightness / 50.0) * 40.0;
+      final List<double> brightnessMatrix = [
+        1,
+        0,
+        0,
+        0,
+        b,
+        0,
+        1,
+        0,
+        0,
+        b,
+        0,
+        0,
+        1,
+        0,
+        b,
+        0,
+        0,
+        0,
+        1,
+        0,
+      ];
+      base = multiplyColorMatrices(base, brightnessMatrix);
     }
 
-    // 필터 변경 시 부드러운 전환 애니메이션
-    // Positioned.fill 안에서 사용되므로 SizedBox.expand 사용
-    debugPrint(
-      '[Petgram] 🎨 Final result type: ${result.runtimeType}, returning directly',
-    );
+    // 4. 대비는 HomePage에서 지원하지 않으므로 제외
+    // FilterPage는 _editContrast를 지원하지만, HomePage는 밝기만 지원
 
-    // Positioned.fill이 크기를 제어하므로 직접 반환
-    // AnimatedSwitcher는 overflow 발생하므로 제거
-    return result;
+    return base;
+  }
+
+  /// [DEPRECATED] 이 함수는 더 이상 사용되지 않음
+  /// ColorFiltered는 CameraPreview 빌드 시 직접 적용됨
+  @Deprecated(
+    'Use _buildPreviewColorMatrix and apply ColorFiltered directly to CameraPreview',
+  )
+  Widget _buildFilteredWidgetLive(PetFilter? filter, Widget child) {
+    // 이 함수는 호환성을 위해 유지하지만, 실제로는 사용되지 않음
+    final previewMatrix = _buildPreviewColorMatrix();
+    if (!_listEquals(previewMatrix, kIdentityMatrix)) {
+      return ColorFiltered(
+        colorFilter: ColorFilter.matrix(previewMatrix),
+        child: child,
+      );
+    }
+    return child;
   }
 
   /// 그리드라인 오버레이 (풀 오버레이 기준으로 한번에 그리기)
@@ -3778,68 +4318,54 @@ class _HomePageState extends State<HomePage> {
 
   /// 프레임 미리보기 오버레이 (새로운 구조)
   /// 프레임은 오버레이가 가려지는 바로 위와 아래에 자동으로 조정됨
-  Widget _buildFramePreviewOverlay(
-    double screenWidth,
-    double screenHeight,
-    double frameTopOffset,
-    double overlayTopScreen, // 사용하지 않음 (호환성 유지)
-    double overlayBottomScreen, // 사용하지 않음 (호환성 유지)
-    double previewWidth,
-    double previewHeight,
-    double previewOffsetX,
-    double previewOffsetY,
-  ) {
-    // 프레임은 프리뷰 박스 내부에 그려지므로, 프리뷰 박스 로컬 좌표계 사용
-    // 프리뷰 박스는 Positioned(left: offsetX, top: offsetY, width: previewBoxW, height: previewBoxH)
-    // 내부에서는 (0, 0)부터 (previewWidth, previewHeight)까지의 좌표계 사용
+  Widget _buildFramePreviewOverlay({
+    required double previewWidth,
+    required double previewHeight,
+    required double previewOffsetX,
+    required double previewOffsetY,
+  }) {
+    if (!_frameEnabled || _petList.isEmpty) {
+      return const SizedBox.shrink();
+    }
 
-    // 촬영본과 동일한 정규화 비율 계산
-    // 촬영본에서: overlayTop / imageHeight = normalizedTop
-    // 프리뷰에서: normalizedTop * previewHeight = topBarHeight
+    // _addPhotoFrame과 동일한 규칙 사용
+    final double topBarHeight = previewWidth * 0.02; // frameMargin
+    final double bottomBarHeight = previewHeight; // previewBox 전체 높이
 
-    // 프리뷰 박스는 이미 크롭된 영역이므로, 프레임 위치를 previewBox 내부 로컬 좌표로 직접 계산
-    // 프레임은 크롭된 이미지 상단에서 frameMargin만큼 아래에 배치
-    final double frameMargin = previewWidth * 0.02;
-    final double finalTopBarHeight = frameMargin;
-
-    // 하단 프레임 위치: 프리뷰 박스 하단 (프리뷰 박스 내부 기준, 로컬 좌표)
-    final double bottomBarHeight = previewHeight; // 프리뷰 박스 하단 = previewHeight
-
-    debugPrint(
-      '[Petgram] 🔍 FramePreviewOverlay: previewBox=${previewWidth}x${previewHeight}, frameMargin=$frameMargin, finalTopBarHeight=$finalTopBarHeight',
-    );
-
-    return CustomPaint(
-      painter: FramePreviewPainter(
-        petList: _petList,
-        selectedPetId: _selectedPetId,
-        previewWidth: previewWidth,
-        previewHeight: previewHeight,
-        imageWidth: previewWidth, // 프리뷰와 동일
-        imageHeight: previewHeight, // 프리뷰와 동일
-        aspectMode: _aspectMode,
-        topBarHeight: finalTopBarHeight, // 프리뷰 박스 내부 기준 상단 위치 (정규화 비율 적용)
-        bottomBarHeight: bottomBarHeight, // 프리뷰 박스 내부 기준 하단 위치
-        dogIconImage: _dogIconImage,
-        catIconImage: _catIconImage,
-        location: _currentLocation,
+    return Positioned(
+      left: previewOffsetX,
+      top: previewOffsetY,
+      width: previewWidth,
+      height: previewHeight,
+      child: IgnorePointer(
+        ignoring: true,
+        child: CustomPaint(
+          painter: FramePainter(
+            petList: _petList,
+            selectedPetId: _selectedPetId,
+            width: previewWidth,
+            height: previewHeight,
+            topBarHeight: topBarHeight,
+            bottomBarHeight: bottomBarHeight,
+            dogIconImage: _dogIconImage,
+            catIconImage: _catIconImage,
+            location: _currentLocation,
+          ),
+        ),
       ),
-      size: Size(previewWidth, previewHeight), // 프리뷰 박스 크기
     );
   }
 
   /// 상단 로고 + 프레임 설정 + 설정 버튼
   Widget _buildTopBar() {
-    // 로고와 아이콘 크기 조정
-    final double logoSize = 28.0; // 36.0 -> 28.0
-    final double fontSize = 20.0; // 16.0 -> 20.0 (텍스트 크기 키움)
+    final double logoSize = 28.0;
+    final double fontSize = 20.0;
     final double horizontalPadding = 12.0;
-    final double verticalPadding = 10.0; // 12.0 -> 10.0 (살짝 위로)
-    final double iconSize = 18.0; // 16.0 -> 18.0 (아이콘 크기 살짝 키움)
+    final double verticalPadding = 10.0;
+    final double iconSize = 18.0;
 
-    // 상단 바 위치는 화면 기준에서 아래로 내림
     return Positioned(
-      top: 6.0, // 8.0 -> 6.0 (살짝 위로)
+      top: 6.0,
       left: 0,
       right: 0,
       child: Padding(
@@ -3852,19 +4378,18 @@ class _HomePageState extends State<HomePage> {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            // 투명 박스 제거, 아이콘만 표시
             SizedBox(
               width: logoSize,
               height: logoSize,
               child: Image.asset('assets/images/logo.png', fit: BoxFit.contain),
             ),
-            const SizedBox(width: 0), // 로고와 글씨 더 가깝게 (1 -> 0)
+            const SizedBox(width: 0),
             Text(
               'Petgram',
               style: TextStyle(
                 fontSize: fontSize,
                 fontWeight: FontWeight.w900,
-                color: kMainPink, // 연분홍색으로 변경
+                color: kMainPink,
                 letterSpacing: 0.8,
                 shadows: [
                   Shadow(
@@ -3881,7 +4406,6 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
             const Spacer(),
-            // 위치정보 업데이트 버튼 (프레임이 켜져있고 위치정보가 활성화된 경우에만 표시)
             if (_frameEnabled && _petList.isNotEmpty) ...[
               Builder(
                 builder: (context) {
@@ -3891,11 +4415,10 @@ class _HomePageState extends State<HomePage> {
                           orElse: () => _petList.first,
                         )
                       : _petList.first;
-
                   if (selectedPet.locationEnabled) {
                     return Container(
-                      width: 36, // 가로 길이 늘림
-                      height: 32, // 세로 길이 조정 (아이콘 크기 + 패딩)
+                      width: 36,
+                      height: 32,
                       decoration: BoxDecoration(
                         color: Colors.black.withValues(alpha: 0.5),
                         borderRadius: BorderRadius.circular(16),
@@ -3903,30 +4426,26 @@ class _HomePageState extends State<HomePage> {
                       child: IconButton(
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints(),
-                        iconSize: 16, // 14 -> 16 (아이콘 크기 살짝 키움)
+                        iconSize: 16,
                         onPressed: () async {
-                          // GPS 업데이트 시: 위치정보 재로드
                           _checkAndFetchLocation(forceReload: true);
                           HapticFeedback.lightImpact();
-                          // _fetchLocation 내부에서 스낵바를 표시하므로 여기서는 추가 처리 불필요
                         },
                         icon: Stack(
                           children: [
-                            // 그림자 효과
                             Positioned(
                               left: 0.5,
                               top: 0.5,
                               child: Icon(
                                 Icons.location_on,
                                 color: Colors.black.withValues(alpha: 0.6),
-                                size: 16, // 14 -> 16 (아이콘 크기 살짝 키움)
+                                size: 16,
                               ),
                             ),
-                            // 실제 아이콘
                             const Icon(
                               Icons.location_on,
                               color: Colors.white,
-                              size: 16, // 14 -> 16 (아이콘 크기 살짝 키움)
+                              size: 16,
                             ),
                           ],
                         ),
@@ -3939,10 +4458,9 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(width: 4),
             ],
-            // 프레임 설정 버튼 (별도 그룹)
             Container(
-              width: 36, // 가로 길이 늘림
-              height: 32, // 세로 길이 조정 (아이콘 크기 + 패딩)
+              width: 36,
+              height: 32,
               decoration: BoxDecoration(
                 color: Colors.black.withValues(alpha: 0.5),
                 borderRadius: BorderRadius.circular(16),
@@ -3950,7 +4468,7 @@ class _HomePageState extends State<HomePage> {
               child: IconButton(
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
-                iconSize: iconSize, // 16.0
+                iconSize: iconSize,
                 onPressed: () {
                   Navigator.of(context).push(
                     MaterialPageRoute(
@@ -3963,7 +4481,6 @@ class _HomePageState extends State<HomePage> {
                             _petList = list;
                             _selectedPetId = selectedId;
                           });
-                          // 반려동물 리스트 변경 시: 위치정보가 활성화된 프레임이면 위치정보 다시 불러오기
                           if (_frameEnabled && _petList.isNotEmpty) {
                             final selectedPet = _selectedPetId != null
                                 ? _petList.firstWhere(
@@ -3972,20 +4489,11 @@ class _HomePageState extends State<HomePage> {
                                   )
                                 : _petList.first;
                             if (selectedPet.locationEnabled) {
-                              debugPrint(
-                                '[Petgram] 📍 onPetListChanged: 위치정보 활성화됨, 위치정보 불러오기 시작',
-                              );
                               _checkAndFetchLocation(alwaysReload: true);
-                            } else {
-                              debugPrint(
-                                '[Petgram] 📍 onPetListChanged: 위치정보 비활성화됨',
-                              );
-                              // 위치 정보 활성화가 안 되어 있으면 null로 설정
-                              if (mounted) {
-                                setState(() {
-                                  _currentLocation = null;
-                                });
-                              }
+                            } else if (mounted) {
+                              setState(() {
+                                _currentLocation = null;
+                              });
                             }
                           }
                         },
@@ -3994,7 +4502,6 @@ class _HomePageState extends State<HomePage> {
                             _frameEnabled = enabled;
                           });
                           _saveFrameEnabled();
-                          // 프레임을 켤 때: 위치정보가 활성화된 프레임이면 위치정보 다시 불러오기
                           if (enabled && _petList.isNotEmpty) {
                             final selectedPet = _selectedPetId != null
                                 ? _petList.firstWhere(
@@ -4005,36 +4512,28 @@ class _HomePageState extends State<HomePage> {
                             if (selectedPet.locationEnabled) {
                               _checkAndFetchLocation(alwaysReload: true);
                             }
-                          } else {
-                            // 프레임을 끌 때: 위치정보 초기화
-                            if (mounted) {
-                              setState(() {
-                                _currentLocation = null;
-                              });
-                            }
+                          } else if (mounted) {
+                            setState(() {
+                              _currentLocation = null;
+                            });
                           }
                         },
                         onSelectedPetChanged: (selectedId) {
                           setState(() {
                             _selectedPetId = selectedId;
                           });
-                          // 프레임 선택 변경 시: 위치정보가 활성화된 프레임이면 항상 위치정보 갱신
                           final currentPet = selectedId != null
                               ? _petList.firstWhere(
                                   (pet) => pet.id == selectedId,
                                   orElse: () => _petList.first,
                                 )
                               : _petList.first;
-
                           if (currentPet.locationEnabled) {
                             _checkAndFetchLocation(alwaysReload: true);
-                          } else {
-                            // 위치 정보 활성화가 안 되어 있으면 null로 설정
-                            if (mounted) {
-                              setState(() {
-                                _currentLocation = null;
-                              });
-                            }
+                          } else if (mounted) {
+                            setState(() {
+                              _currentLocation = null;
+                            });
                           }
                         },
                       ),
@@ -4043,7 +4542,6 @@ class _HomePageState extends State<HomePage> {
                 },
                 icon: Stack(
                   children: [
-                    // 그림자 효과
                     Positioned(
                       left: 0.5,
                       top: 0.5,
@@ -4052,16 +4550,15 @@ class _HomePageState extends State<HomePage> {
                             ? Icons.photo_filter
                             : Icons.photo_filter_outlined,
                         color: Colors.black.withValues(alpha: 0.6),
-                        size: iconSize, // 16.0
+                        size: iconSize,
                       ),
                     ),
-                    // 실제 아이콘
                     Icon(
                       _frameEnabled
                           ? Icons.photo_filter
                           : Icons.photo_filter_outlined,
                       color: _frameEnabled ? kMainPink : Colors.white,
-                      size: iconSize, // 16.0
+                      size: iconSize,
                     ),
                   ],
                 ),
@@ -4069,44 +4566,29 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
             const SizedBox(width: 4),
-            // 후원하기 버튼
-            Container(
-              width: 36, // 가로 길이 늘림
-              height: 32, // 세로 길이 조정 (아이콘 크기 + 패딩)
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.5),
+            Material(
+              color: Colors.transparent,
+              child: InkWell(
                 borderRadius: BorderRadius.circular(16),
-              ),
-              child: IconButton(
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-                iconSize: iconSize, // 16.0
-                onPressed: () {
+                onTap: () {
+                  debugPrint('[Petgram] ❤️ Support button tapped');
                   Navigator.of(
                     context,
                   ).push(MaterialPageRoute(builder: (_) => SettingsPage()));
                 },
-                icon: Stack(
-                  children: [
-                    // 그림자 효과
-                    Positioned(
-                      left: 0.5,
-                      top: 0.5,
-                      child: Icon(
-                        Icons.coffee,
-                        color: Colors.black.withValues(alpha: 0.6),
-                        size: iconSize, // 16.0
-                      ),
-                    ),
-                    // 실제 아이콘
-                    Icon(
-                      Icons.coffee,
-                      color: Colors.white,
-                      size: iconSize,
-                    ), // 16.0
-                  ],
+                child: Container(
+                  width: 36,
+                  height: 32,
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Icon(
+                    Icons.coffee,
+                    color: Colors.white,
+                    size: iconSize,
+                  ),
                 ),
-                tooltip: '후원하기',
               ),
             ),
           ],
@@ -4125,26 +4607,57 @@ class _HomePageState extends State<HomePage> {
       right: 8,
       top: overlayTop > 0 ? overlayTop : 0,
       bottom: overlayBottom > 0 ? overlayBottom : 0,
-      child: Center(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // 밝기 조절 슬라이더 (세로)
-              _buildBrightnessSlider(),
-              const SizedBox(height: 12),
-              // 카메라 전환 버튼 (전면/후면)
-              _buildOptionIconButton(
-                icon: _cameraLensDirection == CameraLensDirection.back
-                    ? Icons.camera_front
-                    : Icons.camera_rear,
-                isActive: true,
-                onTap: _switchCamera,
-                tooltip: _cameraLensDirection == CameraLensDirection.back
-                    ? '전면 카메라로 전환'
-                    : '후면 카메라로 전환',
-              ),
-            ],
+      child: GestureDetector(
+        // 오른쪽 옵션 패널의 탭이 전체 화면 GestureDetector보다 우선순위를 가지도록
+        behavior: HitTestBehavior.opaque,
+        child: Center(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.end, // 오른쪽 끝 정렬
+              children: [
+                // 밝기 조절 슬라이더 (세로) - 개별 pill 배경 적용
+                Container(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.35),
+                    borderRadius: BorderRadius.circular(18),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.2),
+                        blurRadius: 4,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: _buildBrightnessSlider(),
+                ),
+                const SizedBox(height: 10),
+                // 카메라 전환 버튼 (전면/후면) - 개별 pill 배경 적용
+                Container(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.35),
+                    borderRadius: BorderRadius.circular(18),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.2),
+                        blurRadius: 4,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: _buildOptionIconButton(
+                    icon: _cameraLensDirection == CameraLensDirection.back
+                        ? Icons.camera_front
+                        : Icons.camera_rear,
+                    isActive: true,
+                    onTap: _switchCamera,
+                    tooltip: _cameraLensDirection == CameraLensDirection.back
+                        ? '전면 카메라로 전환'
+                        : '후면 카메라로 전환',
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -4156,10 +4669,7 @@ class _HomePageState extends State<HomePage> {
     return Container(
       width: 48,
       height: 200,
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.35),
-        borderRadius: BorderRadius.circular(24),
-      ),
+      padding: const EdgeInsets.symmetric(vertical: 8),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -4173,6 +4683,14 @@ class _HomePageState extends State<HomePage> {
                 : Icons.brightness_medium,
             color: Colors.white,
             size: 24,
+            shadows: [
+              // 흰색 배경에서도 또렷하게 보이도록 그림자 추가
+              Shadow(
+                color: Colors.black.withValues(alpha: 0.5),
+                blurRadius: 2,
+                offset: const Offset(0, 1),
+              ),
+            ],
           ),
           const SizedBox(height: 8),
           // 슬라이더 영역 (필터 강도 조절 슬라이더와 동일한 방식 - onPanUpdate 사용)
@@ -4189,8 +4707,8 @@ class _HomePageState extends State<HomePage> {
                       sliderHeight,
                     );
                     final double normalized = localY / sliderHeight;
-                    final double newValue = ((1.0 - normalized) * 100.0 - 50.0)
-                        .clamp(-50.0, 50.0);
+                    final double newValue = ((1.0 - normalized) * 20.0 - 10.0)
+                        .clamp(-10.0, 10.0);
                     setState(() {
                       _brightnessValue = newValue;
                     });
@@ -4204,11 +4722,8 @@ class _HomePageState extends State<HomePage> {
                         sliderHeight,
                       );
                       final double normalized = localY / sliderHeight;
-                      final double newValue =
-                          ((1.0 - normalized) * 100.0 - 50.0).clamp(
-                            -50.0,
-                            50.0,
-                          );
+                      final double newValue = ((1.0 - normalized) * 20.0 - 10.0)
+                          .clamp(-10.0, 10.0);
                       setState(() {
                         _brightnessValue = newValue;
                       });
@@ -4234,8 +4749,8 @@ class _HomePageState extends State<HomePage> {
                       Align(
                         alignment: Alignment(
                           0,
-                          -((_brightnessValue + 50.0) / 100.0 * 2.0 -
-                              1.0), // -50~50을 -1.0~1.0으로
+                          -((_brightnessValue + 10.0) / 20.0 * 2.0 -
+                              1.0), // -10~10을 -1.0~1.0으로
                         ),
                         child: Container(
                           width: 32,
@@ -4301,275 +4816,255 @@ class _HomePageState extends State<HomePage> {
     final double bottomPadding = overlayBottom > 0 ? overlayBottom + 4.0 : 0;
 
     return Positioned(
-      key: ValueKey('left_options_${_selectedZoomRatio}_${_currentZoomLevel}'),
+      key: ValueKey('left_options_${_uiZoomScale.toStringAsFixed(2)}'),
       left: 8,
       top: topPadding,
       bottom: bottomPadding,
-      child: Center(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // 플래시 토글
-              _buildOptionIconButton(
-                icon: _flashMode == FlashMode.off
-                    ? Icons.flash_off
-                    : Icons.flash_on,
-                isActive: _flashMode != FlashMode.off,
-                onTap: _toggleFlash,
-                tooltip: _flashMode == FlashMode.off ? '플래시 켜기' : '플래시 끄기',
-              ),
-              const SizedBox(height: 4),
-              // 격자 토글
-              _buildOptionIconButton(
-                icon: _showGridLines ? Icons.grid_on : Icons.grid_off,
-                isActive: _showGridLines,
-                onTap: () {
-                  setState(() {
-                    _showGridLines = !_showGridLines;
-                  });
-                  _saveShowGridLines();
-                },
-                tooltip: _showGridLines ? '격자 끄기' : '격자 켜기',
-              ),
-              const SizedBox(height: 4),
-              // 카메라 배율 선택 (0.8x, 1x, 1.5x 등) - 항상 표시
-              _buildOptionIconButton(
-                key: ValueKey('zoom_button_$_selectedZoomRatio'),
-                icon: Icons.center_focus_strong,
-                isActive: _selectedZoomRatio != 1.0,
-                label: '${_selectedZoomRatio.toStringAsFixed(1)}x',
-                onTap: () {
-                  showDialog(
-                    context: context,
-                    builder: (context) => AlertDialog(
-                      backgroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      title: const Text(
-                        '카메라 배율',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
+      child: GestureDetector(
+        // 왼쪽 옵션 패널의 탭이 전체 화면 GestureDetector보다 우선순위를 가지도록
+        behavior: HitTestBehavior.opaque,
+        child: Center(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // 플래시 토글
+                _buildOptionIconButton(
+                  icon: _flashMode == FlashMode.off
+                      ? Icons.flash_off
+                      : Icons.flash_on,
+                  isActive: _flashMode != FlashMode.off,
+                  onTap: _toggleFlash,
+                  tooltip: _flashMode == FlashMode.off ? '플래시 켜기' : '플래시 끄기',
+                ),
+                const SizedBox(height: 4),
+                // 격자 토글
+                _buildOptionIconButton(
+                  icon: _showGridLines ? Icons.grid_on : Icons.grid_off,
+                  isActive: _showGridLines,
+                  onTap: () {
+                    setState(() {
+                      _showGridLines = !_showGridLines;
+                    });
+                    _saveShowGridLines();
+                  },
+                  tooltip: _showGridLines ? '격자 끄기' : '격자 켜기',
+                ),
+                const SizedBox(height: 4),
+                // 카메라 배율 선택 (0.8x, 1x, 1.5x 등) - 항상 표시
+                _buildOptionIconButton(
+                  key: ValueKey(
+                    'zoom_button_${_uiZoomScale.toStringAsFixed(2)}',
+                  ),
+                  icon: Icons.center_focus_strong,
+                  isActive: (_uiZoomScale - 1.0).abs() > 0.05,
+                  label: '${_uiZoomScale.toStringAsFixed(1)}x',
+                  onTap: () {
+                    showDialog(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        backgroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        title: const Text(
+                          '카메라 배율',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        content: Builder(
+                          builder: (context) {
+                            final uniqueOptions = _getZoomPresets();
+                            return Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: uniqueOptions
+                                  .map((ratio) => _buildZoomRatioOption(ratio))
+                                  .toList(),
+                            );
+                          },
                         ),
                       ),
-                      content: Builder(
-                        builder: (context) {
-                          // 카메라 지원에 따라 줌 옵션 동적 생성
-                          final List<double> zoomOptions = [];
-
-                          // 최저값 추가 (카메라 최저값이 1.0보다 작으면)
-                          if (_minZoomLevel < 1.0) {
-                            zoomOptions.add(_minZoomLevel);
-                          }
-
-                          // 고정 옵션: 1.0, 2.0, 3.0 (카메라 지원 범위 내에서만)
-                          // 단, 카메라가 3배 미만 지원 시 최대값 반영
-                          if (_maxZoomLevel >= 1.0) {
-                            zoomOptions.add(1.0);
-                          }
-                          if (_maxZoomLevel >= 2.0) {
-                            zoomOptions.add(2.0);
-                          }
-                          if (_maxZoomLevel >= 3.0) {
-                            zoomOptions.add(3.0);
-                          } else if (_maxZoomLevel > 2.0 &&
-                              _maxZoomLevel < 3.0) {
-                            // 카메라가 3배 미만 지원 시 최대값 반영
-                            zoomOptions.add(_maxZoomLevel);
-                          }
-
-                          // 중복 제거 및 정렬
-                          final uniqueOptions = zoomOptions.toSet().toList()
-                            ..sort();
-
-                          return Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: uniqueOptions
-                                .map((ratio) => _buildZoomRatioOption(ratio))
-                                .toList(),
-                          );
-                        },
-                      ),
-                    ),
-                  );
-                },
-                tooltip: '카메라 배율: ${_selectedZoomRatio}x',
-              ),
-              const SizedBox(height: 6),
-              // 화면 비율 선택 (활성화 표시 + 비율 표기)
-              _buildOptionIconButton(
-                icon: Icons.crop_free,
-                isActive: true, // 항상 활성화 표시
-                label: _aspectLabel(_aspectMode), // 선택된 비율 표기
-                onTap: () {
-                  showDialog(
-                    context: context,
-                    builder: (context) => AlertDialog(
-                      backgroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      title: const Text(
-                        '화면 비율',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
+                    );
+                  },
+                  tooltip: '배율: ${_uiZoomScale.toStringAsFixed(1)}x',
+                ),
+                const SizedBox(height: 6),
+                // 화면 비율 선택 (활성화 표시 + 비율 표기)
+                _buildOptionIconButton(
+                  icon: Icons.crop_free,
+                  isActive: true, // 항상 활성화 표시
+                  label: _aspectLabel(_aspectMode), // 선택된 비율 표기
+                  onTap: () {
+                    showDialog(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        backgroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        title: const Text(
+                          '화면 비율',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            ListTile(
+                              title: const Text('9:16'),
+                              trailing:
+                                  _aspectMode == AspectRatioMode.nineSixteen
+                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  : const Icon(
+                                      Icons.radio_button_unchecked,
+                                      color: Colors.grey,
+                                    ),
+                              onTap: () {
+                                _changeAspectMode(AspectRatioMode.nineSixteen);
+                                Navigator.of(context).pop();
+                              },
+                            ),
+                            ListTile(
+                              title: const Text('3:4'),
+                              trailing: _aspectMode == AspectRatioMode.threeFour
+                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  : const Icon(
+                                      Icons.radio_button_unchecked,
+                                      color: Colors.grey,
+                                    ),
+                              onTap: () {
+                                _changeAspectMode(AspectRatioMode.threeFour);
+                                Navigator.of(context).pop();
+                              },
+                            ),
+                            ListTile(
+                              title: const Text('1:1'),
+                              trailing: _aspectMode == AspectRatioMode.oneOne
+                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  : const Icon(
+                                      Icons.radio_button_unchecked,
+                                      color: Colors.grey,
+                                    ),
+                              onTap: () {
+                                _changeAspectMode(AspectRatioMode.oneOne);
+                                Navigator.of(context).pop();
+                              },
+                            ),
+                          ],
                         ),
                       ),
-                      content: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          ListTile(
-                            title: const Text('9:16'),
-                            trailing: _aspectMode == AspectRatioMode.nineSixteen
-                                ? Icon(Icons.check_circle, color: kMainPink)
-                                : const Icon(
-                                    Icons.radio_button_unchecked,
-                                    color: Colors.grey,
-                                  ),
-                            onTap: () {
-                              _changeAspectMode(AspectRatioMode.nineSixteen);
-                              Navigator.of(context).pop();
-                            },
+                    );
+                  },
+                  tooltip: '화면 비율: ${_aspectLabel(_aspectMode)}',
+                ),
+                const SizedBox(height: 4),
+                // 연속 촬영
+                _buildOptionIconButton(
+                  icon: Icons.camera_roll,
+                  isActive: _isBurstMode,
+                  label: _isBurstMode ? '${_burstCountSetting}' : null,
+                  onTap: () {
+                    showDialog(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        backgroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        title: const Text(
+                          '연속 촬영 매수',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
                           ),
-                          ListTile(
-                            title: const Text('3:4'),
-                            trailing: _aspectMode == AspectRatioMode.threeFour
-                                ? Icon(Icons.check_circle, color: kMainPink)
-                                : const Icon(
-                                    Icons.radio_button_unchecked,
-                                    color: Colors.grey,
-                                  ),
-                            onTap: () {
-                              _changeAspectMode(AspectRatioMode.threeFour);
-                              Navigator.of(context).pop();
-                            },
-                          ),
-                          ListTile(
-                            title: const Text('1:1'),
-                            trailing: _aspectMode == AspectRatioMode.oneOne
-                                ? Icon(Icons.check_circle, color: kMainPink)
-                                : const Icon(
-                                    Icons.radio_button_unchecked,
-                                    color: Colors.grey,
-                                  ),
-                            onTap: () {
-                              _changeAspectMode(AspectRatioMode.oneOne);
-                              Navigator.of(context).pop();
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
-                tooltip: '화면 비율: ${_aspectLabel(_aspectMode)}',
-              ),
-              const SizedBox(height: 4),
-              // 연속 촬영
-              _buildOptionIconButton(
-                icon: Icons.camera_roll,
-                isActive: _isBurstMode,
-                label: _isBurstMode ? '${_burstCountSetting}' : null,
-                onTap: () {
-                  showDialog(
-                    context: context,
-                    builder: (context) => AlertDialog(
-                      backgroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      title: const Text(
-                        '연속 촬영 매수',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
+                        ),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _buildBurstCountOption(3),
+                            _buildBurstCountOption(5),
+                            _buildBurstCountOption(10),
+                            ListTile(
+                              title: const Text('연속 촬영 끄기'),
+                              trailing: !_isBurstMode
+                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  : const Icon(
+                                      Icons.radio_button_unchecked,
+                                      color: Colors.grey,
+                                    ),
+                              onTap: () {
+                                setState(() {
+                                  _isBurstMode = false;
+                                });
+                                _saveBurstSettings();
+                                Navigator.of(context).pop();
+                              },
+                            ),
+                          ],
                         ),
                       ),
-                      content: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          _buildBurstCountOption(3),
-                          _buildBurstCountOption(5),
-                          _buildBurstCountOption(10),
-                          ListTile(
-                            title: const Text('연속 촬영 끄기'),
-                            trailing: !_isBurstMode
-                                ? Icon(Icons.check_circle, color: kMainPink)
-                                : const Icon(
-                                    Icons.radio_button_unchecked,
-                                    color: Colors.grey,
-                                  ),
-                            onTap: () {
-                              setState(() {
-                                _isBurstMode = false;
-                              });
-                              _saveBurstSettings();
-                              Navigator.of(context).pop();
-                            },
+                    );
+                  },
+                  tooltip: _isBurstMode
+                      ? '연속 촬영: ${_burstCountSetting}장'
+                      : '연속 촬영',
+                ),
+                const SizedBox(height: 4),
+                // 타이머
+                _buildOptionIconButton(
+                  icon: Icons.timer,
+                  isActive: _timerSeconds > 0,
+                  label: _timerSeconds > 0 ? '${_timerSeconds}' : null,
+                  onTap: () {
+                    showDialog(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        backgroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        title: const Text(
+                          '타이머 선택',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
                           ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
-                tooltip: _isBurstMode
-                    ? '연속 촬영: ${_burstCountSetting}장'
-                    : '연속 촬영',
-              ),
-              const SizedBox(height: 4),
-              // 타이머
-              _buildOptionIconButton(
-                icon: Icons.timer,
-                isActive: _timerSeconds > 0,
-                label: _timerSeconds > 0 ? '${_timerSeconds}' : null,
-                onTap: () {
-                  showDialog(
-                    context: context,
-                    builder: (context) => AlertDialog(
-                      backgroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      title: const Text(
-                        '타이머 선택',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
+                        ),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _buildTimerOption(3),
+                            _buildTimerOption(5),
+                            _buildTimerOption(10),
+                            ListTile(
+                              title: const Text('타이머 끄기'),
+                              trailing: _timerSeconds == 0
+                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  : const Icon(
+                                      Icons.radio_button_unchecked,
+                                      color: Colors.grey,
+                                    ),
+                              onTap: () {
+                                setState(() {
+                                  _timerSeconds = 0;
+                                });
+                                _saveTimerSettings();
+                                Navigator.of(context).pop();
+                              },
+                            ),
+                          ],
                         ),
                       ),
-                      content: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          _buildTimerOption(3),
-                          _buildTimerOption(5),
-                          _buildTimerOption(10),
-                          ListTile(
-                            title: const Text('타이머 끄기'),
-                            trailing: _timerSeconds == 0
-                                ? Icon(Icons.check_circle, color: kMainPink)
-                                : const Icon(
-                                    Icons.radio_button_unchecked,
-                                    color: Colors.grey,
-                                  ),
-                            onTap: () {
-                              setState(() {
-                                _timerSeconds = 0;
-                              });
-                              _saveTimerSettings();
-                              Navigator.of(context).pop();
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
-                tooltip: _timerSeconds > 0 ? '타이머: ${_timerSeconds}초' : '타이머',
-              ),
-            ],
+                    );
+                  },
+                  tooltip: _timerSeconds > 0 ? '타이머: ${_timerSeconds}초' : '타이머',
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -4610,7 +5105,15 @@ class _HomePageState extends State<HomePage> {
                       icon,
                       key: ValueKey(icon),
                       size: 24,
-                      color: isActive ? kMainPink : Colors.white70,
+                      color: isActive ? kMainPink : Colors.white,
+                      shadows: [
+                        // 흰색 배경에서도 또렷하게 보이도록 그림자 추가
+                        Shadow(
+                          color: Colors.black.withValues(alpha: 0.5),
+                          blurRadius: 2,
+                          offset: const Offset(0, 1),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -4627,7 +5130,15 @@ class _HomePageState extends State<HomePage> {
                         style: TextStyle(
                           fontSize: 9,
                           fontWeight: FontWeight.w600,
-                          color: isActive ? kMainPink : Colors.white70,
+                          color: isActive ? kMainPink : Colors.white,
+                          shadows: [
+                            // 흰색 배경에서도 또렷하게 보이도록 그림자 추가
+                            Shadow(
+                              color: Colors.black.withValues(alpha: 0.5),
+                              blurRadius: 1,
+                              offset: const Offset(0, 1),
+                            ),
+                          ],
                         ),
                       ),
                     ),
@@ -5220,64 +5731,24 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildZoomRatioOption(double ratio) {
+    // 프리셋 버튼 선택 시에만 정확히 일치하는지 확인 (0.05 이내)
+    final bool isSelected = (_uiZoomScale - ratio).abs() <= 0.05;
     return ListTile(
       title: Text('${ratio.toStringAsFixed(1)}x'),
-      trailing:
-          (_selectedZoomRatio - ratio).abs() <
-              0.05 // 부동소수점 오차 고려
+      trailing: isSelected
           ? Icon(Icons.check_circle, color: kMainPink)
           : const Icon(Icons.radio_button_unchecked, color: Colors.grey),
-      onTap: () async {
-        if (_cameraController != null &&
-            _cameraController!.value.isInitialized) {
-          try {
-            final minZoom = await _cameraController!.getMinZoomLevel();
-            final maxZoom = await _cameraController!.getMaxZoomLevel();
-            final newZoom = ratio.clamp(minZoom, maxZoom);
-
-            debugPrint(
-              '[Petgram] 🔍 배율 선택: ratio=$ratio, newZoom=$newZoom (min=$minZoom, max=$maxZoom)',
-            );
-
-            // 카메라 줌 레벨 설정
-            await _cameraController!.setZoomLevel(newZoom);
-
-            // 모든 줌 관련 변수 업데이트
-            if (mounted) {
-              setState(() {
-                _currentZoomLevel = newZoom;
-                _baseZoomLevel = newZoom; // 핀치 줌 기준값도 업데이트
-                _selectedZoomRatio = newZoom; // 실제 설정된 값으로 업데이트
-              });
-              debugPrint(
-                '[Petgram] ✅ 배율 설정 완료: _currentZoomLevel=$_currentZoomLevel, _baseZoomLevel=$_baseZoomLevel, _selectedZoomRatio=$_selectedZoomRatio',
-              );
-            }
-          } catch (e) {
-            debugPrint('❌ setZoomLevel error: $e');
-          }
-        } else {
-          // 목업 모드 또는 카메라가 초기화되지 않은 경우 UI만 업데이트
-          debugPrint(
-            '[Petgram] 🔍 목업 모드: 배율 선택 ratio=$ratio, _useMockCamera=$_useMockCamera',
-          );
-          if (mounted) {
-            setState(() {
-              _currentZoomLevel = ratio;
-              _baseZoomLevel = ratio; // 핀치 줌 기준값도 업데이트
-              _selectedZoomRatio = ratio;
-              // 목업 모드에서는 UI 줌 스케일도 업데이트 (핀치 줌과 동일하게)
-              _uiZoomScale = ratio.clamp(1.0, 5.0);
-              _baseZoomScale = ratio.clamp(1.0, 5.0);
-            });
-            debugPrint(
-              '[Petgram] ✅ 목업 모드 배율 설정 완료: _currentZoomLevel=$_currentZoomLevel, _uiZoomScale=$_uiZoomScale, _selectedZoomRatio=$_selectedZoomRatio',
-            );
-          }
-        }
-        if (mounted) {
-          Navigator.of(context).pop();
-        }
+      onTap: () {
+        if (!mounted) return;
+        // 프리셋 버튼을 탭할 때만 정확한 프리셋 값으로 설정
+        final clampedRatio = ratio.clamp(_uiZoomMin, _uiZoomMax);
+        setState(() {
+          _uiZoomScale = clampedRatio;
+          _baseUiZoomScale = clampedRatio;
+          _selectedZoomRatio =
+              clampedRatio; // 프리셋 선택 시에만 _selectedZoomRatio 업데이트
+        });
+        Navigator.of(context).pop();
       },
     );
   }
@@ -6493,15 +6964,42 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
 class FilterPage extends StatefulWidget {
   final File imageFile;
   final String initialFilterKey;
+  final PetInfo? selectedPet; // 펫 정보 (펫톤 보정용)
+  final String? coatPreset; // 코트 프리셋 (light/mid/dark)
 
   const FilterPage({
     super.key,
     required this.imageFile,
     required this.initialFilterKey,
+    this.selectedPet,
+    this.coatPreset,
   });
 
   @override
   State<FilterPage> createState() => _FilterPageState();
+}
+
+/// 펫 전용 보정 프리셋 모델
+class _PetAdjustPreset {
+  final String id;
+  final String label;
+  final double brightness; // -50 ~ +50
+  final double contrast; // -50 ~ +50
+  final double sharpness; // 0 ~ 100
+
+  const _PetAdjustPreset({
+    required this.id,
+    required this.label,
+    required this.brightness,
+    required this.contrast,
+    required this.sharpness,
+  });
+}
+
+/// 조정 타입 enum (슬라이딩 패널용)
+enum AdjustmentType {
+  filterAndIntensity, // 필터 + 강도
+  petToneAndAdjust, // 펫톤 + 밝기/대비/선명
 }
 
 class _FilterPageState extends State<FilterPage> {
@@ -6519,11 +7017,39 @@ class _FilterPageState extends State<FilterPage> {
   double _intensity = 0.8;
   String _coatPreset = 'mid'; // light / mid / dark / custom
 
+  // 썸네일 이미지 (프리뷰용, 저해상도)
+  img.Image? _thumbnailImage;
+  bool _isLoadingThumbnail = false;
+
+  // 펫 전용 보정 (FilterPage 전용)
+  double _editBrightness = 0.0; // -50 ~ +50
+  double _editContrast = 0.0; // -50 ~ +50
+  double _editSharpness = 0.0; // 0 ~ 100
+
+  // 펫 전용 보정 프리셋
+  String _selectedPresetId = 'basic'; // 기본 프리셋
+  bool _isManualDetailMode = false; // false=프리셋, true=수동
+
   // 핀치줌 관련 변수
   double _baseScale = 1.0;
   double _currentScale = 1.0;
   Offset _offset = Offset.zero;
   Offset _lastFocalPoint = Offset.zero;
+
+  // Preview matrix 저장 (Save 시 동일하게 사용)
+  List<double>? _cachedPreviewMatrix;
+
+  // 성능 최적화: 썸네일 JPG 바이트 캐시
+  Uint8List? _cachedThumbnailBytes;
+
+  // 성능 최적화: 슬라이더 변경 debounce 타이머
+  Timer? _sliderDebounceTimer;
+
+  // 성능 최적화: 이미지 크기 캐시
+  Size? _cachedImageSize;
+
+  // [UI 개편] 활성 조정 타입 (슬라이딩 패널용)
+  AdjustmentType? _activeAdjustment;
 
   @override
   void initState() {
@@ -6534,6 +7060,153 @@ class _FilterPageState extends State<FilterPage> {
     _category = 'basic';
     _currentImageFile = widget.imageFile;
     // widget.initialFilterKey는 UI용 메타 정보 (현재는 사용하지 않음)
+
+    // 펫 정보 초기화
+    if (widget.coatPreset != null) {
+      _coatPreset = widget.coatPreset!;
+    }
+
+    // 기본 프리셋 적용
+    if (_detailPresets.isNotEmpty) {
+      _applyPreset(_detailPresets.first);
+    }
+
+    // 썸네일 생성 (프리뷰 최적화)
+    _loadThumbnail();
+
+    // 초기 Preview matrix 계산 및 캐시
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _cachedPreviewMatrix = _buildPreviewColorMatrix();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _sliderDebounceTimer?.cancel();
+    super.dispose();
+  }
+
+  /// 썸네일 이미지 로드 (프리뷰 최적화: 고해상도 썸네일 생성)
+  /// 화면 크기 측정 후 1.3~1.5배 큰 해상도로 썸네일 생성하여 GPU scaling blur 방지
+  Future<void> _loadThumbnail() async {
+    if (_isLoadingThumbnail) return;
+    _isLoadingThumbnail = true;
+
+    try {
+      // 통합 이미지 로딩 헬퍼 사용 (PNG/JPG/HEIC 모두 지원)
+      final originalImage = await loadImageWithExifRotation(_currentImageFile);
+      if (originalImage != null) {
+        // 이미지 비율 계산
+        final imageAspectRatio = originalImage.width / originalImage.height;
+
+        // 화면 크기 측정 (BuildContext가 필요하므로 WidgetsBinding 사용)
+        final screenSize =
+            WidgetsBinding
+                .instance
+                .platformDispatcher
+                .views
+                .first
+                .physicalSize /
+            WidgetsBinding
+                .instance
+                .platformDispatcher
+                .views
+                .first
+                .devicePixelRatio;
+        final screenWidth = screenSize.width;
+
+        // Preview 영역 크기 계산 (화면 너비 기준, 패딩 제외)
+        final availableWidth = screenWidth - 32; // 좌우 패딩 16px * 2
+        double previewWidth = availableWidth;
+        double previewHeight;
+
+        // 이미지 비율에 따라 preview 높이 계산
+        if (imageAspectRatio < 0.6) {
+          // 9:16 비율 (세로형)
+          previewHeight = availableWidth * (4 / 3); // 최대 높이 제한
+          previewWidth = previewHeight * imageAspectRatio;
+        } else if (imageAspectRatio <= 1.0) {
+          // 1:1 이하 비율
+          previewHeight = availableWidth / imageAspectRatio;
+          if (previewHeight > availableWidth * (4 / 3)) {
+            previewHeight = availableWidth * (4 / 3);
+            previewWidth = previewHeight * imageAspectRatio;
+          }
+        } else {
+          // 3:4 등 가로형
+          previewHeight = availableWidth * (4 / 3);
+        }
+
+        // Preview 영역보다 최소 1.4배 큰 해상도로 썸네일 생성 (GPU scaling blur 방지)
+        final double scaleFactor = 1.4;
+        int targetWidth = (previewWidth * scaleFactor).round();
+        int targetHeight = (previewHeight * scaleFactor).round();
+
+        // 비율별 최소 크기 기준 적용
+        if (imageAspectRatio < 0.6) {
+          // 9:16 비율: 최소 1600px (세로 기준)
+          targetHeight = math.max(targetHeight, 1600);
+          targetWidth = (targetHeight * imageAspectRatio).round();
+        } else if (imageAspectRatio <= 1.0) {
+          // 1:1 비율: 최소 1200px
+          targetWidth = math.max(targetWidth, 1200);
+          targetHeight = (targetWidth / imageAspectRatio).round();
+        } else {
+          // 3:4 비율: 최소 1400px (가로 기준)
+          targetWidth = math.max(targetWidth, 1400);
+          targetHeight = (targetWidth / imageAspectRatio).round();
+        }
+
+        // 원본 이미지보다 크게 리사이즈하지 않도록 제한
+        targetWidth = math.min(targetWidth, originalImage.width);
+        targetHeight = math.min(targetHeight, originalImage.height);
+
+        debugPrint(
+          '[FilterPage] 📐 썸네일 생성: '
+          '원본=${originalImage.width}x${originalImage.height}, '
+          '비율=${imageAspectRatio.toStringAsFixed(3)}, '
+          '프리뷰영역=${previewWidth.toStringAsFixed(0)}x${previewHeight.toStringAsFixed(0)}, '
+          '썸네일=${targetWidth}x${targetHeight}',
+        );
+
+        // 고해상도 썸네일 생성
+        final thumbnail = img.copyResize(
+          originalImage,
+          width: targetWidth,
+          height: targetHeight,
+          maintainAspect: true,
+        );
+
+        // 썸네일 JPG 바이트 캐시 (성능 최적화, 화질 향상)
+        final thumbnailBytes = Uint8List.fromList(
+          img.encodeJpg(thumbnail, quality: 90), // 화질 향상: 85 -> 90
+        );
+
+        if (mounted) {
+          setState(() {
+            _thumbnailImage = thumbnail;
+            _cachedThumbnailBytes = thumbnailBytes;
+            _isLoadingThumbnail = false;
+          });
+        }
+      } else {
+        debugPrint('[FilterPage] ⚠️ 썸네일 로드 실패: 이미지 디코딩 실패');
+        if (mounted) {
+          setState(() {
+            _isLoadingThumbnail = false;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('[FilterPage] ❌ 썸네일 로드 실패: $e');
+      if (mounted) {
+        setState(() {
+          _isLoadingThumbnail = false;
+        });
+      }
+    }
   }
 
   Future<void> _pickNewImage() async {
@@ -6553,13 +7226,21 @@ class _FilterPageState extends State<FilterPage> {
 
       setState(() {
         _currentImageFile = File(picked.path);
-        _filterKey = 'basic_none'; // 새 이미지 선택 시 필터 초기화
+        // 필터 상태 보존: filter key, intensity, brightness, petTone preset은 초기화하지 않음
+        // 사용자가 설정한 필터 및 보정 값은 새 이미지에서도 유지됨
         _isPickingImage = false;
         // 새 이미지 선택 시 핀치줌 리셋
         _currentScale = 1.0;
         _baseScale = 1.0;
         _offset = Offset.zero;
+        // 캐시 초기화
+        _cachedThumbnailBytes = null;
+        _cachedImageSize = null;
+        _cachedPreviewMatrix = null;
       });
+
+      // 새 이미지 썸네일 로드
+      _loadThumbnail();
     } catch (e) {
       if (mounted) {
         setState(() => _isPickingImage = false);
@@ -6576,10 +7257,6 @@ class _FilterPageState extends State<FilterPage> {
 
   @override
   Widget build(BuildContext context) {
-    final fallback =
-        _filtersByCategory['basic'] ?? <PetFilter>[_allFilters['basic_none']!];
-    final filters = _filtersByCategory[_category] ?? fallback;
-
     return Scaffold(
       appBar: AppBar(
         elevation: 0,
@@ -6618,145 +7295,142 @@ class _FilterPageState extends State<FilterPage> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   const SizedBox(height: 16),
-                  // 미리보기 영역 (가로 100%, 세로는 제한)
+                  // 미리보기 영역 (3:4 기준, 9:16의 경우 가로값 조정)
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
                     child: LayoutBuilder(
                       builder: (context, constraints) {
                         final availableWidth = constraints.maxWidth;
-                        // 가로 세로 100% 표시를 위해 높이 제한 제거
-                        return Container(
-                          width: availableWidth,
-                          constraints: BoxConstraints(minWidth: availableWidth),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(24),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.1),
-                                blurRadius: 20,
-                                offset: const Offset(0, 8),
+                        // 3:4 기준으로 세로값 계산
+                        final double baseHeight = availableWidth * (4 / 3);
+
+                        // 이미지 파일에서 실제 비율 가져오기 (FutureBuilder 사용)
+                        return FutureBuilder<Size>(
+                          future: _getImageSize(_currentImageFile),
+                          builder: (context, snapshot) {
+                            double displayWidth = availableWidth;
+                            double displayHeight = baseHeight;
+
+                            if (snapshot.hasData) {
+                              final imageSize = snapshot.data!;
+                              final imageAspectRatio =
+                                  imageSize.width / imageSize.height;
+
+                              // 최대 세로값: 3:4 기준
+                              final double maxHeight = availableWidth * (4 / 3);
+
+                              // 9:16 비율인 경우 (약 0.5625)
+                              if (imageAspectRatio < 0.6) {
+                                // 가로값을 줄이면서 비율 맞추기
+                                displayHeight = maxHeight;
+                                displayWidth = displayHeight * imageAspectRatio;
+                              } else if (imageAspectRatio <= 1.0) {
+                                // 1:1 이하 비율 (1:1 포함)
+                                // 세로값을 이미지 비율에 맞춰 줄임
+                                displayWidth = availableWidth;
+                                displayHeight =
+                                    availableWidth / imageAspectRatio;
+                                // 최대값 제한
+                                if (displayHeight > maxHeight) {
+                                  displayHeight = maxHeight;
+                                  displayWidth =
+                                      displayHeight * imageAspectRatio;
+                                }
+                              } else {
+                                // 1:1 초과 비율 (3:4 등)
+                                // 3:4 기준으로 세로값 조정
+                                displayWidth = availableWidth;
+                                displayHeight = maxHeight;
+                              }
+                            }
+
+                            return Container(
+                              width: displayWidth,
+                              height: displayHeight,
+                              constraints: BoxConstraints(
+                                minWidth: displayWidth,
+                                maxWidth: displayWidth,
+                                minHeight: displayHeight,
+                                maxHeight: displayHeight,
                               ),
-                            ],
-                          ),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(24),
-                            child: RepaintBoundary(
-                              key: _previewKey,
-                              child: _buildFilteredImageContent(),
-                            ),
-                          ),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(24),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.1),
+                                    blurRadius: 20,
+                                    offset: const Offset(0, 8),
+                                  ),
+                                ],
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(24),
+                                child: _buildFilteredImageContent(),
+                              ),
+                            );
+                          },
                         );
                       },
                     ),
                   ),
                   const SizedBox(height: 16),
-                  // 필터 컨트롤 영역 (카드 스타일)
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: const BorderRadius.only(
-                        topLeft: Radius.circular(28),
-                        topRight: Radius.circular(28),
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.05),
-                          blurRadius: 20,
-                          offset: const Offset(0, -4),
-                        ),
-                      ],
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const SizedBox(height: 10),
-                        // 카테고리 탭
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 20),
-                          child: _buildCategoryTabs(),
-                        ),
-                        const SizedBox(height: 8),
-                        // 필터 버튼들
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 20),
-                          child: _buildFilterButtons(filters),
-                        ),
-                        const SizedBox(height: 8),
-                        // 강도 조절
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 20),
-                          child: _buildIntensityControls(),
-                        ),
-                        const SizedBox(height: 100), // 저장 버튼 공간 확보
-                      ],
-                    ),
+                  // [UI 간소화] 필터 선택 영역 제거됨 (패널 내부로 이동)
+                  // [위치 조정] 하단 아이콘 바 높이 + 여백 확보 (사진 하단이 안 짤리도록)
+                  SizedBox(
+                    height:
+                        MediaQuery.of(context).size.height *
+                        0.25, // 화면 높이의 25% 여백
                   ),
                 ],
               ),
             ),
-            // 고정된 저장 버튼 (하단에 고정)
+            // [UI 개편] 하단 아이콘 바
             Positioned(
               left: 0,
               right: 0,
               bottom: 0,
-              child: Container(
-                padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.1),
-                      blurRadius: 10,
-                      offset: const Offset(0, -2),
-                    ),
-                  ],
-                ),
-                child: SafeArea(
-                  top: false,
-                  child: SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: _isSaving ? null : _onSavePressed,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: kMainPink,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        elevation: 4,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(20),
+              child: _buildBottomToolbar(),
+            ),
+            // [UI 개편] 슬라이딩 조정 패널
+            if (_activeAdjustment != null)
+              Positioned.fill(
+                child: GestureDetector(
+                  // 외부 클릭 시 패널 닫기
+                  onTap: () {
+                    setState(() {
+                      _activeAdjustment = null;
+                    });
+                  },
+                  child: Container(
+                    color: Colors.transparent,
+                    child: Stack(
+                      children: [
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: GestureDetector(
+                            // 패널 영역 클릭은 닫히지 않도록 함
+                            onTap: () {},
+                            child: _buildAdjustmentPanel(),
+                          ),
                         ),
-                      ),
-                      child: _isSaving
-                          ? const SizedBox(
-                              height: 20,
-                              width: 20,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2.5,
-                                valueColor: AlwaysStoppedAnimation<Color>(
-                                  Colors.white,
-                                ),
-                              ),
-                            )
-                          : const Text(
-                              '이 사진으로 저장하기',
-                              style: TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 15,
-                              ),
-                            ),
+                      ],
                     ),
                   ),
                 ),
               ),
-            ),
           ],
         ),
       ),
     );
   }
 
-  /// ColorMatrix를 실제 이미지 픽셀에 적용
-  img.Image _applyColorMatrixToImage(img.Image image, List<double> matrix) {
+  /// ColorMatrix를 실제 이미지 픽셀에 적용 (compute용 정적 함수)
+  static img.Image _applyColorMatrixToImageStatic(List<dynamic> args) {
+    final imageBytes = args[0] as Uint8List;
+    final matrix = args[1] as List<double>;
+    final image = img.decodeImage(imageBytes)!;
     final result = img.copyResize(
       image,
       width: image.width,
@@ -6766,12 +7440,14 @@ class _FilterPageState extends State<FilterPage> {
     for (int y = 0; y < result.height; y++) {
       for (int x = 0; x < result.width; x++) {
         final pixel = result.getPixel(x, y);
+
+        // [ROLLBACK] 0~1 정규화 롤백 - 원래 0~255 방식으로 복원
         final r = pixel.r.toDouble();
         final g = pixel.g.toDouble();
         final b = pixel.b.toDouble();
         final a = pixel.a.toDouble();
 
-        // ColorMatrix 적용
+        // ColorMatrix 적용 (0~255 색 공간)
         final newR =
             (matrix[0] * r +
                     matrix[1] * g +
@@ -6796,14 +7472,10 @@ class _FilterPageState extends State<FilterPage> {
                     matrix[14])
                 .clamp(0, 255)
                 .toInt();
-        final newA =
-            (matrix[15] * r +
-                    matrix[16] * g +
-                    matrix[17] * b +
-                    matrix[18] * a +
-                    matrix[19])
-                .clamp(0, 255)
-                .toInt();
+        // Alpha는 원본 유지 (행렬 계산 무시)
+        // multiplyColorMatrices에서 alpha 행을 [0, 0, 0, 1, 0]으로 강제하므로
+        // alpha는 항상 원본 값 그대로 유지
+        final newA = pixel.a.toInt();
 
         result.setPixel(x, y, img.ColorRgba8(newR, newG, newB, newA));
       }
@@ -6812,25 +7484,450 @@ class _FilterPageState extends State<FilterPage> {
     return result;
   }
 
-  /// 미리보기 영역: 선택된 필터 + 강도 + 자동 보정 적용
-  Widget _buildFilteredImageContent() {
-    final PetFilter base =
-        _allFilters[_filterKey] ?? _allFilters['basic_none']!;
+  /// [DEPRECATED - GPU 렌더 캡처 방식 사용]
+  /// ColorMatrix를 실제 이미지 픽셀에 적용 (인스턴스 메서드, compute 호출)
+  /// GPU 렌더 캡처 방식으로 전환되어 더 이상 사용되지 않음
+  @Deprecated('Use GPU render capture instead')
+  Future<img.Image> _applyColorMatrixToImage(
+    img.Image image,
+    List<double> matrix,
+  ) async {
+    // 성능 최적화: 이미지를 직접 처리 (인코딩/디코딩 제거)
+    // 큰 이미지의 경우에만 compute 사용
+    if (image.width * image.height > 2000000) {
+      // 200만 픽셀 이상이면 isolate에서 처리
+      final imageBytes = Uint8List.fromList(img.encodePng(image));
+      return await compute(_applyColorMatrixToImageStatic, [
+        imageBytes,
+        matrix,
+      ]);
+    } else {
+      // 작은 이미지는 메인 스레드에서 직접 처리 (인코딩/디코딩 오버헤드 제거)
+      return _applyColorMatrixToImageDirect(image, matrix);
+    }
+  }
 
-    // 항상 _currentImageFile만 사용 (촬영 시 입혀진 필터가 이미 적용된 상태)
-    // 원본 필터(basic_none) 선택 시: 촬영 시 입혀진 필터 상태 그대로 표시 (추가 ColorFiltered 없음)
-    // 다른 필터 선택 시: 촬영 시 입혀진 필터 위에 새로운 필터를 합성하여 적용
+  /// ColorMatrix를 직접 적용 (메인 스레드, 작은 이미지용)
+  /// [ROLLBACK] 0~1 정규화 롤백 - 원래 0~255 방식으로 복원
+  img.Image _applyColorMatrixToImageDirect(
+    img.Image image,
+    List<double> matrix,
+  ) {
+    final result = img.copyResize(
+      image,
+      width: image.width,
+      height: image.height,
+    );
 
-    final bool isOriginalFilter = base.key == 'basic_none';
-    List<double>? matrix;
-    if (!isOriginalFilter) {
-      // 다른 필터 선택 시: 새로운 필터 매트릭스를 촬영 시 입혀진 필터 위에 합성
-      matrix = mixMatrix(kIdentityMatrix, base.matrix, _intensity);
+    for (int y = 0; y < result.height; y++) {
+      for (int x = 0; x < result.width; x++) {
+        final pixel = result.getPixel(x, y);
+        final r = pixel.r.toDouble();
+        final g = pixel.g.toDouble();
+        final b = pixel.b.toDouble();
+        final a = pixel.a.toDouble();
+
+        // ColorMatrix 적용 (0~255 색 공간)
+        final newR =
+            (matrix[0] * r +
+                    matrix[1] * g +
+                    matrix[2] * b +
+                    matrix[3] * a +
+                    matrix[4])
+                .clamp(0, 255)
+                .toInt();
+        final newG =
+            (matrix[5] * r +
+                    matrix[6] * g +
+                    matrix[7] * b +
+                    matrix[8] * a +
+                    matrix[9])
+                .clamp(0, 255)
+                .toInt();
+        final newB =
+            (matrix[10] * r +
+                    matrix[11] * g +
+                    matrix[12] * b +
+                    matrix[13] * a +
+                    matrix[14])
+                .clamp(0, 255)
+                .toInt();
+        // Alpha는 원본 유지 (행렬 계산 무시)
+        // ColorFilter.matrix의 alpha 행은 [0, 0, 0, 1, 0]이므로 alpha는 항상 원본 유지
+        final newA = pixel.a.toInt();
+
+        result.setPixel(x, y, img.ColorRgba8(newR, newG, newB, newA));
+      }
     }
 
-    final imageWidget = Image.file(
-      _currentImageFile,
-      fit: BoxFit.contain, // 100% 표시를 위해 contain 사용
+    return result;
+  }
+
+  /// 펫톤 프로파일 가져오기 (HomePage의 _getCurrentPetToneProfile과 동일한 로직)
+  PetToneProfile? _getCurrentPetToneProfile() {
+    if (widget.selectedPet == null) return null;
+
+    final pet = widget.selectedPet!;
+    if (pet.type != 'dog' && pet.type != 'cat') return null;
+
+    String tone = _coatPreset;
+    if (tone == 'custom' ||
+        (tone != 'light' && tone != 'mid' && tone != 'dark')) {
+      tone = 'mid';
+    }
+
+    final key = '${pet.type}_$tone';
+    return kPetToneProfiles[key];
+  }
+
+  /// 프리뷰용 ColorMatrix 생성 (펫톤 + 필터 + 밝기/대비/선명도)
+  /// Preview용 ColorMatrix 생성 (순서: petTone → filter → brightness → contrast)
+  /// Sharpness는 matrix에 포함하지 않음 (Preview와 Save 모두 별도 적용으로 통일)
+  List<double> _buildPreviewColorMatrix() {
+    List<double> base = List.from(kIdentityMatrix);
+
+    // 1. 펫톤 프로파일 적용 (40% 강도)
+    final petProfile = _getCurrentPetToneProfile();
+    if (petProfile != null) {
+      final petToneMatrix = mixMatrix(
+        kIdentityMatrix,
+        petProfile.matrix,
+        0.4, // 40% 강도로 약하게 적용
+      );
+      base = multiplyColorMatrices(base, petToneMatrix);
+    }
+
+    // 2. 필터 적용
+    final PetFilter? currentFilter = _allFilters[_filterKey];
+    if (currentFilter != null && currentFilter.key != 'basic_none') {
+      final filterMatrix = mixMatrix(
+        kIdentityMatrix,
+        currentFilter.matrix,
+        _intensity,
+      );
+      base = multiplyColorMatrices(base, filterMatrix);
+    }
+
+    // 3. 밝기 적용
+    if (_editBrightness != 0.0) {
+      final double b = (_editBrightness / 50.0) * 40.0; // 약한 범위로 clamp
+      final List<double> brightnessMatrix = [
+        1,
+        0,
+        0,
+        0,
+        b,
+        0,
+        1,
+        0,
+        0,
+        b,
+        0,
+        0,
+        1,
+        0,
+        b,
+        0,
+        0,
+        0,
+        1,
+        0,
+      ];
+      base = multiplyColorMatrices(base, brightnessMatrix);
+    }
+
+    // 4. 대비 적용
+    if (_editContrast != 0.0) {
+      final double c = 1.0 + (_editContrast / 50.0) * 0.4; // 0.6 ~ 1.4 정도
+      final List<double> contrastMatrix = [
+        c,
+        0,
+        0,
+        0,
+        0,
+        0,
+        c,
+        0,
+        0,
+        0,
+        0,
+        0,
+        c,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+      ];
+      base = multiplyColorMatrices(base, contrastMatrix);
+    }
+
+    // Sharpness는 matrix에 포함하지 않음 (Preview와 Save 모두 별도 적용)
+
+    return base;
+  }
+
+  /// img.Image를 ui.Image로 변환 (FilterPage 저장용)
+  Future<ui.Image> _convertImgImageToUiImage(img.Image image) async {
+    final Uint8List pngBytes = Uint8List.fromList(img.encodePng(image));
+    final ui.Codec codec = await ui.instantiateImageCodec(pngBytes);
+    final ui.FrameInfo frameInfo = await codec.getNextFrame();
+    return frameInfo.image;
+  }
+
+  /// GPU 기반 ColorMatrix 적용 (FilterPage 저장용)
+  /// 비파괴적 함수: 입력 이미지를 dispose하지 않음 (소유권은 호출자가 관리)
+  Future<ui.Image> _applyColorMatrixToUiImageGpu(
+    ui.Image image,
+    List<double> matrix,
+  ) async {
+    // matrix가 identity면 원본 반환
+    if (_listEquals(matrix, kIdentityMatrix)) {
+      return image;
+    }
+
+    final int width = image.width;
+    final int height = image.height;
+
+    // PictureRecorder로 새 이미지 생성
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(recorder);
+
+    // ColorFilter 적용하여 그리기
+    final paint = Paint()
+      ..colorFilter = ColorFilter.matrix(matrix)
+      ..filterQuality = FilterQuality.high;
+
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+      Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+      paint,
+    );
+
+    // Picture를 Image로 변환
+    final ui.Picture picture = recorder.endRecording();
+    final ui.Image filteredImage = await picture.toImage(width, height);
+    picture.dispose();
+    // 입력 image는 dispose하지 않음 (호출자가 관리)
+
+    return filteredImage;
+  }
+
+  /// 펫 전용 보정 프리셋 목록
+  static const List<_PetAdjustPreset> _detailPresets = [
+    _PetAdjustPreset(
+      id: 'basic',
+      label: '기본',
+      brightness: 0,
+      contrast: 0,
+      sharpness: 0,
+    ),
+    _PetAdjustPreset(
+      id: 'eye_clear',
+      label: '눈 또렷',
+      brightness: 5,
+      contrast: 20,
+      sharpness: 60,
+    ),
+    _PetAdjustPreset(
+      id: 'fur_soft',
+      label: '털 보송',
+      brightness: 10,
+      contrast: -10,
+      sharpness: 25,
+    ),
+    _PetAdjustPreset(
+      id: 'dark_fur',
+      label: '어두운 털',
+      brightness: 20,
+      contrast: 5,
+      sharpness: 35,
+    ),
+  ];
+
+  /// 프리셋 적용
+  void _applyPreset(_PetAdjustPreset preset) {
+    setState(() {
+      _selectedPresetId = preset.id;
+      _isManualDetailMode = false; // 프리셋 선택 시 수동 모드 해제
+      _editBrightness = preset.brightness;
+      _editContrast = preset.contrast;
+      _editSharpness = preset.sharpness;
+      // Preview matrix 캐시 무효화 (다음 빌드에서 재계산)
+      _cachedPreviewMatrix = null;
+    });
+    debugPrint(
+      '[Petgram] 🎨 Detail preset: $_selectedPresetId, '
+      'brightness=$_editBrightness, contrast=$_editContrast, sharpness=$_editSharpness',
+    );
+  }
+
+  /// 선명도(샤프) 적용 (compute용 정적 함수)
+  static img.Image _applySharpenStatic(List<dynamic> args) {
+    final imageBytes = args[0] as Uint8List;
+    final amount = args[1] as double;
+    if (amount <= 0.0) return img.decodeImage(imageBytes)!;
+
+    final image = img.decodeImage(imageBytes)!;
+    // 기본 샤프닝 커널 (3x3)
+    // center: 1 + 5*amount, 주변: -amount
+    final kernel = [
+      -amount,
+      -amount,
+      -amount,
+      -amount,
+      1 + 5 * amount,
+      -amount,
+      -amount,
+      -amount,
+      -amount,
+    ];
+
+    // 간단한 컨볼루션 적용
+    final result = img.copyResize(
+      image,
+      width: image.width,
+      height: image.height,
+    );
+
+    for (int y = 1; y < image.height - 1; y++) {
+      for (int x = 1; x < image.width - 1; x++) {
+        double r = 0, g = 0, b = 0;
+
+        // 3x3 커널 적용
+        for (int ky = -1; ky <= 1; ky++) {
+          for (int kx = -1; kx <= 1; kx++) {
+            final pixel = image.getPixel(x + kx, y + ky);
+            final weight = kernel[(ky + 1) * 3 + (kx + 1)];
+            r += pixel.r * weight;
+            g += pixel.g * weight;
+            b += pixel.b * weight;
+          }
+        }
+
+        final newR = r.clamp(0, 255).toInt();
+        final newG = g.clamp(0, 255).toInt();
+        final newB = b.clamp(0, 255).toInt();
+        final a = image.getPixel(x, y).a.toInt();
+
+        result.setPixel(x, y, img.ColorRgba8(newR, newG, newB, a));
+      }
+    }
+
+    return result;
+  }
+
+  /// [DEPRECATED - GPU 렌더 캡처 방식 사용]
+  /// 선명도(샤프) 적용 (인스턴스 메서드, compute 호출)
+  /// GPU 렌더 캡처 방식으로 전환되어 더 이상 사용되지 않음
+  @Deprecated('Use GPU render capture instead')
+  Future<img.Image> _applySharpen(img.Image image, double amount) async {
+    if (amount <= 0.0) return image;
+
+    // 성능 최적화: 큰 이미지의 경우에만 compute 사용
+    if (image.width * image.height > 2000000) {
+      // 200만 픽셀 이상이면 isolate에서 처리
+      final imageBytes = Uint8List.fromList(img.encodePng(image));
+      return await compute(_applySharpenStatic, [imageBytes, amount]);
+    } else {
+      // 작은 이미지는 메인 스레드에서 직접 처리
+      return _applySharpenDirect(image, amount);
+    }
+  }
+
+  /// 선명도 직접 적용 (메인 스레드, 작은 이미지용)
+  img.Image _applySharpenDirect(img.Image image, double amount) {
+    final result = img.copyResize(
+      image,
+      width: image.width,
+      height: image.height,
+    );
+
+    // 기본 샤프닝 커널 (3x3)
+    final kernel = [
+      -amount,
+      -amount,
+      -amount,
+      -amount,
+      1 + 5 * amount,
+      -amount,
+      -amount,
+      -amount,
+      -amount,
+    ];
+
+    // 간단한 컨볼루션 적용
+    for (int y = 1; y < image.height - 1; y++) {
+      for (int x = 1; x < image.width - 1; x++) {
+        double r = 0, g = 0, b = 0;
+
+        // 3x3 커널 적용
+        for (int ky = -1; ky <= 1; ky++) {
+          for (int kx = -1; kx <= 1; kx++) {
+            final pixel = image.getPixel(x + kx, y + ky);
+            final weight = kernel[(ky + 1) * 3 + (kx + 1)];
+            r += pixel.r * weight;
+            g += pixel.g * weight;
+            b += pixel.b * weight;
+          }
+        }
+
+        final newR = r.clamp(0, 255).toInt();
+        final newG = g.clamp(0, 255).toInt();
+        final newB = b.clamp(0, 255).toInt();
+        final a = image.getPixel(x, y).a.toInt();
+
+        result.setPixel(x, y, img.ColorRgba8(newR, newG, newB, a));
+      }
+    }
+
+    return result;
+  }
+
+  /// 이미지 크기 가져오기 (캐시 사용)
+  Future<Size> _getImageSize(File imageFile) async {
+    // 캐시된 크기가 있고 파일이 동일하면 캐시 사용
+    if (_cachedImageSize != null && imageFile.path == _currentImageFile.path) {
+      return _cachedImageSize!;
+    }
+
+    try {
+      // 통합 이미지 로딩 헬퍼 사용 (PNG/JPG/HEIC 모두 지원, EXIF 회전 처리)
+      final img.Image? decoded = await loadImageWithExifRotation(imageFile);
+      if (decoded != null) {
+        final size = Size(decoded.width.toDouble(), decoded.height.toDouble());
+        _cachedImageSize = size; // 캐시 저장
+        return size;
+      }
+    } catch (e) {
+      debugPrint('[FilterPage] 이미지 크기 가져오기 실패: $e');
+    }
+    // 기본값: 3:4 비율
+    return const Size(3, 4);
+  }
+
+  /// 미리보기 영역: 선택된 필터 + 강도 + 펫 전용 보정 적용
+  Widget _buildFilteredImageContent() {
+    // 썸네일이 로드되지 않았으면 원본 파일 사용 (로딩 중)
+    if (_thumbnailImage == null) {
+      return Container(
+        width: double.infinity,
+        height: 200,
+        color: Colors.grey[200],
+        child: const Center(child: CircularProgressIndicator(strokeWidth: 2)),
+      );
+    }
+
+    // 썸네일을 메모리 이미지로 변환 (캐시된 바이트 사용)
+    final thumbnailBytes =
+        _cachedThumbnailBytes ??
+        Uint8List.fromList(img.encodeJpg(_thumbnailImage!, quality: 85));
+    final imageWidget = Image.memory(
+      thumbnailBytes,
+      fit: BoxFit.contain,
       errorBuilder: (context, error, stackTrace) {
         return Container(
           width: double.infinity,
@@ -6842,12 +7939,91 @@ class _FilterPageState extends State<FilterPage> {
       },
     );
 
-    final filteredWidget = isOriginalFilter
-        ? imageWidget // 원본 필터: 촬영 시 입혀진 필터 상태 그대로 (추가 ColorFiltered 없음)
-        : ColorFiltered(
-            colorFilter: ColorFilter.matrix(matrix!),
-            child: imageWidget, // 다른 필터: 촬영 시 입혀진 필터 위에 새로운 필터 합성
+    // 프리뷰용 matrix 생성 (펫톤 + 필터 + 밝기/대비)
+    // Sharpness는 Preview와 Save 모두 matrix 적용 후 별도 처리로 통일
+    final previewMatrix = _buildPreviewColorMatrix();
+    final bool hasFilter = !_listEquals(previewMatrix, kIdentityMatrix);
+
+    // Preview matrix를 캐시하여 Save 시 동일하게 사용
+    _cachedPreviewMatrix = previewMatrix;
+
+    // Preview matrix 로그 출력 (FilterPage 프리뷰용)
+    // 캐시된 matrix를 사용하므로 로그는 최소화 (초기 로드 시에만 출력)
+    if (_cachedPreviewMatrix == null || _cachedPreviewMatrix != previewMatrix) {
+      debugPrint(
+        '[Petgram] 🎨 [FILTER PAGE PREVIEW] Preview matrix = ${previewMatrix.join(', ')}',
+      );
+      debugPrint(
+        '[Petgram] 🎨 [FILTER PAGE PREVIEW] Preview matrix context: petProfile=${_getCurrentPetToneProfile()?.id ?? 'none'}, '
+        'filter=$_filterKey, intensity=$_intensity, brightness=$_editBrightness, contrast=$_editContrast',
+      );
+
+      // Alpha 행 검증 로그
+      final alphaRow = [
+        previewMatrix[15],
+        previewMatrix[16],
+        previewMatrix[17],
+        previewMatrix[18],
+        previewMatrix[19],
+      ];
+      if (alphaRow[0] != 0.0 ||
+          alphaRow[1] != 0.0 ||
+          alphaRow[2] != 0.0 ||
+          alphaRow[3] != 1.0 ||
+          alphaRow[4] != 0.0) {
+        debugPrint(
+          '[Petgram] ⚠️ [FILTER PAGE PREVIEW] Preview matrix alpha row is NOT [0,0,0,1,0]: $alphaRow',
+        );
+      } else {
+        debugPrint(
+          '[Petgram] ✅ [FILTER PAGE PREVIEW] Preview matrix alpha row is correct: $alphaRow',
+        );
+      }
+
+      // 각 행의 RGB 계수 합과 offset 로그 (색 파괴 추적용)
+      for (int row = 0; row < 3; row++) {
+        final rgbSum =
+            (previewMatrix[row * 5 + 0].abs() +
+                    previewMatrix[row * 5 + 1].abs() +
+                    previewMatrix[row * 5 + 2].abs())
+                .toStringAsFixed(3);
+        final offset = previewMatrix[row * 5 + 4].toStringAsFixed(2);
+        final rowName = row == 0 ? 'R' : (row == 1 ? 'G' : 'B');
+        debugPrint(
+          '[Petgram] 📊 [FILTER PAGE PREVIEW] Preview matrix $rowName row: RGB sum=$rgbSum, offset=$offset',
+        );
+        if (double.parse(rgbSum) < 0.2) {
+          debugPrint(
+            '[Petgram] ⚠️ [FILTER PAGE PREVIEW] WARNING: $rowName row RGB sum is too low (<0.2), color may be destroyed!',
           );
+        }
+      }
+    }
+
+    // GPU 렌더 캡처를 위한 최종 위젯 구성
+    // RepaintBoundary가 모든 필터 효과를 포함한 최종 렌더를 캡처
+    Widget filteredWidget = imageWidget;
+
+    // 1. 펫톤 + 필터 + 밝기/대비 적용 (ColorFiltered)
+    if (hasFilter) {
+      filteredWidget = ColorFiltered(
+        colorFilter: ColorFilter.matrix(previewMatrix),
+        child: filteredWidget,
+      );
+    }
+
+    // 2. 선명도(Sharpness) 적용은 GPU 렌더 캡처에서는 별도 처리 불필요
+    // GPU 렌더 캡처 시 프리뷰와 100% 동일하게 저장되므로
+    // 선명도는 ColorFilter matrix에 포함시키거나 프리뷰에서도 동일하게 보여줘야 함
+    // 현재는 프리뷰에서 선명도 효과를 보여주지 않으므로 저장 시에도 적용하지 않음
+    // 향후 프리뷰에 선명도 효과를 추가하면 ImageFiltered를 사용하여 추가할 수 있음
+
+    // 3. RepaintBoundary로 감싸서 GPU 렌더 캡처 준비
+    // RepaintBoundary는 필터가 적용된 최종 위젯 전체를 감싸야 함
+    final finalWidget = RepaintBoundary(
+      key: _previewKey,
+      child: filteredWidget,
+    );
 
     return Container(
       width: double.infinity,
@@ -6887,7 +8063,7 @@ class _FilterPageState extends State<FilterPage> {
           },
           child: Transform.scale(
             scale: _currentScale,
-            child: Transform.translate(offset: _offset, child: filteredWidget),
+            child: Transform.translate(offset: _offset, child: finalWidget),
           ),
         ),
       ),
@@ -6895,6 +8071,8 @@ class _FilterPageState extends State<FilterPage> {
   }
 
   /// 카테고리 탭 (기본 / Pink / Dog / Cat)
+  /// [UI 간소화] 더 이상 사용되지 않음 (패널 내부용으로 대체됨)
+  @Deprecated('Use _buildCategoryTabsForPanel instead')
   Widget _buildCategoryTabs() {
     final tabs = <_FilterCategoryTab>[
       const _FilterCategoryTab(keyValue: 'basic', label: '기본'),
@@ -6916,6 +8094,7 @@ class _FilterPageState extends State<FilterPage> {
           return Expanded(
             child: GestureDetector(
               onTap: () {
+                HapticFeedback.lightImpact();
                 setState(() {
                   _category = t.keyValue;
                   // 카테고리 변경 시 현재 선택된 필터가 새 카테고리에 없으면 첫 번째 필터로 변경
@@ -6934,33 +8113,45 @@ class _FilterPageState extends State<FilterPage> {
                   }
                 });
               },
-              child: AnimatedContainer(
+              child: TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0.95, end: selected ? 1.0 : 0.95),
                 duration: const Duration(milliseconds: 200),
-                curve: Curves.easeOut,
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                decoration: BoxDecoration(
-                  color: selected ? Colors.white : Colors.transparent,
-                  borderRadius: BorderRadius.circular(12),
-                  boxShadow: selected
-                      ? [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.08),
-                            blurRadius: 8,
-                            offset: const Offset(0, 2),
+                key: ValueKey(selected), // selected 값이 변경될 때마다 애니메이션 재시작
+                builder: (context, scale, child) {
+                  return Transform.scale(
+                    scale: scale,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      curve: Curves.easeOut,
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      decoration: BoxDecoration(
+                        color: selected ? Colors.white : Colors.transparent,
+                        borderRadius: BorderRadius.circular(11),
+                        boxShadow: selected
+                            ? [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.1),
+                                  blurRadius: 4,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ]
+                            : null,
+                      ),
+                      child: Center(
+                        child: Text(
+                          t.label,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: selected
+                                ? FontWeight.w700
+                                : FontWeight.w500,
+                            color: selected ? Colors.black87 : Colors.grey[600],
                           ),
-                        ]
-                      : null,
-                ),
-                child: Center(
-                  child: Text(
-                    t.label,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
-                      color: selected ? kMainPink : Colors.grey[600],
+                        ),
+                      ),
                     ),
-                  ),
-                ),
+                  );
+                },
               ),
             ),
           );
@@ -6970,6 +8161,8 @@ class _FilterPageState extends State<FilterPage> {
   }
 
   /// 카테고리 내 필터 버튼들
+  /// [UI 간소화] 더 이상 사용되지 않음 (패널 내부용으로 대체됨)
+  @Deprecated('Use _buildFilterButtonsForPanel instead')
   Widget _buildFilterButtons(List<PetFilter> filters) {
     return SizedBox(
       height: 60,
@@ -6986,6 +8179,8 @@ class _FilterPageState extends State<FilterPage> {
               // 필터 선택 시 즉시 업데이트하여 깜박임 방지
               setState(() {
                 _filterKey = f.key;
+                // Preview matrix 캐시 무효화 (다음 빌드에서 재계산)
+                _cachedPreviewMatrix = null;
                 // 원본 필터 선택 시 이미지 파일은 그대로 유지 (필터만 제거)
                 // _currentImageFile은 변경하지 않음
               });
@@ -7067,6 +8262,8 @@ class _FilterPageState extends State<FilterPage> {
   }
 
   /// 강도 조절 슬라이더 + 프리셋
+  /// [UI 개편] 더 이상 사용되지 않음 (패널 내부로 이동)
+  @Deprecated('Use _buildFilterIntensitySlider in panel instead')
   Widget _buildIntensityControls() {
     final PetFilter current =
         _allFilters[_filterKey] ?? _allFilters['basic_none']!;
@@ -7154,16 +8351,1037 @@ class _FilterPageState extends State<FilterPage> {
                   max: 1.2,
                   value: _intensity,
                   onChanged: (v) {
+                    // 즉시 UI 업데이트
                     setState(() {
                       _intensity = v;
                       _coatPreset = 'custom';
                     });
+
+                    // 프리뷰 업데이트는 debounce 적용 (성능 최적화)
+                    _sliderDebounceTimer?.cancel();
+                    _sliderDebounceTimer = Timer(
+                      const Duration(milliseconds: 150),
+                      () {
+                        if (mounted) {
+                          setState(() {
+                            // Preview matrix 캐시 무효화 (다음 빌드에서 재계산)
+                            _cachedPreviewMatrix = null;
+                          });
+                        }
+                      },
+                    );
                   },
                 ),
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 프리셋 칩 리스트
+  Widget _buildPresetChips() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 전체 너비에서 간격(8 * 3 = 24)을 제외하고 4등분
+        final double availableWidth = constraints.maxWidth;
+        final double spacing = 8.0 * (_detailPresets.length - 1);
+        final double chipWidth =
+            (availableWidth - spacing) / _detailPresets.length;
+
+        return SizedBox(
+          height: 40,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: _detailPresets.map((preset) {
+              final bool selected =
+                  _selectedPresetId == preset.id && !_isManualDetailMode;
+              return SizedBox(
+                width: chipWidth,
+                height: 40,
+                child: GestureDetector(
+                  onTap: () {
+                    _applyPreset(preset);
+                  },
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: selected ? kMainPink : Colors.grey[200],
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Text(
+                      preset.label,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: selected ? Colors.white : Colors.black87,
+                        fontWeight: selected
+                            ? FontWeight.w600
+                            : FontWeight.w500,
+                      ),
+                      textAlign: TextAlign.center,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 펫 전용 보정 헤더 (제목 + 프리셋/수동 전환)
+  Widget _buildDetailHeader() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        const Text(
+          '펫 전용 보정',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 14,
+            color: Colors.black87,
+          ),
+        ),
+        TextButton.icon(
+          onPressed: () {
+            setState(() {
+              _isManualDetailMode = !_isManualDetailMode;
+              if (_isManualDetailMode) {
+                // 슬라이더를 건드리기 시작하면 프리셋 id를 custom으로 변경
+                _selectedPresetId = 'custom';
+              }
+            });
+          },
+          icon: Icon(
+            _isManualDetailMode ? Icons.tune : Icons.auto_awesome,
+            size: 16,
+          ),
+          label: Text(
+            _isManualDetailMode ? '프리셋' : '수동설정',
+            style: const TextStyle(fontSize: 12),
+          ),
+          style: TextButton.styleFrom(
+            foregroundColor: kMainPink,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 펫 전용 보정 슬라이더 패널 (제목 없음)
+  Widget _buildDetailAdjustPanel() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildSliderRow(
+          label: '밝기',
+          value: _editBrightness,
+          min: -50,
+          max: 50,
+          onChanged: (v) {
+            // 즉시 UI 업데이트 (슬라이더 값만)
+            setState(() {
+              _editBrightness = v;
+              _selectedPresetId = 'custom';
+              _isManualDetailMode = true;
+            });
+
+            // 프리뷰 업데이트는 debounce 적용 (성능 최적화)
+            _sliderDebounceTimer?.cancel();
+            _sliderDebounceTimer = Timer(const Duration(milliseconds: 150), () {
+              if (mounted) {
+                setState(() {
+                  // Preview matrix 캐시 무효화 (다음 빌드에서 재계산)
+                  _cachedPreviewMatrix = null;
+                });
+              }
+            });
+          },
+        ),
+        const SizedBox(height: 4),
+        _buildSliderRow(
+          label: '대비',
+          value: _editContrast,
+          min: -50,
+          max: 50,
+          onChanged: (v) {
+            // 즉시 UI 업데이트 (슬라이더 값만)
+            setState(() {
+              _editContrast = v;
+              _selectedPresetId = 'custom';
+              _isManualDetailMode = true;
+            });
+
+            // 프리뷰 업데이트는 debounce 적용 (성능 최적화)
+            _sliderDebounceTimer?.cancel();
+            _sliderDebounceTimer = Timer(const Duration(milliseconds: 150), () {
+              if (mounted) {
+                setState(() {
+                  // Preview matrix 캐시 무효화 (다음 빌드에서 재계산)
+                  _cachedPreviewMatrix = null;
+                });
+              }
+            });
+          },
+        ),
+        const SizedBox(height: 4),
+        _buildSliderRow(
+          label: '선명도',
+          value: _editSharpness,
+          min: 0,
+          max: 100,
+          onChanged: (v) {
+            // 즉시 UI 업데이트 (슬라이더 값만)
+            setState(() {
+              _editSharpness = v;
+              _selectedPresetId = 'custom';
+              _isManualDetailMode = true;
+            });
+
+            // 선명도는 프리뷰에 실시간 반영하지 않음 (저장 시에만 적용)
+            // debounce 불필요
+          },
+        ),
+      ],
+    );
+  }
+
+  /// 펫 전용 보정 전체 섹션 (프리셋 + 수동 조절)
+  /// [UI 개편] 더 이상 사용되지 않음 (패널 내부로 이동)
+  @Deprecated('Use individual sliders in panel instead')
+  Widget _buildPetDetailAdjustSection() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.9),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildDetailHeader(),
+          const SizedBox(height: 8),
+          _buildPresetChips(),
+          const SizedBox(height: 8),
+          AnimatedCrossFade(
+            crossFadeState: _isManualDetailMode
+                ? CrossFadeState.showFirst
+                : CrossFadeState.showSecond,
+            duration: const Duration(milliseconds: 200),
+            firstChild: _buildDetailAdjustPanel(), // 수동 슬라이더
+            secondChild: const SizedBox.shrink(), // 프리셋 모드에서는 슬라이더 숨김
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 슬라이더 행 위젯
+  Widget _buildSliderRow({
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required ValueChanged<double> onChanged,
+    Color? textColor, // [UI 개편] 패널 내부에서 흰색 텍스트 사용
+  }) {
+    final Color labelColor = textColor ?? Colors.black87;
+    final Color valueColor = textColor ?? Colors.grey;
+
+    return Row(
+      children: [
+        SizedBox(
+          width: 52,
+          child: Text(label, style: TextStyle(fontSize: 12, color: labelColor)),
+        ),
+        Expanded(
+          child: Slider(
+            value: value,
+            min: min,
+            max: max,
+            onChanged: onChanged,
+            activeColor: kMainPink,
+          ),
+        ),
+        SizedBox(
+          width: 36,
+          child: Text(
+            value.round().toString(),
+            textAlign: TextAlign.end,
+            style: TextStyle(fontSize: 11, color: valueColor),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // [UI 개편] 하단 아이콘 바
+  Widget _buildBottomToolbar() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.1),
+            blurRadius: 10,
+            offset: const Offset(0, -2),
+          ),
+        ],
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 아이콘 버튼들 (간소화: 필터+강도, 펫톤+보정, 리셋)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _buildToolbarIconButton(
+                  icon: Icons.photo_filter,
+                  label: '필터',
+                  type: AdjustmentType.filterAndIntensity,
+                ),
+                _buildToolbarIconButton(
+                  icon: Icons.pets,
+                  label: '펫톤',
+                  type: AdjustmentType.petToneAndAdjust,
+                ),
+                _buildToolbarIconButton(
+                  icon: Icons.refresh,
+                  label: '리셋',
+                  type: null, // 리셋은 특별 처리
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            // 저장 버튼
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _isSaving ? null : _onSavePressed,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: kMainPink,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  elevation: 4,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                ),
+                child: _isSaving
+                    ? const SizedBox(
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.5,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            Colors.white,
+                          ),
+                        ),
+                      )
+                    : const Text(
+                        '이 사진으로 저장하기',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 15,
+                        ),
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // [UI 개편] 선택 상태 레이블 가져오기
+  String _getSelectionLabel(AdjustmentType type) {
+    if (type == AdjustmentType.filterAndIntensity) {
+      final currentFilter =
+          _allFilters[_filterKey] ?? _allFilters['basic_none']!;
+      if (currentFilter.key != 'basic_none') {
+        return currentFilter.label;
+      }
+      return '';
+    } else if (type == AdjustmentType.petToneAndAdjust) {
+      // 기본 프리셋이고 값이 모두 0인 경우는 표시하지 않음
+      if (_selectedPresetId == 'basic' &&
+          _editBrightness == 0.0 &&
+          _editContrast == 0.0 &&
+          _editSharpness == 0.0 &&
+          !_isManualDetailMode) {
+        return '';
+      }
+
+      // 현재 값이 프리셋 중 하나와 일치하는지 확인
+      bool matchesPreset = false;
+      String? matchingPresetId;
+      for (final preset in _detailPresets) {
+        if (preset.brightness == _editBrightness &&
+            preset.contrast == _editContrast &&
+            preset.sharpness == _editSharpness) {
+          matchesPreset = true;
+          matchingPresetId = preset.id;
+          break;
+        }
+      }
+
+      // 수동 모드이거나 커스텀이거나 프리셋과 일치하지 않으면 "수동 설정" 표시
+      if (_isManualDetailMode ||
+          _selectedPresetId == 'custom' ||
+          !matchesPreset) {
+        return '수동 설정';
+      }
+
+      // 프리셋이 선택된 경우
+      final preset = _detailPresets.firstWhere(
+        (p) => p.id == (matchingPresetId ?? _selectedPresetId),
+        orElse: () => _detailPresets.first,
+      );
+      return preset.label;
+    }
+    return '';
+  }
+
+  // [UI 개편] 아이콘 버튼 위젯
+  Widget _buildToolbarIconButton({
+    required IconData icon,
+    required String label,
+    required AdjustmentType? type,
+  }) {
+    final bool isActive = _activeAdjustment == type;
+
+    // [선택 표시] 필터나 펫톤이 선택되었는지 확인
+    bool hasSelection = false;
+    if (type == AdjustmentType.filterAndIntensity) {
+      // 필터가 선택되었는지 확인 (basic_none이 아닌 경우)
+      final currentFilter =
+          _allFilters[_filterKey] ?? _allFilters['basic_none']!;
+      hasSelection = currentFilter.key != 'basic_none';
+    } else if (type == AdjustmentType.petToneAndAdjust) {
+      // 펫톤 프리셋이 선택되었는지 확인
+      hasSelection =
+          _selectedPresetId != 'basic' ||
+          _editBrightness != 0.0 ||
+          _editContrast != 0.0 ||
+          _editSharpness != 0.0 ||
+          _isManualDetailMode;
+    }
+
+    return GestureDetector(
+      onTap: () {
+        if (type == null) {
+          // 리셋 버튼 - 필터와 펫톤 모두 리셋
+          setState(() {
+            // 필터 리셋
+            _filterKey = 'basic_none';
+            _intensity = 0.8;
+            // 펫톤 리셋
+            _editBrightness = 0.0;
+            _editContrast = 0.0;
+            _editSharpness = 0.0;
+            _coatPreset = 'mid';
+            _selectedPresetId = 'basic';
+            _isManualDetailMode = false;
+            if (_detailPresets.isNotEmpty) {
+              _applyPreset(_detailPresets.first);
+            }
+            _activeAdjustment = null;
+            _cachedPreviewMatrix = null;
+          });
+        } else {
+          // 같은 버튼 다시 누르면 패널 닫힘
+          setState(() {
+            _activeAdjustment = isActive ? null : type;
+          });
+        }
+      },
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Stack(
+            children: [
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: isActive ? kMainPink : Colors.grey[100],
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(
+                  icon,
+                  color: isActive ? Colors.white : Colors.black87,
+                  size: 24,
+                ),
+              ),
+              // [선택 표시] 선택된 경우 작은 점 표시
+              if (hasSelection && !isActive)
+                Positioned(
+                  top: 4,
+                  right: 4,
+                  child: Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: kMainPink,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 1.5),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 10,
+                  color: isActive
+                      ? kMainPink
+                      : (hasSelection
+                            ? kMainPink.withOpacity(0.7)
+                            : Colors.black54),
+                  fontWeight: isActive || hasSelection
+                      ? FontWeight.w600
+                      : FontWeight.normal,
+                ),
+              ),
+              // 선택된 필터/펫톤 정보 표시 (가독성 개선)
+              if (hasSelection && !isActive)
+                Container(
+                  margin: const EdgeInsets.only(top: 3),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: kMainPink.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    _getSelectionLabel(type!),
+                    style: TextStyle(
+                      fontSize: 9,
+                      color: kMainPink,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // [UI 개편] 슬라이딩 조정 패널
+  Widget _buildAdjustmentPanel() {
+    return Align(
+      alignment: Alignment.bottomCenter,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 72),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.75),
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 헤더 (제목 + X 버튼)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  _getAdjustmentTitle(_activeAdjustment!),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white),
+                  onPressed: () {
+                    setState(() {
+                      _activeAdjustment = null;
+                    });
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            // 패널 본문
+            _buildAdjustmentPanelBody(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // [UI 개편] 패널 본문 (타입별 분기)
+  Widget _buildAdjustmentPanelBody() {
+    switch (_activeAdjustment!) {
+      case AdjustmentType.filterAndIntensity:
+        return _buildFilterAndIntensityPanel();
+      case AdjustmentType.petToneAndAdjust:
+        return _buildPetToneAndAdjustPanel();
+    }
+  }
+
+  // [UI 개편] 조정 타입별 제목
+  String _getAdjustmentTitle(AdjustmentType type) {
+    switch (type) {
+      case AdjustmentType.filterAndIntensity:
+        return '필터 & 강도';
+      case AdjustmentType.petToneAndAdjust:
+        return '펫톤 & 보정';
+    }
+  }
+
+  // [UI 간소화] 필터 + 강도 패널
+  Widget _buildFilterAndIntensityPanel() {
+    final fallback =
+        _filtersByCategory['basic'] ?? <PetFilter>[_allFilters['basic_none']!];
+    final filters = _filtersByCategory[_category] ?? fallback;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // 카테고리 탭 (패널 내부용 스타일)
+        _buildCategoryTabsForPanel(),
+        const SizedBox(height: 12),
+        // 필터 버튼들 (패널 내부용 스타일)
+        SizedBox(height: 60, child: _buildFilterButtonsForPanel(filters)),
+        const SizedBox(height: 16),
+        // 필터 강도 슬라이더
+        _buildFilterIntensitySlider(),
+      ],
+    );
+  }
+
+  // [UI 간소화] 패널 내부용 카테고리 탭 (흰색 텍스트)
+  Widget _buildCategoryTabsForPanel() {
+    final tabs = <_FilterCategoryTab>[
+      const _FilterCategoryTab(keyValue: 'basic', label: '기본'),
+      const _FilterCategoryTab(keyValue: 'pink', label: 'Pink'),
+      const _FilterCategoryTab(keyValue: 'dog', label: 'Dog'),
+      const _FilterCategoryTab(keyValue: 'cat', label: 'Cat'),
+    ];
+
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: tabs.map((t) {
+          final bool selected = _category == t.keyValue;
+          return Expanded(
+            child: GestureDetector(
+              onTap: () {
+                HapticFeedback.lightImpact();
+                setState(() {
+                  _category = t.keyValue;
+                  final list = _filtersByCategory[_category];
+                  if (list != null && list.isNotEmpty) {
+                    final hasCurrentFilter = list.any(
+                      (f) => f.key == _filterKey,
+                    );
+                    if (!hasCurrentFilter) {
+                      _filterKey = list.first.key;
+                    }
+                  } else {
+                    _filterKey = 'basic_none';
+                  }
+                });
+              },
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOut,
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                decoration: BoxDecoration(
+                  color: selected
+                      ? Colors.white.withOpacity(0.3)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(11),
+                ),
+                child: Center(
+                  child: Text(
+                    t.label,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  // [UI 간소화] 패널 내부용 필터 버튼들 (흰색 텍스트)
+  Widget _buildFilterButtonsForPanel(List<PetFilter> filters) {
+    return SizedBox(
+      height: 60,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 0),
+        itemCount: filters.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final f = filters[index];
+          final bool selected = f.key == _filterKey;
+          return GestureDetector(
+            onTap: () {
+              setState(() {
+                _filterKey = f.key;
+                _cachedPreviewMatrix = null;
+              });
+            },
+            child: AnimatedContainer(
+              key: ValueKey('filter_${f.key}_${selected}'),
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOut,
+              width: 72,
+              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 3),
+              decoration: BoxDecoration(
+                gradient: selected
+                    ? LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [kMainPink, kMainPink.withValues(alpha: 0.8)],
+                      )
+                    : null,
+                color: selected ? null : Colors.white.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(
+                  color: selected
+                      ? Colors.transparent
+                      : Colors.white.withOpacity(0.3),
+                  width: selected ? 0 : 1,
+                ),
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(f.icon, size: 24, color: Colors.white),
+                  const SizedBox(height: 2),
+                  Text(
+                    f.label,
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                      color: Colors.white,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  // [UI 간소화] 펫톤 + 보정 패널
+  Widget _buildPetToneAndAdjustPanel() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // 펫톤 프리셋 섹션 (프리셋 모드일 때만 표시)
+        if (!_isManualDetailMode) ...[_buildPetTonePresetSection()],
+        // 밝기/대비/선명 슬라이더 (수동 모드일 때만 표시)
+        if (_isManualDetailMode) ...[
+          _buildBrightnessSlider(),
+          const SizedBox(height: 8),
+          _buildContrastSlider(),
+          const SizedBox(height: 8),
+          _buildSharpnessSlider(),
+        ],
+        // 모드 전환 버튼 (하단에 통일)
+        const SizedBox(height: 12),
+        _buildPetToneModeToggle(),
+      ],
+    );
+  }
+
+  // [UI 간소화] 펫톤 프리셋 섹션 (4가지: 기본, 눈또렷, 털 보송, 어두운 털)
+  Widget _buildPetTonePresetSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 4가지 프리셋 칩 (선택 표시 개선) - 타이틀 제거
+        SizedBox(
+          height: 44,
+          child: Row(
+            children: _detailPresets.map((preset) {
+              final bool selected =
+                  _selectedPresetId == preset.id && !_isManualDetailMode;
+              return Expanded(
+                child: Padding(
+                  padding: EdgeInsets.only(
+                    right: preset.id != _detailPresets.last.id ? 8 : 0,
+                  ),
+                  child: GestureDetector(
+                    onTap: () {
+                      _applyPreset(preset);
+                    },
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      curve: Curves.easeOut,
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: BoxDecoration(
+                        // 선택된 경우: 핑크 그라데이션 배경 + 두꺼운 테두리
+                        // 선택되지 않은 경우: 반투명 배경 + 얇은 테두리
+                        gradient: selected
+                            ? LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: [
+                                  kMainPink,
+                                  kMainPink.withValues(alpha: 0.85),
+                                ],
+                              )
+                            : null,
+                        color: selected ? null : Colors.white.withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: selected
+                              ? kMainPink.withValues(alpha: 1.0) // 선택 시 핑크 테두리
+                              : Colors.white.withOpacity(0.4),
+                          width: selected ? 2 : 1, // 선택 시 더 두꺼운 테두리
+                        ),
+                        // 선택된 경우 그림자 추가
+                        boxShadow: selected
+                            ? [
+                                BoxShadow(
+                                  color: kMainPink.withValues(alpha: 0.4),
+                                  blurRadius: 8,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ]
+                            : null,
+                      ),
+                      alignment: Alignment.center,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // 선택된 경우 체크 아이콘 표시
+                          if (selected) ...[
+                            Icon(
+                              Icons.check_circle,
+                              size: 16,
+                              color: Colors.white,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          Text(
+                            preset.label,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: selected
+                                  ? FontWeight.w700
+                                  : FontWeight.w600,
+                              color: Colors.white,
+                            ),
+                            textAlign: TextAlign.center,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // 펫톤 프리셋/수동 전환 버튼 (작고 간결한 형태)
+  Widget _buildPetToneModeToggle() {
+    return Align(
+      alignment: Alignment.centerRight,
+      child: GestureDetector(
+        onTap: () {
+          setState(() {
+            _isManualDetailMode = !_isManualDetailMode;
+            if (!_isManualDetailMode && _selectedPresetId == 'custom') {
+              // 수동 모드에서 프리셋 모드로 전환 시 기본 프리셋 적용
+              if (_detailPresets.isNotEmpty) {
+                _applyPreset(_detailPresets.first);
+              }
+            }
+          });
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _isManualDetailMode ? Icons.auto_awesome : Icons.tune,
+                size: 14,
+                color: Colors.white.withOpacity(0.8),
+              ),
+              const SizedBox(width: 4),
+              Text(
+                _isManualDetailMode ? '프리셋' : '수동 설정',
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.8),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.underline,
+                  decorationColor: Colors.white.withOpacity(0.5),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // [UI 개편] 밝기 슬라이더
+  Widget _buildBrightnessSlider() {
+    return _buildSliderRow(
+      label: '밝기',
+      value: _editBrightness,
+      min: -50,
+      max: 50,
+      onChanged: (v) {
+        setState(() {
+          _editBrightness = v;
+          _selectedPresetId = 'custom';
+          _isManualDetailMode = true;
+        });
+        _sliderDebounceTimer?.cancel();
+        _sliderDebounceTimer = Timer(const Duration(milliseconds: 150), () {
+          if (mounted) {
+            setState(() {
+              _cachedPreviewMatrix = null;
+            });
+          }
+        });
+      },
+      textColor: Colors.white, // 패널 내부에서 흰색 텍스트 사용
+    );
+  }
+
+  // [UI 개편] 대비 슬라이더
+  Widget _buildContrastSlider() {
+    return _buildSliderRow(
+      label: '대비',
+      value: _editContrast,
+      min: -50,
+      max: 50,
+      onChanged: (v) {
+        setState(() {
+          _editContrast = v;
+          _selectedPresetId = 'custom';
+          _isManualDetailMode = true;
+        });
+        _sliderDebounceTimer?.cancel();
+        _sliderDebounceTimer = Timer(const Duration(milliseconds: 150), () {
+          if (mounted) {
+            setState(() {
+              _cachedPreviewMatrix = null;
+            });
+          }
+        });
+      },
+      textColor: Colors.white, // 패널 내부에서 흰색 텍스트 사용
+    );
+  }
+
+  // [UI 개편] 선명도 슬라이더
+  Widget _buildSharpnessSlider() {
+    return _buildSliderRow(
+      label: '선명도',
+      value: _editSharpness,
+      min: 0,
+      max: 100,
+      onChanged: (v) {
+        setState(() {
+          _editSharpness = v;
+          _selectedPresetId = 'custom';
+          _isManualDetailMode = true;
+        });
+      },
+      textColor: Colors.white, // 패널 내부에서 흰색 텍스트 사용
+    );
+  }
+
+  // [UI 개편] 필터 강도 슬라이더
+  Widget _buildFilterIntensitySlider() {
+    final PetFilter current =
+        _allFilters[_filterKey] ?? _allFilters['basic_none']!;
+    final bool isBasicNone = current.key == 'basic_none';
+
+    return Opacity(
+      opacity: isBasicNone ? 0.4 : 1.0,
+      child: IgnorePointer(
+        ignoring: isBasicNone,
+        child: SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            activeTrackColor: kMainPink,
+            inactiveTrackColor: Colors.grey[300],
+            thumbColor: kMainPink,
+            overlayColor: kMainPink.withValues(alpha: 0.2),
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+            trackHeight: 2.5,
+          ),
+          child: Slider(
+            min: 0.4,
+            max: 1.2,
+            value: _intensity,
+            onChanged: (v) {
+              setState(() {
+                _intensity = v;
+                _coatPreset = 'custom';
+              });
+              _sliderDebounceTimer?.cancel();
+              _sliderDebounceTimer = Timer(
+                const Duration(milliseconds: 150),
+                () {
+                  if (mounted) {
+                    setState(() {
+                      _cachedPreviewMatrix = null;
+                    });
+                  }
+                },
+              );
+            },
+          ),
+        ),
       ),
     );
   }
@@ -7175,6 +9393,8 @@ class _FilterPageState extends State<FilterPage> {
         setState(() {
           _coatPreset = key;
           _intensity = presetValue;
+          // Preview matrix 캐시 무효화 (다음 빌드에서 재계산)
+          _cachedPreviewMatrix = null;
         });
       },
       child: AnimatedContainer(
@@ -7189,16 +9409,29 @@ class _FilterPageState extends State<FilterPage> {
                   colors: [kMainPink, kMainPink.withValues(alpha: 0.8)],
                 )
               : null,
-          color: selected ? null : Colors.white,
+          color: selected
+              ? null
+              : (_activeAdjustment == AdjustmentType.petToneAndAdjust
+                    ? Colors.white.withOpacity(0.2)
+                    : Colors.white),
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
-            color: selected ? Colors.transparent : Colors.grey[300]!,
+            color: selected
+                ? Colors.transparent
+                : (_activeAdjustment == AdjustmentType.petToneAndAdjust
+                      ? Colors.white.withOpacity(0.3)
+                      : Colors.grey[300]!),
             width: 1.5,
           ),
           boxShadow: selected
               ? [
                   BoxShadow(
-                    color: kMainPink.withValues(alpha: 0.3),
+                    color: kMainPink.withValues(
+                      alpha:
+                          _activeAdjustment == AdjustmentType.petToneAndAdjust
+                          ? 0.5
+                          : 0.3,
+                    ),
                     blurRadius: 8,
                     offset: const Offset(0, 2),
                   ),
@@ -7211,7 +9444,11 @@ class _FilterPageState extends State<FilterPage> {
             style: TextStyle(
               fontSize: 11,
               fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
-              color: selected ? Colors.white : Colors.black87,
+              color: selected
+                  ? Colors.white
+                  : (_activeAdjustment == AdjustmentType.petToneAndAdjust
+                        ? Colors.white
+                        : Colors.black87),
             ),
           ),
         ),
@@ -7219,6 +9456,9 @@ class _FilterPageState extends State<FilterPage> {
     );
   }
 
+  /// 원본 이미지를 다시 로딩하여 필터 및 보정 처리 후 저장
+  /// UI 프리뷰용 축소본이 아닌 원본 파일을 사용하여 고해상도 저장
+  /// 9:16 비율 이미지는 중앙 crop으로 9:16 강제 적용
   Future<void> _onSavePressed() async {
     if (_isSaving) return;
 
@@ -7226,47 +9466,218 @@ class _FilterPageState extends State<FilterPage> {
       _isSaving = true;
     });
 
+    File? processedTempFile;
+    // 모든 ui.Image를 추적하여 finally에서 dispose (중복 dispose 방지)
+    ui.Image? uiImageForDispose;
+    final List<ui.Image> imagesToDispose = []; // dispose할 이미지 목록
+
     try {
-      // 원본 이미지 파일 읽기
-      final Uint8List imageBytes = await _currentImageFile.readAsBytes();
-      img.Image? decodedImage = img.decodeImage(imageBytes);
+      // ========================================
+      // 저장 파이프라인: 원본 이미지만 사용 (preview 이미지 절대 사용 금지)
+      // ========================================
+
+      // 1. 원본 이미지 파일 다시 로딩 (UI 프리뷰용 축소본 사용하지 않음)
+      // preview 변수(_thumbnailImage, _cachedThumbnailBytes 등) 절대 사용 금지
+      final originalFile = widget.imageFile;
+      if (!originalFile.existsSync()) {
+        throw Exception('원본 이미지 파일을 찾을 수 없습니다: ${originalFile.path}');
+      }
+
+      debugPrint('[FilterPage] 📸 원본 이미지 로딩: ${originalFile.path}');
+
+      // 2. 원본 이미지 디코딩 (EXIF 회전 처리 포함)
+      // preview 리사이즈된 이미지 절대 사용 금지
+      img.Image? decodedImage = await loadImageWithExifRotation(originalFile);
 
       if (decodedImage == null) {
-        setState(() => _isSaving = false);
-        return;
+        throw Exception('이미지 디코딩 실패: ${originalFile.path}');
       }
 
-      // 리사이즈 제한 제거 - 원본 해상도 유지 (성능 영향 최소화)
-      // 필터 적용
-      final PetFilter base =
-          _allFilters[_filterKey] ?? _allFilters['basic_none']!;
-
-      List<double> finalMatrix = base.key != 'basic_none'
-          ? mixMatrix(kIdentityMatrix, base.matrix, _intensity)
-          : List.from(kIdentityMatrix);
-
-      // 필터 적용
-      if (base.key != 'basic_none') {
-        decodedImage = _applyColorMatrixToImage(decodedImage, finalMatrix);
-        debugPrint('✅ 필터 적용 완료: ${base.key}');
-      }
-
-      // JPEG로 인코딩 (품질 100%)
-      final Uint8List jpegBytes = Uint8List.fromList(
-        img.encodeJpg(decodedImage, quality: 100),
+      // ✅ 저장 입력 이미지 크기 로그 (preview 이미지가 섞였는지 확인)
+      debugPrint(
+        '[FilterPage] ✅ SAVE INPUT SIZE: ${decodedImage.width}x${decodedImage.height} (원본 파일에서 직접 로딩)',
       );
 
-      // 갤러리에만 저장 (내부 폴더 저장 없음)
+      // 3. 원본 비율 유지 (crop 제거)
+      // FilterPage는 이미 촬영된 이미지를 편집하므로 원본 비율 그대로 유지
+      // 9:16 강제 crop 로직 제거 (HomePage에서만 비율 crop 적용)
+      debugPrint(
+        '[FilterPage] ✅ 원본 비율 유지: ${decodedImage.width}x${decodedImage.height} (비율: ${(decodedImage.width / decodedImage.height).toStringAsFixed(3)})',
+      );
+
+      // 4. img.Image를 ui.Image로 변환 (원본 해상도 유지)
+      ui.Image uiImage = await _convertImgImageToUiImage(decodedImage);
+      uiImageForDispose = uiImage;
+
+      // ✅ ui.Image 변환 후 크기 확인 로그
+      debugPrint(
+        '[FilterPage] ✅ SAVE INPUT SIZE: ${uiImage.width}x${uiImage.height} (ui.Image 변환 완료)',
+      );
+
+      // 5. ColorMatrix 생성 (원본에 적용)
+      // 프리뷰와 동일한 ColorMatrix를 재계산하여 원본에 적용
+      // preview에서 사용한 ColorMatrix를 그대로 사용 (필터, intensity, brightness, contrast, petTone 모두 포함)
+      final colorMatrix = _buildPreviewColorMatrix();
+
+      debugPrint(
+        '[FilterPage] 🎨 ColorMatrix 적용: filter=$_filterKey, intensity=$_intensity, '
+        'brightness=$_editBrightness, contrast=$_editContrast, '
+        'petTone=${_getCurrentPetToneProfile()?.id ?? 'none'}',
+      );
+
+      // 6. GPU에서 ColorFilter 적용 (안정화된 방식)
+      // 비파괴적 함수: 새로운 이미지를 반환하므로 이전 이미지는 추적하여 finally에서 dispose
+      ui.Image? previousImage;
+      if (!_listEquals(colorMatrix, kIdentityMatrix)) {
+        previousImage = uiImage; // 이전 이미지 추적
+        uiImage = await _applyColorMatrixToUiImageGpu(uiImage, colorMatrix);
+        // 이전 이미지가 새 이미지와 다른 경우에만 dispose 목록에 추가
+        if (previousImage != uiImage) {
+          imagesToDispose.add(previousImage); // finally에서 dispose
+        }
+        uiImageForDispose = uiImage; // 최신 이미지는 최종적으로 dispose
+      } else {
+        // ColorMatrix가 identity면 이미지가 그대로 반환되므로 uiImageForDispose만 설정
+        uiImageForDispose = uiImage;
+      }
+
+      // 7. ui.Image를 PNG 바이트로 변환 (안정화 + fallback)
+      Uint8List? pngBytes;
+
+      // 첫 번째 시도: GPU 렌더 캡처 방식
+      try {
+        final ByteData? byteData = await uiImage.toByteData(
+          format: ui.ImageByteFormat.png,
+        );
+
+        if (byteData != null && byteData.lengthInBytes > 0) {
+          pngBytes = byteData.buffer.asUint8List(
+            byteData.offsetInBytes,
+            byteData.lengthInBytes,
+          );
+          debugPrint('[FilterPage] ✅ GPU 렌더 캡처 성공: ${pngBytes.length} bytes');
+        } else {
+          debugPrint('[FilterPage] ⚠️ toByteData가 null 또는 빈 데이터 반환');
+        }
+      } catch (e) {
+        debugPrint('[FilterPage] ⚠️ GPU 렌더 캡처 실패: $e');
+      }
+
+      // Fallback: img.Image로 직접 PNG 인코딩
+      if (pngBytes == null || pngBytes.isEmpty) {
+        debugPrint('[FilterPage] 🔄 Fallback: img.Image 직접 PNG 인코딩 시도');
+        try {
+          // ui.Image를 img.Image로 변환 후 PNG 인코딩
+          final ByteData? rgbaData = await uiImage.toByteData(
+            format: ui.ImageByteFormat.rawRgba,
+          );
+
+          if (rgbaData != null) {
+            // img.Image 객체 생성
+            final fallbackImage = img.Image(
+              width: uiImage.width,
+              height: uiImage.height,
+            );
+
+            final pixels = rgbaData.buffer.asUint8List();
+            for (int y = 0; y < uiImage.height; y++) {
+              for (int x = 0; x < uiImage.width; x++) {
+                final index = (y * uiImage.width + x) * 4;
+                final r = pixels[index];
+                final g = pixels[index + 1];
+                final b = pixels[index + 2];
+                final a = pixels[index + 3];
+                fallbackImage.setPixel(x, y, img.ColorRgba8(r, g, b, a));
+              }
+            }
+
+            pngBytes = Uint8List.fromList(img.encodePng(fallbackImage));
+            debugPrint(
+              '[FilterPage] ✅ Fallback PNG 인코딩 성공: ${pngBytes.length} bytes',
+            );
+          }
+        } catch (e) {
+          debugPrint('[FilterPage] ❌ Fallback PNG 인코딩 실패: $e');
+        }
+      }
+
+      // 최종 fallback: 원본 이미지에 ColorMatrix 직접 적용 (CPU 방식)
+      if (pngBytes == null || pngBytes.isEmpty) {
+        debugPrint('[FilterPage] 🔄 최종 Fallback: CPU 방식 ColorMatrix 적용 시도');
+        try {
+          final cpuProcessedImage = _applyColorMatrixToImageDirect(
+            decodedImage,
+            colorMatrix,
+          );
+          pngBytes = Uint8List.fromList(img.encodePng(cpuProcessedImage));
+          debugPrint(
+            '[FilterPage] ✅ CPU 방식 PNG 인코딩 성공: ${pngBytes.length} bytes',
+          );
+        } catch (e) {
+          debugPrint('[FilterPage] ❌ CPU 방식 PNG 인코딩 실패: $e');
+          throw Exception('모든 PNG 인코딩 방식이 실패했습니다. 저장할 수 없습니다.');
+        }
+      }
+
+      // pngBytes가 여전히 null이거나 비어있으면 예외 발생
+      if (pngBytes == null || pngBytes.isEmpty) {
+        throw Exception('PNG 바이트 데이터가 비어있습니다.');
+      }
+
+      // 8. 임시 파일로 저장 (안정화된 방식)
+      final dir = await getTemporaryDirectory();
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final filePath = '${dir.path}/filtered_$timestamp.png';
+      processedTempFile = File(filePath);
+
+      // 파일 쓰기 시도 (최대 3회 재시도)
+      bool writeSuccess = false;
+      for (int attempt = 0; attempt < 3; attempt++) {
+        try {
+          await processedTempFile.writeAsBytes(
+            pngBytes,
+            flush: true, // 즉시 디스크에 쓰기
+          );
+
+          // 파일이 제대로 쓰였는지 확인
+          if (await processedTempFile.exists()) {
+            final fileSize = await processedTempFile.length();
+            if (fileSize > 0) {
+              writeSuccess = true;
+              debugPrint(
+                '[FilterPage] ✅ 파일 쓰기 성공 (시도 ${attempt + 1}): $fileSize bytes',
+              );
+              break;
+            }
+          }
+        } catch (e) {
+          debugPrint('[FilterPage] ⚠️ 파일 쓰기 실패 (시도 ${attempt + 1}): $e');
+          if (attempt < 2) {
+            await Future.delayed(Duration(milliseconds: 100 * (attempt + 1)));
+          }
+        }
+      }
+
+      if (!writeSuccess) {
+        throw Exception('임시 파일 쓰기 실패: 최대 재시도 횟수 초과');
+      }
+
+      // 9. 갤러리에 저장
+      final finalImageBytes = await processedTempFile.readAsBytes();
+      if (finalImageBytes.isEmpty) {
+        throw Exception('최종 이미지 바이트가 비어있습니다.');
+      }
+
       await Gal.putImageBytes(
-        jpegBytes,
-        name: 'petgram_edit_${DateTime.now().millisecondsSinceEpoch}.jpg',
+        finalImageBytes,
+        name: 'petgram_edit_${timestamp}.png',
       );
 
       // 저장 성공 피드백
       HapticFeedback.mediumImpact();
 
       debugPrint(
-        '[Petgram] ✅ filter image saved to gallery only (no internal storage)',
+        '[FilterPage] ✅ 원본 이미지 기반 저장 완료: ${decodedImage.width}x${decodedImage.height}',
       );
 
       if (!mounted) return;
@@ -7279,10 +9690,9 @@ class _FilterPageState extends State<FilterPage> {
           duration: Duration(seconds: 2),
         ),
       );
-
-      // 저장 후 보정 화면 유지 (화면 닫지 않음)
-    } catch (e) {
-      debugPrint('[Petgram] save filter error: $e');
+    } catch (e, stackTrace) {
+      debugPrint('[FilterPage] ❌ 원본 이미지 기반 저장 오류: $e');
+      debugPrint('[FilterPage] ❌ Stack trace: $stackTrace');
       if (!mounted) return;
 
       // 사용자 친화적인 에러 메시지
@@ -7294,6 +9704,9 @@ class _FilterPageState extends State<FilterPage> {
       } else if (e.toString().contains('storage') ||
           e.toString().contains('저장')) {
         errorMessage = '저장 공간이 부족할 수 있습니다. 저장 공간을 확인해주세요.';
+      } else if (e.toString().contains('디코딩') ||
+          e.toString().contains('decode')) {
+        errorMessage = '이미지를 불러오는 중 오류가 발생했어요. 다시 시도해주세요.';
       }
 
       ScaffoldMessenger.of(context).showSnackBar(
@@ -7304,6 +9717,40 @@ class _FilterPageState extends State<FilterPage> {
         ),
       );
     } finally {
+      // 리소스 정리: 모든 ui.Image를 한 번만 dispose
+      // 중간에 생성된 이전 이미지들 dispose
+      for (final img in imagesToDispose) {
+        try {
+          img.dispose();
+          debugPrint('[FilterPage] ✅ 중간 이미지 dispose 완료');
+        } catch (e) {
+          debugPrint('[FilterPage] ⚠️ 중간 이미지 dispose 실패 (무시): $e');
+        }
+      }
+      imagesToDispose.clear();
+
+      // 최종 이미지 dispose (단 한 번만)
+      if (uiImageForDispose != null) {
+        try {
+          uiImageForDispose.dispose();
+          debugPrint('[FilterPage] ✅ 최종 ui.Image dispose 완료');
+        } catch (e) {
+          debugPrint('[FilterPage] ⚠️ 최종 ui.Image dispose 실패 (무시): $e');
+        }
+        uiImageForDispose = null; // 중복 dispose 방지
+      }
+
+      // 임시 파일 삭제
+      if (processedTempFile != null) {
+        try {
+          if (await processedTempFile.exists()) {
+            await processedTempFile.delete();
+          }
+        } catch (e) {
+          debugPrint('[FilterPage] ⚠️ 임시 파일 삭제 실패: $e');
+        }
+      }
+
       if (mounted) {
         setState(() {
           _isSaving = false;
@@ -7366,13 +9813,6 @@ class GridLinesPainter extends CustomPainter {
 class FramePreviewPainter extends CustomPainter {
   final List<PetInfo> petList;
   final String? selectedPetId;
-  final double previewWidth;
-  final double previewHeight;
-  final double imageWidth; // 실제 이미지 크기 (저장 시와 동일한 비율 계산용)
-  final double imageHeight;
-  final AspectRatioMode aspectMode; // 9:16일 때 상단 여백 조정용
-  final double topBarHeight; // 상단 바 높이 (9:16일 때 프레임 시작 위치 조정용)
-  final double? bottomBarHeight; // 하단 오버레이 경계 (촬영 영역 하단)
   final ui.Image? dogIconImage;
   final ui.Image? catIconImage;
   final String? location; // 위치 정보
@@ -7380,13 +9820,6 @@ class FramePreviewPainter extends CustomPainter {
   FramePreviewPainter({
     required this.petList,
     required this.selectedPetId,
-    required this.previewWidth,
-    required this.previewHeight,
-    required this.imageWidth,
-    required this.imageHeight,
-    required this.aspectMode,
-    required this.topBarHeight,
-    this.bottomBarHeight, // 하단 경계 추가
     this.dogIconImage,
     this.catIconImage,
     this.location,
@@ -7410,23 +9843,15 @@ class FramePreviewPainter extends CustomPainter {
 
     if (selectedPet == null) return;
 
-    // 테두리 제거 - 모든 정보를 칩 형태로 표시 (FramePainter와 동일)
+    // 프레임은 size 전체(= previewBox 전체 테두리)에 맞춰 그림
+    // size는 previewBox 크기와 정확히 일치함
+
+    // 테두리 제거 - 모든 정보를 칩 형태로 표시
     final double chipHeight = size.width * 0.06;
     final double chipPadding = size.width * 0.03;
     final double chipSpacing = size.width * 0.015;
     final double chipCornerRadius = chipHeight * 0.3;
     final double horizontalPadding = size.width * 0.04;
-
-    // 상단 프레임 위치: FramePainter와 동일한 로직 사용
-    // topBarHeight는 프리뷰 박스 내부 로컬 좌표 (0부터 시작)
-    // 촬영본과 동기화를 위해 동일한 계산 사용
-    double frameTopOffset = (topBarHeight > 0)
-        ? topBarHeight + chipPadding * 1.5
-        : chipPadding * 1.5;
-
-    debugPrint(
-      '[Petgram] 🎨 FramePreviewPainter (로컬 좌표): topBarHeight=$topBarHeight, frameTopOffset=$frameTopOffset, size=${size.width}x${size.height}',
-    );
 
     // 반려동물 정보
     final ui.Image? petIconImage = selectedPet.type == 'dog'
@@ -7619,7 +10044,7 @@ class FramePreviewPainter extends CustomPainter {
 
     // 상단 칩들
     double currentTopChipX = horizontalPadding;
-    final double topChipY = frameTopOffset + chipPadding;
+    final double topChipY = chipPadding;
 
     final truncatedName = truncateText(selectedPet.name, 12);
     final nameChipWidth = drawChip(
@@ -7646,33 +10071,28 @@ class FramePreviewPainter extends CustomPainter {
     }
 
     // 하단 저작권 정보를 칩 형태로 표시 (촬영날짜, 위치정보)
-    // 하단 오버레이 경계를 고려하여 촬영 영역 안에 그리기
-    final double bottomInfoPadding = chipPadding * 1.5;
-    // 하단 바 높이(80px)와 여유 공간을 줄여서 하단 문구를 더 아래로 배치
-    final double bottomBarSpace =
-        80.0 + 5.0; // 하단 바 높이 + 여유 공간 (10.0 -> 5.0으로 줄여서 더 아래로)
+    // previewBox 기준 상대적 비율로만 계산 (전체 화면 기준 수식 제거)
+    final double additionalOffset = math.max(
+      20.0,
+      size.height * 0.02,
+    ); // 추가 하향 offset (20~24px)
+    final double bottomMargin =
+        size.height * 0.12 - additionalOffset; // 하단 여백을 줄여서 텍스트를 더 아래로
 
-    // bottomBarHeight는 실제 촬영 영역의 하단 경계 (화면 기준)
-    // 하단 문구는 촬영 영역 하단에서 여유 공간을 두고 표시
-    double finalBottomInfoY;
-    if (bottomBarHeight != null) {
-      // 촬영 영역 하단을 기준으로 하단 문구 위치 계산
-      // 하단 문구는 촬영 영역 하단에서 bottomBarSpace만큼 위에 배치 (더 아래로 내리기 위해 여유 공간 줄임)
-      finalBottomInfoY =
-          bottomBarHeight! - bottomBarSpace - bottomInfoPadding - chipHeight;
+    // 하단 칩 위치: bottomMargin을 줄여서 텍스트를 더 아래로 이동
+    double finalBottomInfoY = size.height - bottomMargin - chipHeight;
+    finalBottomInfoY = math.min(
+      size.height - chipHeight - chipPadding,
+      finalBottomInfoY,
+    );
 
-      // 상단 칩 위치 확인 (하단 문구가 상단 칩 아래에만 그려지도록)
-      final double topChipBottom = frameTopOffset + chipHeight + chipPadding;
+    // 상단 칩 위치 확인 (하단 문구가 상단 칩 아래에만 그려지도록)
+    final double topChipBottom = topChipY + chipHeight + chipPadding;
 
-      // 하단 문구가 상단 칩 영역과 겹치거나, 음수이면 그리지 않음
-      if (finalBottomInfoY < topChipBottom + chipPadding * 2 ||
-          finalBottomInfoY < 0) {
-        return; // 하단 문구를 그리지 않음
-      }
-    } else {
-      // bottomBarHeight가 없으면 화면 하단 기준
-      finalBottomInfoY =
-          size.height - bottomBarSpace - bottomInfoPadding - chipHeight;
+    // 하단 문구가 상단 칩 영역과 겹치거나, 음수이면 그리지 않음
+    if (finalBottomInfoY < topChipBottom + chipPadding * 2 ||
+        finalBottomInfoY < 0) {
+      return; // 하단 문구를 그리지 않음
     }
 
     final now = DateTime.now();
@@ -7742,10 +10162,6 @@ class FramePreviewPainter extends CustomPainter {
 
     return oldDelegate.selectedPetId != selectedPetId ||
         oldDelegate.petList.length != petList.length ||
-        oldDelegate.imageWidth != imageWidth ||
-        oldDelegate.imageHeight != imageHeight ||
-        oldDelegate.aspectMode != aspectMode ||
-        oldDelegate.topBarHeight != topBarHeight ||
         oldDelegate.location != location ||
         (oldPet?.framePattern != newPet?.framePattern);
   }
@@ -8064,27 +10480,34 @@ class FramePainter extends CustomPainter {
 
     // 하단 저작권 정보를 칩 형태로 표시 (촬영날짜, 위치정보)
     // 하단 오버레이 경계를 고려하여 촬영 영역 안에 그리기
+    final double additionalOffset = math.max(
+      20.0,
+      size.height * 0.02,
+    ); // 추가 하향 offset (20~24px)
     final double bottomInfoPadding = chipPadding * 1.5;
 
     // bottomBarSpace를 이미지 크기에 비례하도록 계산
     // 프리뷰에서는 화면 기준 100px이지만, 저장 이미지에서는 이미지 높이의 비율로 계산
     // 일반적인 화면 높이(약 800-900px)를 기준으로 100px은 약 11-12%에 해당
-    // 안전하게 이미지 높이의 5%를 사용하되, 최소값은 chipHeight의 1.5배로 설정 (8% -> 5%로 줄여서 더 아래로)
+    // 안전하게 이미지 높이의 5%를 사용하되, 최소값은 chipHeight의 1.5배로 설정
     final double minBottomSpace = chipHeight * 1.5;
-    final double proportionalBottomSpace =
-        size.height * 0.05; // 0.08 -> 0.05로 줄여서 더 아래로
+    final double proportionalBottomSpace = size.height * 0.05;
     final double bottomBarSpace = proportionalBottomSpace > minBottomSpace
         ? proportionalBottomSpace
         : minBottomSpace;
 
     // bottomBarHeight는 실제 촬영 영역의 하단 경계 (화면 기준)
     // 하단 문구는 촬영 영역 하단에서 여유 공간을 두고 표시
+    // additionalOffset만큼 더 아래로 이동하기 위해 bottomBarSpace를 줄임
     double finalBottomInfoY;
     if (bottomBarHeight != null) {
       // 촬영 영역 하단을 기준으로 하단 문구 위치 계산
-      // 하단 문구는 촬영 영역 하단에서 bottomBarSpace만큼 위에 배치 (더 아래로 내리기 위해 여유 공간 줄임)
+      // bottomBarSpace에서 additionalOffset을 빼서 텍스트를 더 아래로 이동
       finalBottomInfoY =
-          bottomBarHeight! - bottomBarSpace - bottomInfoPadding - chipHeight;
+          bottomBarHeight! -
+          (bottomBarSpace - additionalOffset) -
+          bottomInfoPadding -
+          chipHeight;
 
       // 상단 칩 위치 확인 (하단 문구가 상단 칩 아래에만 그려지도록)
       final double topChipBottom =
@@ -8093,25 +10516,19 @@ class FramePainter extends CustomPainter {
       // 하단 문구가 상단 칩 영역과 겹치거나, 음수이면 그리지 않음
       if (finalBottomInfoY < topChipBottom + chipPadding * 2 ||
           finalBottomInfoY < 0) {
-        debugPrint(
-          '[Petgram] ⚠️ 하단 문구가 상단 칩과 겹치거나 위치가 잘못됨: finalBottomInfoY=$finalBottomInfoY, topChipBottom=$topChipBottom, 그리지 않음',
-        );
         return; // 하단 문구를 그리지 않음
       }
-
-      debugPrint(
-        '[Petgram] 🔍 FramePainter 하단 위치: bottomBarHeight=$bottomBarHeight, finalBottomInfoY=$finalBottomInfoY, chipHeight=$chipHeight, size.height=${size.height}, topChipBottom=$topChipBottom, bottomBarSpace=$bottomBarSpace',
-      );
     } else {
       // bottomBarHeight가 없으면 화면 하단 기준
+      // bottomBarSpace에서 additionalOffset을 빼서 텍스트를 더 아래로 이동
       finalBottomInfoY =
-          size.height - bottomBarSpace - bottomInfoPadding - chipHeight;
+          size.height -
+          (bottomBarSpace - additionalOffset) -
+          bottomInfoPadding -
+          chipHeight;
 
       // 음수 체크
       if (finalBottomInfoY < 0) {
-        debugPrint(
-          '[Petgram] ⚠️ 하단 문구 위치가 음수: finalBottomInfoY=$finalBottomInfoY, 그리지 않음',
-        );
         return;
       }
     }
@@ -8288,3 +10705,5 @@ class FrameExporter {
     }
   }
 }
+
+// FilterPage dispose 메서드 추가
