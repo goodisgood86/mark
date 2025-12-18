@@ -94,7 +94,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // 카메라 디버그 오버레이 전체 ON/OFF 플래그
   // 🔥 릴리즈 빌드에서도 디버그 오버레이 표시
-  static const bool kEnableCameraDebugOverlay = true;
+  static const bool kEnableCameraDebugOverlay = false;
 
   /// Exposure Bias 범위 상수 (-0.4 ~ +0.4)
   /// 슬라이더는 -10 ~ +10 범위를 사용하지만, 실제 적용은 이 범위로 제한
@@ -112,6 +112,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // 디버그 로그 저장 (오버레이 표시용)
   final List<String> _debugLogs = [];
+  final List<String> _pendingDebugLogs = []; // 🔥 로그 버퍼링용
+  Timer? _debugLogTimer; // 🔥 로그 업데이트 타이머
   static const int _maxDebugLogs = 50; // 최대 로그 개수 (크래시 디버깅을 위해 증가)
 
   // 🔥 크래시 디버깅: 디버그 로그 파일 저장용
@@ -143,31 +145,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _addDebugLog(String log) {
     if (!mounted) return;
 
-    // 🔥 무한 로그 방지: 마지막 로그와 동일하면 추가하지 않음
-    if (_debugLogs.isNotEmpty && _debugLogs.last == log) {
-      return;
-    }
-
-    // 🔥 크래시 디버깅: 로그를 파일에 즉시 저장 (크래시 발생 시에도 로그 보존)
-    // 🔥 릴리즈 빌드에서도 파일 저장은 항상 수행 (크래시 디버깅을 위해)
+    // 🔥 크래시 디버깅: 로그를 파일에 즉시 저장
     _saveDebugLogToFile(log);
 
     // 오버레이 표시는 디버그 모드에서만
     if (!kEnableCameraDebugOverlay) return;
 
-    // 빌드 중 setState 방지: 항상 postFrameCallback으로 지연 실행
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        setState(() {
-          // 🔥 중복 체크: 리스트에 추가하기 전에 다시 확인 (postFrameCallback 사이에 중복이 들어올 수 있음)
-          if (_debugLogs.isEmpty || _debugLogs.last != log) {
-            _debugLogs.add(log);
+    // 🔥 무한 로그 방지
+    if (_debugLogs.isNotEmpty && _debugLogs.last == log) return;
+    if (_pendingDebugLogs.isNotEmpty && _pendingDebugLogs.last == log) return;
+
+    _pendingDebugLogs.add(log);
+
+    // 0.5초마다 UI 업데이트
+    _debugLogTimer ??= Timer(const Duration(milliseconds: 500), () {
+      if (!mounted) return;
+      setState(() {
+        for (final pendingLog in _pendingDebugLogs) {
+          if (_debugLogs.isEmpty || _debugLogs.last != pendingLog) {
+            _debugLogs.add(pendingLog);
             if (_debugLogs.length > _maxDebugLogs) {
               _debugLogs.removeAt(0);
             }
           }
-        });
-      }
+        }
+        _pendingDebugLogs.clear();
+      });
+      _debugLogTimer = null;
     });
   }
 
@@ -475,69 +479,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         // 상태 캐시는 제거했지만, UI 갱신을 위한 최소한의 트리거는 필요
         if (mounted) {
           setState(() {
-            // 빌드 트리거용 카운터만 증가 (의미 없는 값이지만 UI 리빌드에 필요)
-            _debugStateVersion++;
-
-            // 디버그 오버레이 전용 필드만 업데이트 (kEnableCameraDebugOverlay일 때만)
-            if (kEnableCameraDebugOverlay && rawDebugState != null) {
-              _nativeConnectionEnabled =
-                  rawDebugState['connectionEnabled'] as bool?;
-              _nativeSampleBufferCount =
-                  rawDebugState['sampleBufferCount'] as int?;
-              _nativePreviewFrameCount =
-                  rawDebugState['previewFrameCount'] as int?;
-              _nativeDisplayCallCount =
-                  rawDebugState['displayCallCount'] as int?;
-              _nativeDrawCallCount = rawDebugState['drawCallCount'] as int?;
-              _nativeRenderSuccessCount =
-                  rawDebugState['renderSuccessCount'] as int?;
-              _nativeDrawNoImageCount =
-                  rawDebugState['drawNoImageCount'] as int?;
-              _nativeDrawInvalidSizeCount =
-                  rawDebugState['drawInvalidSizeCount'] as int?;
-              _nativeHasCurrentImage =
-                  rawDebugState['hasCurrentImage'] as bool?;
-              _nativeHasValidSize = rawDebugState['hasValidSize'] as bool?;
-              _nativePreviewViewSize =
-                  rawDebugState['previewViewSize'] as String?;
-              _nativeDrawableSize = rawDebugState['drawableSize'] as String?;
-              _nativePreviewViewFrame =
-                  rawDebugState['previewViewFrame'] as String?;
-              _nativePreviewViewIsHidden =
-                  rawDebugState['previewViewIsHidden'] as bool?;
-              _nativePreviewViewAlpha =
-                  (rawDebugState['previewViewAlpha'] as num?)?.toDouble();
-              _nativePreviewViewHasWindow =
-                  rawDebugState['previewViewHasWindow'] as bool?;
-              _nativeCameraContainerFrame =
-                  rawDebugState['cameraContainerFrame'] as String?;
-              _nativeCameraContainerIsHidden =
-                  rawDebugState['cameraContainerIsHidden'] as bool?;
-              _nativeCameraContainerAlpha =
-                  (rawDebugState['cameraContainerAlpha'] as num?)?.toDouble();
-              _nativeCameraContainerHasWindow =
-                  rawDebugState['cameraContainerHasWindow'] as bool?;
+            if (rawDebugState != null) {
               _nativeCurrentFilterKey =
                   rawDebugState['currentFilterKey'] as String?;
               _nativeCurrentFilterIntensity =
                   rawDebugState['currentFilterIntensity'] as double?;
-              _nativeDebugCaptureInstancePtr =
-                  rawDebugState['captureInstancePtr'] as String?;
-              _nativeDebugGetStateInstancePtr =
-                  rawDebugState['getStateInstancePtr'] as String?;
-              _nativeDeviceType = rawDebugState['deviceType'] as String?;
-              _nativeViewBounds = rawDebugState['viewBounds'] as String?;
-              _nativePreviewFrame = rawDebugState['previewFrame'] as String?;
-              _nativePreviewLayerHasSession =
-                  rawDebugState['previewLayerHasSession'] as bool?;
-              _nativePhotoOutputIsNil =
-                  rawDebugState['photoOutputIsNil'] as bool?;
-              _nativePhotoOutputConnectionCount =
-                  rawDebugState['photoOutputConnectionCount'] as int?;
-              _nativePhotoOutputVideoConnectionCount =
-                  rawDebugState['photoOutputVideoConnectionCount'] as int?;
-              _nativePhotoOutputHasActiveVideoConnection =
-                  rawDebugState['photoOutputHasActiveVideoConnection'] as bool?;
             }
           });
         }
@@ -745,58 +691,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   bool? _nativeConnectionEnabled; // 디버그 전용 (CameraDebugState에 없음)
 
-  // 🔥 보완 포인트 1: UI 리빌드를 위한 최소한의 카운터
-  // lastDebugState가 업데이트되어도 UI가 자동으로 리빌드되지 않는 문제 해결
-  int _debugStateVersion = 0;
-
-  AppLifecycleState _lastLifecycleState =
-      AppLifecycleState.resumed; // 🔥 마지막 라이프사이클 상태
+  AppLifecycleState _lastLifecycleState = AppLifecycleState.resumed;
   bool _isReinitializing = false; // 재초기화 중 플래그 (중복 방지)
-  DateTime? _lastReinitTime; // 🔥 마지막 재초기화 시각 (재초기화 후 일정 시간 보호)
-  String? _nativeViewBounds;
-  String? _nativePreviewFrame;
-  bool? _nativePreviewLayerHasSession;
-  int? _nativePreviewFrameCount;
-  bool? _nativeHasCurrentImage;
-  String? _nativePreviewViewSize;
-  bool? _nativeHasValidSize;
-  // 🔥 AVFoundation 크래시 방지: photoOutput connection 정보
-  bool? _nativePhotoOutputIsNil;
-  int? _nativePhotoOutputConnectionCount;
-  int? _nativePhotoOutputVideoConnectionCount;
-  bool? _nativePhotoOutputHasActiveVideoConnection;
-  // 네이티브 파이프라인 디버그 정보
-  int? _nativeSampleBufferCount;
-  int? _nativeDisplayCallCount;
-  int? _nativeDrawCallCount;
-  int? _nativeRenderSuccessCount;
-  int? _nativeDrawNoImageCount;
-  int? _nativeDrawInvalidSizeCount;
-  String? _nativeDrawableSize;
-  // bool _nativeHasFirstFrame = false; // 🔥 REFACTORING: 제거됨 - CameraDebugState.hasFirstFrame 사용
-  // 🔥 프리뷰 안 보이는 문제 해결: previewView 표시 상태
-  String? _nativePreviewViewFrame;
-  bool? _nativePreviewViewIsHidden;
-  double? _nativePreviewViewAlpha;
-  bool? _nativePreviewViewHasWindow;
-  // 🔥 프리뷰 안 보이는 문제 해결: cameraContainer 상태
-  String? _nativeCameraContainerFrame;
-  bool? _nativeCameraContainerIsHidden;
-  double? _nativeCameraContainerAlpha;
-  bool? _nativeCameraContainerHasWindow;
   String? _nativeCurrentFilterKey;
   double? _nativeCurrentFilterIntensity;
-  // 네이티브 인스턴스 포인터 (captureOutput / getState 인스턴스 동일성 확인용)
-  String? _nativeDebugCaptureInstancePtr;
-  String? _nativeDebugGetStateInstancePtr;
   Timer? _debugStatePollTimer;
 
   // 네이티브 디바이스 타입/포지션 (프론트/백 + wide/ultraWide 디버그용)
   String? _nativeDeviceType; // "wide" / "ultraWide" / "other"
-
-  // 프리뷰 레이아웃 디버그 (9:16 비율/잘림 문제 분석용)
-  double? _debugPreviewWidth;
-  double? _debugPreviewHeight;
+  String _nativeLensKind = 'wide';
 
   // 디버그 오버레이 표시 여부 (기본값: 비활성화, 상단 플래그 기반)
   final bool _showDebugOverlay = kEnableCameraDebugOverlay;
@@ -1239,7 +1142,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // iOS 네이티브 카메라 렌즈 종류 추적 (후면 카메라 전용)
   // - "wide": 기본 광각
   // - "ultraWide": 초광각
-  String _nativeLensKind = 'wide';
   bool _isNativeLensSwitching = false; // 렌즈 전환 중 중복 호출 방지
   // Offset _zoomOffset = Offset.zero; // 줌 오프셋 - 제거됨
   // Offset _lastZoomFocalPoint = Offset.zero; // 마지막 줌 포커스 포인트 - 제거됨
@@ -1259,12 +1161,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _isProcessingTap = false; // 탭 처리 중 플래그 (중복 처리 방지)
   Rect?
   _lastPreviewRect; // 프리뷰 박스 사각형 (오버레이 렌더링용, Tap hit test는 RenderBox 기준 사용)
-  // 🔥 프리뷰 렌더링 디버그 정보 저장
-  String? _debugPreviewRenderPath; // 렌더링 경로 (isRealCamera, Mock, None)
-  String? _debugPreviewWidgetType; // 위젯 타입 (Loading, SizedBox.expand, etc)
-  String? _debugPreviewPositionedInfo; // Positioned 크기/위치 정보
-  String? _debugSourceWidgetInfo; // source 위젯 정보
-  bool? _debugHasNativePreviewKey; // 네이티브 프리뷰 키 존재 여부
   /// 0~1 정규화 좌표 (프리뷰 기준) – UI 인디케이터와 네이티브 포커스가 공유
   Offset? _focusIndicatorNormalized;
   final GlobalKey _previewKey = GlobalKey(); // 프리뷰 Positioned 위젯용 key
@@ -2022,7 +1918,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
     } finally {
       _isReinitializing = false;
-      _lastReinitTime = DateTime.now(); // 🔥 재초기화 완료 시각 기록
       _addDebugLog(
         '[ManualRestart] END: Reinitialization flag reset, protection period started (3s)',
       );
@@ -4760,6 +4655,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _buildTopControls(),
             _buildBottomControls(),
             // 6) 디버그 오버레이 (왼쪽 상단 작은 박스)
+            // ⚠️ 디버그 오버레이: kDebugMode에서만 표시 가능
             if (_showDebugOverlay) _buildCameraDebugOverlay(),
           ],
         ),
@@ -6134,82 +6030,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
       // 🔥 프리뷰 비율 크롭 기반 처리: Mock 이미지도 센서 비율로 고정
       // ⚠️ 중요: _buildPreviewContent에서 처리되므로 여기서는 센서 비율로 고정된 위젯만 반환
-      //          제약 조건을 명시적으로 제공하여 무한 제약 오류 방지
-      // ⚠️ 중요: RepaintBoundary 제거로 debugFrameWasSentToEngine 오류 방지
-      //          _buildPreviewContent 내부에서 이미 RepaintBoundary로 감싸지므로 중복 제거
-      // 🔥 센서 비율로 고정된 Mock 이미지 위젯 반환 (제약 조건 명시)
-      // 🔥 프리뷰 영역 문제 해결: RepaintBoundary에 key를 붙여서 rect 계산 가능하도록 함
-      return RepaintBoundary(
-        key: _mockPreviewKey,
-        child: AspectRatio(
-          // 🔥 크래시 방지: aspectRatio 검증
-          aspectRatio: () {
-            // 🔥 디버그: _sensorAspectRatio 값 확인 (검은 화면 문제 디버깅용)
-            if (kDebugMode) {
-              debugPrint(
-                '[Camera] 📐 _sensorAspectRatio: ${_sensorAspectRatio} '
-                '(isValid: ${_sensorAspectRatio > 0 && _sensorAspectRatio.isFinite})',
-              );
-            }
-            return GeometrySafety.safeAspectRatio(
-              _sensorAspectRatio,
-              1.0,
-              fallback: 3.0 / 4.0,
-            );
-          }(),
-          child: Image.asset('assets/images/mockup.png', fit: BoxFit.cover),
-        ),
-      );
-    }
-
-    // 2. 네이티브 카메라 모드면 항상 NativeCameraPreview 표시
-    //    디버그 플래그(_nativeSessionRunning, _nativeVideoConnected, _nativeHasFirstFrame 등)는 무시
-    //    canUseCamera는 오버레이로 처리하며, 위젯 트리에는 항상 포함
-    _previewSourceLabel = 'NATIVE';
-    final logMsg =
-        '[PreviewRender] path=native, canUseCamera=$canUseCameraNow, shouldUseMock=$shouldShowMock';
-    if (logMsg != _lastPreviewRenderLog) {
-      _lastPreviewRenderLog = logMsg;
-      _addDebugLog(logMsg);
-      if (kDebugMode) {
-        debugPrint('[Petgram] $logMsg');
-      }
-    }
-
-    // 🔥 프리뷰 비율 크롭 기반 처리: 초기화 중에도 센서 비율로 고정
-    // 네이티브 카메라 초기화 중
-    // ⚠️ 중요: SizedBox.expand는 무한 제약을 받을 수 있으므로 제거
-    //          Positioned가 이미 크기를 제공하므로 SizedBox.expand 불필요
-    return RepaintBoundary(
-      key: _nativePreviewKey,
-      child: AspectRatio(
-        // 🔥 크래시 방지: aspectRatio 검증
+      return AspectRatio(
         aspectRatio: () {
-          // 🔥 디버그: _sensorAspectRatio 값 확인 (검은 화면 문제 디버깅용)
-          if (kDebugMode) {
-            debugPrint(
-              '[Camera] 📐 _sensorAspectRatio: ${_sensorAspectRatio} '
-              '(isValid: ${_sensorAspectRatio > 0 && _sensorAspectRatio.isFinite})',
-            );
-          }
           return GeometrySafety.safeAspectRatio(
             _sensorAspectRatio,
             1.0,
             fallback: 3.0 / 4.0,
           );
         }(),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            // 🔥 프리뷰 영역 문제 해결: NativeCameraPreview를 Positioned.fill로 감싸서 실제 크기 차지
-            // 🔥 핵심 수정: NativeCameraPreview는 isCameraReady와 무관하게 항상 표시
-            //              isCameraReady=false일 때는 검은 오버레이만 추가
-            Positioned.fill(
-              child: NativeCameraPreview(
-                // 🔥 전면 재설계: key를 고정하여 재생성 방지
-                // PlatformView는 앱 생명주기 동안 한 번만 생성되고 재사용됨
-                key: const ValueKey('native_camera_preview_fixed'),
-                onCreated: (viewId) {
+        child: Image.asset('assets/images/mockup.png', fit: BoxFit.cover),
+      );
+    }
+
+    // 2. 네이티브 카메라 모드면 항상 NativeCameraPreview 표시
+    _previewSourceLabel = 'NATIVE';
+    
+    // 🔥 프리뷰 비율 크롭 기반 처리: 초기화 중에도 센서 비율로 고정
+    return AspectRatio(
+      aspectRatio: () {
+        return GeometrySafety.safeAspectRatio(
+          _sensorAspectRatio,
+          1.0,
+          fallback: 3.0 / 4.0,
+        );
+      }(),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          Positioned.fill(
+            child: NativeCameraPreview(
+              key: const ValueKey('native_camera_preview_fixed'),
+              onCreated: (viewId) {
                   // 촬영 중에는 attach/init 금지
                   final fenceActive =
                       _captureFenceUntil != null &&
@@ -6713,22 +6564,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   ),
                 ),
               ),
-            // 디버그용 오버레이 (초기화 중 상태 확인용)
-            if (_showDebugOverlay)
-              IgnorePointer(
-                child: Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                      color: Colors.yellow.withValues(alpha: 0.8),
-                      width: 2,
-                    ),
-                  ),
-                ),
-              ),
+            // 디버그용 오버레이 제거됨
           ],
         ), // Stack 닫기
       ), // AspectRatio 닫기
-    ); // RepaintBoundary 닫기
   }
 
   /// 카메라 / 목업 배경
@@ -6915,9 +6754,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 final double previewBoxW = cropBoxW;
                 final double previewBoxH = cropBoxH;
 
-                // 카메라 프리뷰 위젯 사이즈 검증 + 디버그용 변수 저장
-                _debugPreviewWidth = previewBoxW;
-                _debugPreviewHeight = previewBoxH;
                 // 상태가 변경될 때만 로그 출력
                 final widgetSizeLog =
                     '[Petgram] 📷 Camera preview widget size: W=$previewBoxW, H=$previewBoxH, offsetX=$offsetX, offsetY=$offsetY';
@@ -6965,10 +6801,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   previewBoxW,
                   previewBoxH,
                 );
-                // 🔥 프리뷰 렌더링 디버그 정보 저장
-                _debugPreviewPositionedInfo =
-                    'Positioned(left:${offsetX.toStringAsFixed(1)}, top:${offsetY.toStringAsFixed(1)}, '
-                    'w:${cropBoxW.toStringAsFixed(1)}, h:${cropBoxH.toStringAsFixed(1)})';
                 // 🔥 1:1 프리뷰 하단 터치 시 깜빡임 문제 해결: 빌드 중 setState 금지
                 // 이전 rect와 비교해서 "유의미한 차이"가 있을 때만 업데이트 (threshold 사용)
                 // 미세한 차이(1px 미만)는 무시하여 불필요한 프리뷰 재attach 방지
@@ -7126,22 +6958,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ),
                     ),
                     // 2️⃣ Optional debug rectangle for the preview area (only in debug mode)
-                    if (kDebugMode && _showDebugOverlay)
-                      Positioned(
-                        key: _previewKey,
-                        left: offsetX,
-                        top: offsetY,
-                        width: cropBoxW,
-                        height: cropBoxH,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            border: Border.all(
-                              color: Colors.yellow.withValues(alpha: 0.5),
-                              width: 2,
-                            ),
-                          ),
-                        ),
-                      ),
                     // 🔥 프레임/칩 UI는 최상위 Stack으로 이동 (paint skip 문제 해결)
                   ],
                 );
@@ -7176,15 +6992,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ? true // iOS 실기기에서 Mock이 아니면 항상 REAL_CAMERA (초기화 전에도 NativeCameraPreview가 트리에 올라가 있음)
         : (!_shouldUseMockCamera &&
               hasNativeCamera); // Android나 다른 플랫폼은 초기화 여부 확인
-
-    // 🔥 프리뷰 렌더링 디버그 정보 저장
-    _debugPreviewRenderPath = isRealCamera
-        ? 'REAL_CAMERA'
-        : _shouldUseMockCamera
-        ? 'MOCK'
-        : 'NONE';
-    _debugSourceWidgetInfo = source.runtimeType.toString();
-    _debugHasNativePreviewKey = _nativePreviewKey.currentContext != null;
 
     // 상태가 변경될 때만 로그 출력
     final renderDecisionLog =
@@ -7224,10 +7031,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // ⚠️ 네이티브 카메라: source는 이미 AspectRatio와 FittedBox로 감싸져 있음
       //    _buildCameraStack의 Positioned가 이미 크기를 제공하므로,
       //    source를 SizedBox.expand로 감싸서 Positioned의 크기를 채우도록 함
-      // 🔥 프리뷰 렌더링 수정: source의 AspectRatio가 Positioned의 크기를 받아서 제대로 렌더링되도록 함
-      Widget cameraPreviewWidget = SizedBox.expand(child: source);
-      _debugPreviewWidgetType =
-          'SizedBox.expand(source: ${source.runtimeType})';
+      // 🔥 프리뷰 렌더링 수정: FittedBox(BoxFit.cover)를 사용하여 선택된 비율에 맞춰 센서를 크롭하여 보여줌
+      //    아이폰 기본 카메라 앱과 동일하게 동작하도록 (4:3 센서를 9:16 등으로 꽉 채움)
+      Widget cameraPreviewWidget = FittedBox(
+        fit: BoxFit.cover,
+        clipBehavior: Clip.hardEdge,
+        child: source,
+      );
 
       // 필터 적용된 카메라 프리뷰
       // ⚠️ 중요: 네이티브 카메라는 FilterEngine으로 이미 필터 적용 중이므로
@@ -7291,7 +7101,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // 🔥 네이티브 카메라 프리뷰 렌더링 수정: filteredPreview를 Stack으로 감싸서 제대로 렌더링되도록 함
       // 🔥 핵심 수정: canUseCamera=false일 때만 검은 오버레이 추가 (NativeCameraPreview는 항상 표시)
       //              canUseCamera는 sessionRunning과 videoConnected를 포함하므로 더 정확함
-      final bool cameraUsable = canUseCamera;
 
       Widget preview;
       if (_showGridLines) {
@@ -7346,7 +7155,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         );
       }
       // 🔥 크롭 레이어는 이미 위에서 적용되었으므로 여기서는 그대로 반환
-      return preview;
+      // 🔥 _nativePreviewKey 할당: previewRect 업데이트를 위해 RepaintBoundary로 감싸기
+      return RepaintBoundary(key: _nativePreviewKey, child: preview);
     } else {
       // ========== Mock 경로 ==========
       // 🔥 Mock 이미지도 센서 비율로 고정 (네이티브 카메라와 동일한 처리)
@@ -9025,199 +8835,89 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// 디버그 정보를 문자열로 생성
+  /// 디버그 정보를 문자열로 생성 (최소한의 정보만 포함)
   String _buildDebugInfoString() {
-    final bool nativeControllerInit = _cameraEngine.isInitialized;
-    final bool hasNativeCamera = _cameraEngine.isInitialized;
-
-    // 🔥 iOS 실기기 프리뷰 보장: iOS 실기기에서 Mock이 아니면 초기화 여부와 관계없이 NativeCameraPreview가 트리에 올라가 있음
-    final bool isIOS = Platform.isIOS;
-    final bool isRealCamera = isIOS && !_shouldUseMockCamera
-        ? true // iOS 실기기에서 Mock이 아니면 항상 REAL_CAMERA (초기화 전에도 NativeCameraPreview가 트리에 올라가 있음)
-        : (!_shouldUseMockCamera &&
-              hasNativeCamera); // Android나 다른 플랫폼은 초기화 여부 확인
-
-    // 🔥 isPreviewWidgetBuilt: iOS 실기기에서 Mock이 아니면 항상 true (NativeCameraPreview가 트리에 올라가 있음)
-    final bool isPreviewWidgetBuilt =
-        (isIOS && !_shouldUseMockCamera) ||
-        isRealCamera ||
-        _shouldUseMockCamera;
-
-    final buffer = StringBuffer();
-    buffer.writeln('=== Petgram Camera Debug Info ===');
-    buffer.writeln('Timestamp: ${DateTime.now().toIso8601String()}');
-    buffer.writeln('');
-    buffer.writeln('--- Camera Engine State ---');
-    buffer.writeln('canUseCamera: $canUseCamera');
-    buffer.writeln('useMock: ${_cameraEngine.useMockCamera}');
-    buffer.writeln('shouldUseMock: ${_cameraEngine.shouldUseMockCamera}');
-    buffer.writeln('isInitializing: ${_cameraEngine.isInitializing}');
-    buffer.writeln('native: ${_cameraEngine.nativeCamera != null}');
-    buffer.writeln('nativeInit: $nativeControllerInit');
-    if (_cameraEngine.initErrorMessage != null) {
-      buffer.writeln('initError: ${_cameraEngine.initErrorMessage}');
-    }
-    buffer.writeln('isPreviewWidgetBuilt: $isPreviewWidgetBuilt');
-    buffer.writeln('previewSource: $_previewSourceLabel');
-    buffer.writeln('cameras: ${widget.cameras.length}');
-    buffer.writeln('');
-    buffer.writeln('--- Native Camera Session ---');
-    // 🔥 REFACTORING: 단일 상태 소스에서 읽기
     final sessionState = _cameraEngine.lastDebugState;
-    buffer.writeln('sessionRunning: ${sessionState?.sessionRunning ?? false}');
-    buffer.writeln('videoConnected: ${sessionState?.videoConnected ?? false}');
-    buffer.writeln('connectionEnabled: ${_nativeConnectionEnabled ?? false}');
-    if (_nativeViewBounds != null) {
-      buffer.writeln('viewBounds: $_nativeViewBounds');
-    }
-    if (_nativePreviewFrame != null) {
-      buffer.writeln('previewFrame: $_nativePreviewFrame');
-    }
-    if (_nativePreviewLayerHasSession != null) {
-      buffer.writeln('previewLayerHasSession: $_nativePreviewLayerHasSession');
-    }
-    if (_nativePreviewFrameCount != null) {
-      buffer.writeln('frameCount: $_nativePreviewFrameCount');
-      buffer.writeln('previewFrameCount: $_nativePreviewFrameCount');
-    }
-    // 네이티브 파이프라인 디버그 정보 - 그룹화된 형태로도 표시
-    buffer.writeln('');
-    buffer.writeln('--- Buffers ---');
-    buffer.writeln('sampleBufferCount: ${_nativeSampleBufferCount ?? 0}');
-    buffer.writeln('previewFrameCount: ${_nativePreviewFrameCount ?? 0}');
-    buffer.writeln('displayCallCount: ${_nativeDisplayCallCount ?? 0}');
-    buffer.writeln('');
-    buffer.writeln('--- Draw ---');
-    buffer.writeln('drawCallCount: ${_nativeDrawCallCount ?? 0}');
-    buffer.writeln('renderSuccessCount: ${_nativeRenderSuccessCount ?? 0}');
-    buffer.writeln('drawNoImageCount: ${_nativeDrawNoImageCount ?? 0}');
-    buffer.writeln('drawInvalidSizeCount: ${_nativeDrawInvalidSizeCount ?? 0}');
-    buffer.writeln('');
-    buffer.writeln('--- Image ---');
-    if (_nativeHasCurrentImage != null) {
-      buffer.writeln('hasImage: $_nativeHasCurrentImage');
-      buffer.writeln('hasCurrentImage: $_nativeHasCurrentImage');
-    } else {
-      buffer.writeln('hasImage: false');
-      buffer.writeln('hasCurrentImage: false');
-    }
-    if (_nativeHasValidSize != null) {
-      buffer.writeln('validSize: $_nativeHasValidSize');
-    } else {
-      buffer.writeln('validSize: false');
-    }
-    if (_nativePreviewViewSize != null) {
-      buffer.writeln('previewSize: $_nativePreviewViewSize');
-      buffer.writeln('viewSize: $_nativePreviewViewSize');
-    } else {
-      buffer.writeln('previewSize: ?');
-      buffer.writeln('viewSize: ?');
-    }
-    if (_nativeDrawableSize != null) {
-      buffer.writeln('drawableSize: $_nativeDrawableSize');
-    } else {
-      buffer.writeln('drawableSize: ?');
-    }
-    // 인스턴스 포인터 (captureOutput / getState 인스턴스 동일성 확인용)
-    if (_nativeDebugCaptureInstancePtr != null ||
-        _nativeDebugGetStateInstancePtr != null) {
-      buffer.writeln(
-        'debugCaptureInstancePtr: '
-        '${_nativeDebugCaptureInstancePtr ?? 'nil'}',
-      );
-      buffer.writeln(
-        'debugGetStateInstancePtr: '
-        '${_nativeDebugGetStateInstancePtr ?? 'nil'}',
-      );
-    }
-    if (_nativeCurrentFilterKey != null) {
-      buffer.writeln('filter: $_nativeCurrentFilterKey');
-    }
-    if (_nativeCurrentFilterIntensity != null) {
-      buffer.writeln(
-        'filterIntensity: ${_nativeCurrentFilterIntensity?.toStringAsFixed(2) ?? "null"}',
-      );
-    }
-    buffer.writeln('isProcessing: $_isProcessing');
-    buffer.writeln('isTimerCounting: $_isTimerCounting');
-    buffer.writeln('isTimerTriggered: $_isTimerTriggered');
-    buffer.writeln('burstCount: $_burstCount');
-    buffer.writeln('');
-    buffer.writeln('--- Preview Rendering Debug ---');
-    if (_debugPreviewRenderPath != null) {
-      buffer.writeln('renderPath: $_debugPreviewRenderPath');
-    }
-    if (_debugPreviewWidgetType != null) {
-      buffer.writeln('widgetType: $_debugPreviewWidgetType');
-    }
-    if (_debugPreviewPositionedInfo != null) {
-      buffer.writeln('positioned: $_debugPreviewPositionedInfo');
-    }
-    if (_debugSourceWidgetInfo != null) {
-      buffer.writeln('sourceWidget: $_debugSourceWidgetInfo');
-    }
-    if (_debugHasNativePreviewKey != null) {
-      buffer.writeln('hasNativePreviewKey: $_debugHasNativePreviewKey');
-    }
-    if (_lastPreviewRect != null) {
-      buffer.writeln(
-        'lastPreviewRect: left=${_lastPreviewRect!.left.toStringAsFixed(1)}, '
-        'top=${_lastPreviewRect!.top.toStringAsFixed(1)}, '
-        'width=${_lastPreviewRect!.width.toStringAsFixed(1)}, '
-        'height=${_lastPreviewRect!.height.toStringAsFixed(1)}',
-      );
-    }
+    final buffer = StringBuffer();
+    buffer.writeln('=== Petgram Camera Info ===');
+    buffer.writeln('Timestamp: ${DateTime.now().toIso8601String()}');
+    buffer.writeln('Engine State: ${_cameraEngine.state}');
+    buffer.writeln('Ready: ${_cameraEngine.isCameraReady}');
+    buffer.writeln('Session Running: ${sessionState?.sessionRunning ?? false}');
+    buffer.writeln('First Frame: ${sessionState?.hasFirstFrame ?? false}');
     buffer.writeln(
-      'sensorAspectRatio: ${_sensorAspectRatio.toStringAsFixed(3)}',
+      'Lens: ${_cameraLensDirection == CameraLensDirection.back ? "back" : "front"} (${_nativeDeviceType ?? "?"})',
     );
-    buffer.writeln('aspectMode: $_aspectMode');
-    buffer.writeln(
-      'targetRatio: ${aspectRatioOf(_aspectMode).toStringAsFixed(3)}',
-    );
-    // 🔥 REFACTORING: 단일 상태 소스에서 읽기
-    final debugState = _cameraEngine.lastDebugState;
-    buffer.writeln('showPinkOverlay: ${!_isCameraHealthy}');
-    buffer.writeln('hasFirstFrame: ${sessionState?.hasFirstFrame ?? false}');
-    buffer.writeln('hasCurrentImage: ${_nativeHasCurrentImage}');
-    buffer.writeln('previewFrameCount: ${_nativePreviewFrameCount ?? 0}');
-    buffer.writeln('');
-    buffer.writeln(
-      '--- Photo Output Connection (AVFoundation Crash Prevention) ---',
-    );
-    // 🔥 항상 표시 (null이어도 "not received"로 표시하여 네이티브 전달 여부 확인)
-    buffer.writeln(
-      'photoOutputIsNil: ${_nativePhotoOutputIsNil ?? "not received"}',
-    );
-    buffer.writeln(
-      'photoOutputConnectionCount: ${_nativePhotoOutputConnectionCount ?? "not received"}',
-    );
-    buffer.writeln(
-      'photoOutputVideoConnectionCount: ${_nativePhotoOutputVideoConnectionCount ?? "not received"}',
-    );
-    buffer.writeln(
-      'photoOutputHasActiveVideoConnection: ${_nativePhotoOutputHasActiveVideoConnection ?? "not received"}',
-    );
-    buffer.writeln('');
-    buffer.writeln('=== Recent Logs ===');
-    // 오버레이에 표시되는 모든 로그를 복사 (최대 50개로 증가)
-    final logsToCopy = _debugLogs.reversed.take(50).toList();
-    for (final log in logsToCopy) {
-      // 오버레이에서는 60자로 제한되지만 복사에는 전체 내용 포함
-      // 너무 긴 경우에만 제한 (200자)
-      buffer.writeln(log.length > 200 ? '${log.substring(0, 200)}...' : log);
-    }
-    // 로그가 더 있는 경우 표시
-    if (_debugLogs.length > 50) {
-      buffer.writeln('... (${_debugLogs.length - 50} more logs)');
-    }
-    buffer.writeln('================================');
+    buffer.writeln('Aspect: ${_aspectLabel(_aspectMode)}');
+    buffer.writeln('Zoom: ${_uiZoomScale.toStringAsFixed(2)}x');
+    buffer.writeln('Filter: ${_nativeCurrentFilterKey ?? "none"}');
+    buffer.writeln('===========================');
     return buffer.toString();
   }
 
-  /// 디버그 정보를 클립보드에 복사
-  /// 🔥 크래시 디버깅: 파일에 저장된 로그도 포함하여 복사
-  Future<void> _copyDebugInfo() async {
-    // 🔥 파일에서 전체 로그 읽기 (크래시 전 모든 로그 포함)
+  /// 디버그 정보를 클립보드에 복사 (제거됨)
+
+  /// 카메라 디버그 오버레이 위젯
+  /// 🔥 성능 최적화: 아주 작은 영역으로 축소, 탭 시 복사
+  Widget _buildCameraDebugOverlay() {
+    return Positioned(
+      top: 60, // 상단 바 아래
+      left: 10,
+      child: GestureDetector(
+        onTap: () async {
+          // 탭 시 전체 로그 복사 (파일 + 메모리)
+          final String allLogs = await _getDebugStateString();
+          await Clipboard.setData(ClipboardData(text: allLogs));
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('전체 로그가 클립보드에 복사되었습니다.')),
+            );
+          }
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.4), // 투명도 증가
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'DEBUG',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 8,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    '$_previewSourceLabel | ${canUseCamera ? "RDY" : "NOT"}',
+                    style: const TextStyle(color: Colors.white, fontSize: 8),
+                  ),
+                ],
+              ),
+              if (_debugLogs.isNotEmpty)
+                Text(
+                  _debugLogs.last.length > 30
+                      ? '${_debugLogs.last.substring(0, 30)}...'
+                      : _debugLogs.last,
+                  style: const TextStyle(color: Colors.white70, fontSize: 7),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 탭 시 전체 로그 복사 (파일 + 메모리)
+  Future<String> _getDebugStateString() async {
     String fileLogs = '';
     try {
       if (_debugLogFile == null) {
@@ -9228,411 +8928,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         fileLogs = await _debugLogFile!.readAsString();
       }
     } catch (e) {
-      if (kDebugMode) {
-        debugPrint('[Petgram] ⚠️ Failed to read log file: $e');
-      }
+      fileLogs = 'Error reading log file: $e';
     }
 
     final debugInfo = _buildDebugInfoString();
-    final allInfo = StringBuffer()..write(debugInfo);
-
-    if (fileLogs.isNotEmpty) {
-      allInfo.write('\n\n=== Saved Log File (크래시 전 로그 포함) ===\n');
-      allInfo.write(fileLogs);
-    }
-
-    await Clipboard.setData(ClipboardData(text: allInfo.toString()));
-    _addDebugLog('[Debug] ✅ Debug info copied to clipboard');
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('디버그 정보가 클립보드에 복사되었습니다'),
-          duration: Duration(seconds: 2),
-        ),
-      );
-    }
-  }
-
-  /// 카메라 디버그 오버레이 위젯
-  /// 실기기에서도 카메라 프리뷰 상태를 눈으로 확인할 수 있게 함
-  /// canUseCamera, useMock, initialized 상태 등을 표시
-  /// 🔥 이슈 5 수정: 작은 크기로 우측 상단에 배치하여 프리뷰를 가리지 않도록 수정
-  Widget _buildCameraDebugOverlay() {
-    // 네이티브 컨트롤러 초기화 여부
-    final bool nativeControllerInit = _cameraEngine.isInitialized;
-
-    // 프리뷰 위젯이 실제로 빌드되었는지 확인
-    return Positioned(
-      top: 8,
-      left: 8, // 🔥 디버그 오버레이를 왼쪽 상단으로 이동
-      child: Container(
-        width: 280, // 🔥 연분홍 오버레이 디버깅: 너비 증가
-        constraints: const BoxConstraints(
-          maxHeight: 300, // 🔥 연분홍 오버레이 디버깅: 높이 증가
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.7),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: DefaultTextStyle(
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 9,
-          ), // 🔥 이슈 5 수정: 폰트 크기 축소
-          child: SingleChildScrollView(
-            // 🔥 이슈 5 수정: 스크롤 가능하도록 수정
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // 🔥 크래시 디버깅: 복사 버튼 (전체 로그 복사)
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    GestureDetector(
-                      onTap: () async {
-                        // 🔥 파일에서 전체 로그 읽기 (크래시 전 모든 로그 포함)
-                        String fileLogs = '';
-                        try {
-                          if (_debugLogFile == null) {
-                            final directory =
-                                await getApplicationDocumentsDirectory();
-                            _debugLogFile = File(
-                              '${directory.path}/$_debugLogFileName',
-                            );
-                          }
-                          if (await _debugLogFile!.exists()) {
-                            fileLogs = await _debugLogFile!.readAsString();
-                          }
-                        } catch (e) {
-                          if (kDebugMode) {
-                            debugPrint(
-                              '[Petgram] ⚠️ Failed to read log file: $e',
-                            );
-                          }
-                        }
-
-                        // 전체 디버그 정보 + 로그 복사
-                        final allInfo = StringBuffer()
-                          ..write('=== Petgram Camera Debug Info ===\n')
-                          ..write('canUseCamera: $canUseCamera\n')
-                          ..write('nativeInit: $nativeControllerInit\n')
-                          ..write('useMock: ${_cameraEngine.useMockCamera}\n')
-                          ..write(
-                            'shouldUseMock: ${_cameraEngine.shouldUseMockCamera}\n',
-                          )
-                          ..write(
-                            'isInitializing: ${_cameraEngine.isInitializing}\n',
-                          )
-                          ..write('previewSource: $_previewSourceLabel\n')
-                          ..write(
-                            'lens: ${_cameraLensDirection == CameraLensDirection.back ? "back" : "front"}\n',
-                          )
-                          ..write(
-                            'aspect: ${_aspectLabel(_aspectMode)}, ratio=${aspectRatioOf(_aspectMode).toStringAsFixed(3)}\n',
-                          )
-                          ..write(
-                            'preview: W=${_debugPreviewWidth?.toStringAsFixed(1) ?? "?"}, H=${_debugPreviewHeight?.toStringAsFixed(1) ?? "?"}\n',
-                          )
-                          ..write(
-                            'previewRect: ${_lastPreviewRect ?? "null"}\n',
-                          )
-                          ..write(
-                            'pendingRect: ${_pendingPreviewRectForSync ?? "null"}, retry=$_previewSyncRetryCount\n',
-                          )
-                          ..write(
-                            'sessionRunning: ${_cameraEngine.lastDebugState?.sessionRunning ?? false}\n',
-                          )
-                          ..write(
-                            'videoConnected: ${_cameraEngine.lastDebugState?.videoConnected ?? false}\n',
-                          )
-                          ..write(
-                            'hasFirstFrame: ${_cameraEngine.lastDebugState?.hasFirstFrame ?? false}\n',
-                          )
-                          ..write(
-                            'isPinkFallback: ${_cameraEngine.lastDebugState?.isPinkFallback ?? false}\n',
-                          )
-                          ..write(
-                            '=== Current Debug Logs (${_debugLogs.length}개) ===\n',
-                          )
-                          ..write(_debugLogs.join('\n'));
-
-                        if (fileLogs.isNotEmpty) {
-                          allInfo.write(
-                            '\n\n=== Saved Log File (크래시 전 로그 포함) ===\n',
-                          );
-                          allInfo.write(fileLogs);
-                        }
-
-                        Clipboard.setData(
-                          ClipboardData(text: allInfo.toString()),
-                        );
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('디버그 정보가 클립보드에 복사되었습니다'),
-                            duration: Duration(seconds: 2),
-                            behavior: SnackBarBehavior.floating,
-                          ),
-                        );
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.blue.withValues(alpha: 0.7),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.copy, size: 12, color: Colors.white),
-                            SizedBox(width: 4),
-                            Text(
-                              '전체 복사',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 9,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    // 🔥 크래시 디버깅: 로그 파일 삭제 버튼
-                    GestureDetector(
-                      onTap: () async {
-                        await _clearDebugLogFile();
-                        if (mounted) {
-                          setState(() {
-                            _debugLogs.clear();
-                          });
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('디버그 로그가 삭제되었습니다'),
-                              duration: Duration(seconds: 1),
-                              behavior: SnackBarBehavior.floating,
-                            ),
-                          );
-                        }
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.red.withValues(alpha: 0.7),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.delete, size: 12, color: Colors.white),
-                            SizedBox(width: 4),
-                            Text(
-                              '삭제',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 9,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text('canUseCamera: $canUseCamera'),
-                Text('nativeInit: $nativeControllerInit'),
-                Text('useMock: ${_cameraEngine.useMockCamera}'),
-                Text('shouldUseMock: ${_cameraEngine.shouldUseMockCamera}'),
-                Text('isInitializing: ${_cameraEngine.isInitializing}'),
-                Text('previewSource: $_previewSourceLabel'),
-                if (_cameraEngine.initErrorMessage != null)
-                  Text(
-                    'initError: ${_cameraEngine.initErrorMessage != null ? (_cameraEngine.initErrorMessage!.length > 30 ? "${_cameraEngine.initErrorMessage!.substring(0, 30)}..." : _cameraEngine.initErrorMessage!) : "null"}',
-                    style: const TextStyle(color: Colors.red, fontSize: 9),
-                  ),
-                Text(
-                  'lens: ${_cameraLensDirection == CameraLensDirection.back ? "back" : "front"}, '
-                  '${_nativeDeviceType ?? "?"}/${_nativeLensKind}',
-                ),
-                Text(
-                  'aspect: ${_aspectLabel(_aspectMode)}, '
-                  'ratio=${aspectRatioOf(_aspectMode).toStringAsFixed(3)}',
-                  style: const TextStyle(fontSize: 9),
-                ),
-                Text(
-                  'preview: '
-                  'W=${_debugPreviewWidth?.toStringAsFixed(1) ?? "?"}, '
-                  'H=${_debugPreviewHeight?.toStringAsFixed(1) ?? "?"}',
-                  style: const TextStyle(fontSize: 9),
-                ),
-                // 🔥 프리뷰 렌더링 디버그 정보
-                if (_debugPreviewRenderPath != null)
-                  Text(
-                    'renderPath: $_debugPreviewRenderPath',
-                    style: const TextStyle(fontSize: 9, color: Colors.yellow),
-                  ),
-                if (_debugPreviewWidgetType != null)
-                  Text(
-                    'widgetType: $_debugPreviewWidgetType',
-                    style: const TextStyle(fontSize: 9, color: Colors.cyan),
-                  ),
-                if (_debugPreviewPositionedInfo != null)
-                  Text(
-                    'positioned: $_debugPreviewPositionedInfo',
-                    style: const TextStyle(
-                      fontSize: 8,
-                      color: Colors.lightGreen,
-                    ),
-                  ),
-                if (_debugSourceWidgetInfo != null)
-                  Text(
-                    'source: $_debugSourceWidgetInfo',
-                    style: const TextStyle(fontSize: 8, color: Colors.orange),
-                  ),
-                if (_debugHasNativePreviewKey != null)
-                  Text(
-                    'nativeKey: $_debugHasNativePreviewKey',
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: _debugHasNativePreviewKey!
-                          ? Colors.green
-                          : Colors.red,
-                    ),
-                  ),
-                if (_lastPreviewRect != null)
-                  Text(
-                    'lastRect: ${_lastPreviewRect!.left.toStringAsFixed(1)},${_lastPreviewRect!.top.toStringAsFixed(1)} '
-                    '${_lastPreviewRect!.width.toStringAsFixed(1)}x${_lastPreviewRect!.height.toStringAsFixed(1)}',
-                    style: const TextStyle(fontSize: 8, color: Colors.pink),
-                  ),
-                // 🔥 실기기에서도 디버그 오버레이 표시: 세션 상태 상세 정보
-                Text(
-                  'sessionRunning: ${_cameraEngine.lastDebugState?.sessionRunning ?? false}, '
-                  'videoConnected: ${_cameraEngine.lastDebugState?.videoConnected ?? false}, '
-                  'connectionEnabled: ${_nativeConnectionEnabled ?? false}',
-                  style: TextStyle(
-                    fontSize: 9,
-                    color: _isCameraHealthy ? Colors.green : Colors.red,
-                  ),
-                ),
-                Text(
-                  'sampleBufferCount: ${_nativeSampleBufferCount ?? 0}, '
-                  'previewFrameCount: ${_nativePreviewFrameCount ?? 0}, '
-                  'hasFirstFrame: ${_cameraEngine.lastDebugState?.hasFirstFrame ?? false}',
-                  style: TextStyle(
-                    fontSize: 9,
-                    color: (_nativeSampleBufferCount ?? 0) > 0
-                        ? Colors.green
-                        : Colors.yellow,
-                  ),
-                ),
-                Text(
-                  'hasImage: ${_nativeHasCurrentImage == true}, '
-                  'hasValidSize: ${_nativeHasValidSize ?? false}',
-                  style: const TextStyle(fontSize: 9),
-                ),
-                // 🔥 프리뷰 안 보이는 문제 해결: previewView 표시 상태
-                if (_nativePreviewViewFrame != null)
-                  Text(
-                    'previewView: frame=${_nativePreviewViewFrame!.length > 40 ? _nativePreviewViewFrame!.substring(0, 40) + "..." : _nativePreviewViewFrame}, '
-                    'isHidden=${_nativePreviewViewIsHidden ?? false}, '
-                    'alpha=${_nativePreviewViewAlpha?.toStringAsFixed(2) ?? "?"}, '
-                    'window=${_nativePreviewViewHasWindow == true ? "yes" : "no"}',
-                    style: TextStyle(
-                      fontSize: 8,
-                      color:
-                          (_nativePreviewViewIsHidden == false &&
-                              (_nativePreviewViewAlpha ?? 0) > 0.5 &&
-                              _nativePreviewViewHasWindow == true)
-                          ? Colors.green
-                          : Colors.red,
-                    ),
-                  ),
-                // 🔥 프리뷰 안 보이는 문제 해결: cameraContainer 상태
-                if (_nativeCameraContainerFrame != null)
-                  Text(
-                    'cameraContainer: frame=${_nativeCameraContainerFrame!.length > 40 ? _nativeCameraContainerFrame!.substring(0, 40) + "..." : _nativeCameraContainerFrame}, '
-                    'isHidden=${_nativeCameraContainerIsHidden ?? false}, '
-                    'alpha=${_nativeCameraContainerAlpha?.toStringAsFixed(2) ?? "?"}, '
-                    'window=${_nativeCameraContainerHasWindow == true ? "yes" : "no"}',
-                    style: TextStyle(
-                      fontSize: 8,
-                      color:
-                          (_nativeCameraContainerIsHidden == false &&
-                              (_nativeCameraContainerAlpha ?? 0) > 0.5 &&
-                              _nativeCameraContainerHasWindow == true)
-                          ? Colors.green
-                          : Colors.red,
-                    ),
-                  ),
-                // 🔥 AVFoundation 크래시 방지: photoOutput connection 상태 표시
-                if (_nativePhotoOutputIsNil != null)
-                  Text(
-                    'photoOutput: ${_nativePhotoOutputIsNil! ? "nil" : "exists"}',
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: _nativePhotoOutputIsNil!
-                          ? Colors.red
-                          : Colors.green,
-                    ),
-                  ),
-                if (_nativePhotoOutputConnectionCount != null)
-                  Text(
-                    'photoConn: total=${_nativePhotoOutputConnectionCount}, '
-                    'video=${_nativePhotoOutputVideoConnectionCount ?? 0}, '
-                    'active=${_nativePhotoOutputHasActiveVideoConnection == true}',
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: _nativePhotoOutputHasActiveVideoConnection == true
-                          ? Colors.green
-                          : Colors.red,
-                    ),
-                  ),
-                Text(
-                  'isProcessing: $_isProcessing, burst: $_burstCount',
-                  style: const TextStyle(fontSize: 9),
-                ),
-                const SizedBox(height: 4),
-                const Divider(color: Colors.white54, height: 1),
-                const SizedBox(height: 4),
-                // 최근 로그 표시 (최대 10개) // 🔥 연분홍 오버레이 디버깅: 로그 개수 증가
-                ...(_debugLogs.reversed
-                    .take(10)
-                    .map<Widget>(
-                      (log) => Padding(
-                        padding: const EdgeInsets.only(bottom: 2),
-                        child: Text(
-                          log.length > 80
-                              ? '${log.substring(0, 80)}...'
-                              : log, // 🔥 크래시 디버깅: 로그 길이 증가
-                          style: TextStyle(
-                            fontSize: 8, // 🔥 크래시 디버깅: 폰트 크기 증가
-                            color: log.contains('❌') || log.contains('FAILED')
-                                ? Colors.redAccent
-                                : log.contains('📸') || log.contains('CAPTURE')
-                                ? Colors.yellowAccent
-                                : Colors.white70,
-                          ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    )),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
+    return '--- FILE LOGS ---\n$fileLogs\n\n--- CURRENT STATE ---\n$debugInfo';
   }
 }
