@@ -24,9 +24,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../camera/native_camera_preview.dart';
-import '../camera/native_camera_controller.dart';
 import '../services/camera_engine.dart';
-import '../utils/geometry_safety.dart';
+import '../core/shared_image_pipeline.dart';
 
 import '../models/aspect_ratio_mode.dart';
 import '../models/constants.dart';
@@ -35,7 +34,6 @@ import '../models/filter_models.dart';
 import '../models/pet_info.dart';
 import '../models/petgram_nav_tab.dart';
 
-import '../core/shared_image_pipeline.dart';
 import '../services/frame_resource_service.dart';
 import '../services/image_pipeline_service.dart';
 import '../services/petgram_meta_service.dart';
@@ -45,7 +43,6 @@ import '../services/petgram_photo_repository.dart';
 
 import '../widgets/painters/frame_painter.dart';
 import '../widgets/painters/frame_screen_painter.dart';
-import '../widgets/painters/grid_lines_painter.dart';
 import '../widgets/petgram_bottom_nav_bar.dart';
 
 import 'frame_settings_page.dart';
@@ -95,6 +92,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // 카메라 디버그 오버레이 전체 ON/OFF 플래그
   // 🔥 릴리즈 빌드에서도 디버그 오버레이 표시
   static const bool kEnableCameraDebugOverlay = false;
+  static const bool kShowFrameDebugInfo = false; // 🔥 프레임 디버그 정보 표시 여부
 
   /// Exposure Bias 범위 상수 (-0.4 ~ +0.4)
   /// 슬라이더는 -10 ~ +10 범위를 사용하지만, 실제 적용은 이 범위로 제한
@@ -122,19 +120,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // 프리뷰 소스 라벨 (디버그 오버레이 표시용)
   String _previewSourceLabel = 'NONE';
-  String? _lastPreviewStateLog; // 이전 프리뷰 상태 로그 (중복 방지용)
-  String? _lastPreviewRenderLog; // 이전 프리뷰 렌더링 로그 (중복 방지용)
-  String? _lastPreviewLayerLog; // 이전 프리뷰 레이어 로그 (중복 방지용)
-  String? _lastCameraStackLog; // 이전 카메라 스택 로그 (중복 방지용)
-  bool _hasInitPipelineRun = false; // 🔥 initPipeline이 한 번 실행되었는지 여부
-
-  // 무한 로그 방지를 위한 이전 값 저장
-  String? _lastBuildCameraBackgroundLog;
-  String? _lastLayoutBuilderLog;
-  String? _lastPreviewBoxLog;
-  String? _lastPreviewWidgetSizeLog;
-  String? _lastPreviewRenderDecisionLog;
-  String? _lastMockCameraLog;
 
   /// 디버그 로그 추가 (오버레이 표시용)
   /// 릴리즈 빌드에서도 디버그 오버레이가 활성화되어 있으면 표시됨
@@ -207,7 +192,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final logFile = File('${directory.path}/$_debugLogFileName');
 
       if (await logFile.exists()) {
-        final content = await logFile.readAsString();
+        String content = '';
+        try {
+          content = await logFile.readAsString();
+        } catch (e) {
+          // 🔥 UTF-8 디코딩 에러 발생 시 처리 (깨진 데이터 포함된 경우)
+          debugPrint('[Petgram] ⚠️ Debug log file corrupted, clearing: $e');
+          await logFile.delete();
+          return;
+        }
+
+        if (content.isEmpty) return;
+
         final lines = content
             .split('\n')
             .where((line) => line.trim().isNotEmpty)
@@ -245,27 +241,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// 🔥 크래시 디버깅: 디버그 로그 파일 삭제
-  Future<void> _clearDebugLogFile() async {
-    try {
-      if (_debugLogFile == null) {
-        final directory = await getApplicationDocumentsDirectory();
-        _debugLogFile = File('${directory.path}/$_debugLogFileName');
-      }
-
-      if (await _debugLogFile!.exists()) {
-        await _debugLogFile!.delete();
-        if (kDebugMode) {
-          debugPrint('[Petgram] 🗑️ Debug log file cleared');
-        }
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        debugPrint('[Petgram] ⚠️ Failed to clear debug log file: $e');
-      }
-    }
-  }
-
   /// 프리뷰 상태를 한 줄로 로깅 (디버그 오버레이용)
   /// 상태가 변경될 때만 로그 출력 (무한 로그 방지)
   void _logPreviewState(String tag) {
@@ -283,13 +258,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ..write('isProcessing=$_isProcessing');
     final text = msg.toString();
     // 상태가 변경되었을 때만 로그 출력
-    if (text != _lastPreviewStateLog) {
-      if (kEnableCameraDebugOverlay) {
-        debugPrint(text);
-      }
-      _addDebugLog(text);
-      _lastPreviewStateLog = text;
+    if (kEnableCameraDebugOverlay) {
+      debugPrint(text);
     }
+    _addDebugLog(text);
   }
 
   /// 디버그 상태 폴링 시작 (0.5초마다 네이티브 상태 확인)
@@ -482,8 +454,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             if (rawDebugState != null) {
               _nativeCurrentFilterKey =
                   rawDebugState['currentFilterKey'] as String?;
-              _nativeCurrentFilterIntensity =
-                  rawDebugState['currentFilterIntensity'] as double?;
             }
           });
         }
@@ -545,29 +515,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// - Initializing: sessionRunning=false, hasFirstFrame=false
   /// - Ready: sessionRunning=true, videoConnected=true, hasFirstFrame=true
   /// - Error: 명백한 에러 상태
-  bool get _shouldShowPinkOverlay {
-    if (_shouldUseMockCamera) return false;
-
-    final state = _cameraEngine.lastDebugState;
-
-    // Idle: 초기화 전
-    if (state == null) return true;
-
-    // Ready: 첫 프레임을 받았고 핑크 fallback이 아니면 오버레이를 내림
-    // 세션 런닝 플래그가 잠시 false라도 이미 받은 프레임이 있으면 가려두지 않는다.
-    if (state.videoConnected && state.hasFirstFrame && !state.isPinkFallback) {
-      return false; // Ready 상태 - 절대 오버레이 표시 안 함
-    }
-
-    // Initializing: 재초기화 중
-    if (_isReinitializing) return true;
-
-    // Error: 명백한 에러 상태
-    if (_cameraEngine.hasError) return true;
-
-    // 그 외는 모두 오버레이 표시 (Initializing 또는 Error)
-    return true;
-  }
 
   /// 🔥 보완 포인트 3: 자동 복구 훅
   /// nativeInit=false인데 sessionRunning=true인 불일치 상태를 복구
@@ -604,8 +551,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 오직 sessionRunning && videoConnected만 확인
   /// hasFirstFrame, pinkfallback, viewId mismatch는 UI 경고만 표시
   bool get canUseCamera {
-    // Mock 카메라 모드이면 항상 true (네이티브 상태와 무관)
-    if (_shouldUseMockCamera) {
+    // 🔥 시뮬레이터이거나 카메라가 없으면 무조건 true (Mock 사용 허용)
+    if (widget.cameras.isEmpty || _shouldUseMockCamera || _cameraEngine.useMockCamera) {
       return true;
     }
 
@@ -689,12 +636,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // bool? _lastPinkFallback; // 제거됨 - 자동 재초기화 로직 제거로 불필요
   // String? _lastNativeInstancePtr; // 제거됨 - 자동 재초기화 로직 제거로 불필요
 
-  bool? _nativeConnectionEnabled; // 디버그 전용 (CameraDebugState에 없음)
-
   AppLifecycleState _lastLifecycleState = AppLifecycleState.resumed;
   bool _isReinitializing = false; // 재초기화 중 플래그 (중복 방지)
   String? _nativeCurrentFilterKey;
-  double? _nativeCurrentFilterIntensity;
   Timer? _debugStatePollTimer;
 
   // 네이티브 디바이스 타입/포지션 (프론트/백 + wide/ultraWide 디버그용)
@@ -1159,22 +1103,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Timer? _hideFocusIndicatorTimer; // 포커스 인디케이터 숨김 타이머 (취소 가능)
   DateTime? _lastTapTime; // 마지막 탭 시간 (debounce용)
   bool _isProcessingTap = false; // 탭 처리 중 플래그 (중복 처리 방지)
-  Rect?
-  _lastPreviewRect; // 프리뷰 박스 사각형 (오버레이 렌더링용, Tap hit test는 RenderBox 기준 사용)
-  /// 0~1 정규화 좌표 (프리뷰 기준) – UI 인디케이터와 네이티브 포커스가 공유
   Offset? _focusIndicatorNormalized;
-  final GlobalKey _previewKey = GlobalKey(); // 프리뷰 Positioned 위젯용 key
   // 🔥 좌표계 통일: _stackKey는 더 이상 사용되지 않음 (deprecated) - 제거됨
   final GlobalKey _mockPreviewKey = GlobalKey(); // Mock 프리뷰용 key
   final GlobalKey _nativePreviewKey = GlobalKey(); // Native 프리뷰용 key
-  int _nativePreviewKeyCounter = 0; // 🔥 PlatformView 재생성을 위한 카운터
+  final GlobalKey _previewStackKey = GlobalKey(); // 프리뷰 스택 측정용 key
+  Rect? _lastSyncedPreviewRect; // 🔥 마지막으로 동기화된 프리뷰 영역
   Rect? _pendingPreviewRectForSync; // 네이티브 동기화 대기 중인 프리뷰 rect
   int _previewSyncRetryCount = 0; // 프리뷰 동기화 재시도 카운터
   bool _previewSyncRetryScheduled = false; // 재시도 스케줄 플래그
   // 촬영 보호 펜스: 촬영 시작 후 일정 시간 동안 init/resume/sync 차단
   DateTime? _captureFenceUntil;
-  // 🔥 전면 재설계: 앱 생명주기 동안 한 번만 초기화 플래그
-  bool _hasCalledInitOnce = false;
 
   // 밝기 조절 (-1.0 ~ 1.0, 0.0이 원본)
   double _brightnessValue = 0.0; // -10 ~ 10 범위
@@ -1352,11 +1291,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     bool _lastCameraInitializedState = false;
     _cameraEngine.addListener(() {
       // 카메라 상태 변경 시 필요한 최소한의 상태만 업데이트
-      // 주요 UI는 ValueListenableBuilder로 처리되므로 여기서는 특별한 처리 불필요
-      // 하지만 일부 로직에서 _cameraEngine 상태를 직접 참조하므로 유지
+      final bool currentInitialized = _cameraEngine.isInitialized;
+
+      // 🔥 자동 포커스 모드 활성화 체크 (ready 상태로 전환될 때)
+      if (currentInitialized &&
+          !_lastCameraInitializedState &&
+          !_shouldUseMockCamera) {
+        if (mounted) {
+          setState(() {
+            _isAutoFocusEnabled = true;
+          });
+          _startFocusStatusPolling();
+        }
+      }
 
       // 🔥 필터 유지: 카메라가 초기화되면 필터를 다시 적용
-      final bool currentInitialized = _cameraEngine.isInitialized;
       if (currentInitialized && !_lastCameraInitializedState) {
         // 카메라가 방금 초기화됨 → 필터 다시 적용
         if (_isNativeCameraActive) {
@@ -1887,15 +1836,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _addDebugLog('[ManualRestart] Resetting CameraEngine state...');
       await _cameraEngine.dispose(); // 모든 dispose 책임은 CameraEngine 내부로 몰기
 
-      // 4. Flutter 상태 초기화 (PlatformView 재생성)
+      // 4. Flutter 상태 초기화
       if (mounted) {
-        setState(() {
-          // 🔥 REFACTORING: 상태 캐시 제거 - PlatformView 재생성만 수행
-          _nativePreviewKeyCounter++;
-        });
-        _addDebugLog(
-          '[ManualRestart] PlatformView key changed to force recreation: counter=$_nativePreviewKeyCounter',
-        );
+        _addDebugLog('[ManualRestart] PlatformView reset...');
       }
 
       // 3. 재초기화 대기 (네이티브 정리 시간 확보)
@@ -1933,391 +1876,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// - 시뮬레이터/카메라 없음 → Mock 카메라
   ///
   /// 🔥 수정 3: 촬영 중 보호 강화 (세션 라이프사이클 분리)
-  Future<void> _initCameraPipeline() async {
-    // 🔥 촬영 중에는 어떤 경로로도 초기화 금지
-    final now = DateTime.now();
-    final fenceActive =
-        _captureFenceUntil != null && now.isBefore(_captureFenceUntil!);
-    if (_isProcessing || _cameraEngine.isCapturingPhoto || fenceActive) {
-      _addDebugLog(
-        '[InitPipeline] ⏸️ skip: capture fence active (isProcessing=$_isProcessing, isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, fenceActive=$fenceActive)',
-      );
-      return;
-    }
-
-    // 🔥 네이티브 디버그 상태 기준으로만 판단 (플래그 의존 제거)
-    final debugMap = await _cameraEngine.getDebugState();
-    final state = _cameraEngine.lastDebugState;
-    if (state != null) {
-      final healthy =
-          state.sessionRunning &&
-          state.videoConnected &&
-          state.hasFirstFrame &&
-          !state.isPinkFallback;
-      if (healthy) {
-        _addDebugLog(
-          '[InitGuard] skip initPipeline: native healthy (sessionRunning=${state.sessionRunning}, videoConnected=${state.videoConnected}, hasFirstFrame=${state.hasFirstFrame}, isPinkFallback=${state.isPinkFallback})',
-        );
-        return;
-      }
-      // viewId 일치 + 세션 유지 중이면 init 금지
-      final viewIdMatch =
-          _cameraEngine.viewId == null ||
-          (state.viewId >= 0 && _cameraEngine.viewId == state.viewId);
-      if (viewIdMatch && state.sessionRunning && state.videoConnected) {
-        _addDebugLog(
-          '[InitGuard] skip initPipeline: session running with matching viewId; waiting for frames',
-        );
-        return;
-      }
-      // 프레임만 받았어도 resume 우선
-      if (state.hasFirstFrame && !state.isPinkFallback) {
-        _addDebugLog(
-          '[InitGuard] resume only: hasFirstFrame=true while sessionRunning=${state.sessionRunning}',
-        );
-        _resumeCameraSession();
-        return;
-      }
-    } else if (debugMap != null) {
-      // Map 기반 상태도 동일 규칙 적용
-      final healthy =
-          (debugMap['sessionRunning'] as bool? ?? false) &&
-          (debugMap['videoConnected'] as bool? ?? false) &&
-          (debugMap['hasFirstFrame'] as bool? ?? false) &&
-          !((debugMap['isPinkFallback'] as bool?) ?? false);
-      if (healthy) {
-        _addDebugLog('[InitGuard] skip initPipeline: native healthy (map)');
-        return;
-      }
-    }
-
-    // 🔥 핵심 수정: initPipeline은 앱 진입 시 1회만 실행
-    if (_hasInitPipelineRun) {
-      _addDebugLog(
-        '[InitGuard] skipping duplicate initPipeline (already run once)',
-      );
-      return;
-    }
-    _hasInitPipelineRun = true;
-
-    // 🔥 실기기 프리뷰 문제 디버깅: 초기화 시작 로그 (항상 출력)
-    // 촬영 직후 펜스가 남아 있으면 초기화 진입 금지
-    final fenceActiveInitPipeline =
-        _captureFenceUntil != null &&
-        DateTime.now().isBefore(_captureFenceUntil!);
-    if (fenceActiveInitPipeline || _cameraEngine.isCapturingPhoto) {
-      _addDebugLog(
-        '[InitPipeline] ⏸️ skip init: capture fence active (isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, fenceUntil=$_captureFenceUntil)',
-      );
-      return;
-    }
-    _addDebugLog(
-      '[Init] initCameraPipeline started (no early return by isCameraReady)',
-    );
-    _addDebugLog(
-      '[InitPipeline] 📷 ENTRY: Platform.isIOS=${Platform.isIOS}, _shouldUseMockCamera=$_shouldUseMockCamera, _isCameraReady=$_isCameraReady, _cameraEngine.isCameraReady=${_cameraEngine.isCameraReady}, _cameraEngine.useMockCamera=${_cameraEngine.useMockCamera}, cameras.length=${widget.cameras.length}',
-    );
-
-    // 🔥 크래시 원인 추적: 호출 스택 로깅
-    final stackTrace = StackTrace.current;
-    final stackLines = stackTrace.toString().split('\n');
-    final callerInfo = stackLines.length > 2 ? stackLines[1].trim() : 'unknown';
-
-    _addDebugLog('[InitPipeline] 🔍 CALLED FROM: $callerInfo');
-    // 🔥 디버그 오버레이에도 스택 트레이스 표시
-    _addDebugLog('[InitPipeline] 🔍 Full stack trace:');
-    for (int i = 0; i < stackLines.length && i < 10; i++) {
-      _addDebugLog('  [$i] ${stackLines[i]}');
-    }
-    if (kDebugMode) {
-      debugPrint('[Petgram] 🔍 _initCameraPipeline() CALLED FROM: $callerInfo');
-      debugPrint('[Petgram] 🔍 Full stack trace:');
-      for (int i = 0; i < stackLines.length && i < 10; i++) {
-        debugPrint('  [$i] ${stackLines[i]}');
-      }
-    }
-
-    // 🔥 글로벌 보장: 라이프사이클이 resumed 상태가 아니면 초기화 스킵
-    if (!mounted || _lastLifecycleState != AppLifecycleState.resumed) {
-      _addDebugLog(
-        '[InitPipeline] ⏸️ skip init: mounted=$mounted, lifecycle=$_lastLifecycleState',
-      );
-      return;
-    }
-
-    // 🔥 크래시 방지: 촬영 중이면 짧은 딜레이 후 계속 진행 (완전 차단하지 않음)
-    if (_cameraEngine.isCapturingPhoto) {
-      final logMsg =
-          '[InitPipeline] ⚠️ Photo capture in progress, adding small delay (called from: $callerInfo)';
-      if (kDebugMode) {
-        debugPrint('[Petgram] ⚠️ $logMsg');
-      }
-      _addDebugLog(logMsg);
-      // 촬영이 완료될 시간을 주기 위해 짧은 딜레이
-      await Future.delayed(const Duration(milliseconds: 100));
-      // 계속 진행 (차단하지 않음)
-    }
-
-    // 🔥 실기기 디버깅을 위한 상세 로깅
-    final bool isIOS = Platform.isIOS;
-    final bool isAndroid = Platform.isAndroid;
-
-    // 🔥 시뮬레이터 감지 개선: 네이티브에서 직접 확인
-    // ⚠️ 중요: 실기기에서도 cameras.length == 0일 수 있으므로 (권한 문제 등)
-    //          네이티브에서 직접 확인하는 것이 가장 정확함
-    bool isSimulator = false;
-    if (isIOS) {
-      // 네이티브 카메라 컨트롤러가 있으면 직접 확인
-      if (_cameraEngine.nativeCamera is NativeCameraController) {
-        final controller = _cameraEngine.nativeCamera as NativeCameraController;
-        try {
-          isSimulator = await controller.isSimulator();
-          if (kDebugMode) {
-            debugPrint('[Petgram] 📱 Simulator check (native): $isSimulator');
-          }
-        } catch (e) {
-          // 네이티브 확인 실패 시: 일단 실기기로 가정하고 네이티브 카메라 시도
-          // 실기기에서 네이티브 카메라 초기화 실패 시 Mock으로 fallback됨
-          isSimulator = false;
-          if (kDebugMode) {
-            debugPrint(
-              '[Petgram] ⚠️ Failed to check simulator status, assuming physical device: $e',
-            );
-          }
-        }
-      } else {
-        // 🔥 시뮬레이터 체크를 위해 임시로 NativeCameraController 생성
-        // 🔥 Pattern A 보장: NativeCameraController 직접 생성 제거
-        //    시뮬레이터 체크는 MethodChannel을 직접 호출하여 수행
-        try {
-          const channel = MethodChannel('petgram/native_camera');
-          final result = await channel.invokeMethod('isSimulator');
-          isSimulator = result as bool? ?? false;
-          if (kDebugMode) {
-            debugPrint('[Petgram] 📱 Simulator check: $isSimulator');
-          }
-        } catch (e) {
-          // 네이티브 확인 실패 시: 일단 실기기로 가정
-          isSimulator = false;
-          if (kDebugMode) {
-            debugPrint(
-              '[Petgram] ⚠️ Failed to check simulator status, assuming physical device: $e',
-            );
-          }
-        }
-      }
-    }
-
-    final bool isPhysicalDevice =
-        !kIsWeb && (isIOS || isAndroid) && !isSimulator;
-
-    // 상태값 수집
-    final bool shouldUseMock = _shouldUseMockCamera;
-    final bool isCameraReady = _isCameraReady;
-    final bool engineIsReady = _cameraEngine.isCameraReady;
-    final bool engineUseMock = _cameraEngine.useMockCamera;
-
-    // 로그 메시지 생성
-    final logMsg = StringBuffer()
-      ..write('[InitPipeline] 📷 ENTRY: ')
-      ..write('Platform.isIOS=$isIOS, ')
-      ..write('isSimulator=$isSimulator, ')
-      ..write('_shouldUseMockCamera=$shouldUseMock, ')
-      ..write('_isCameraReady=$isCameraReady, ')
-      ..write('_cameraEngine.isCameraReady=$engineIsReady, ')
-      ..write('_cameraEngine.useMockCamera=$engineUseMock, ')
-      ..write('cameras.length=${widget.cameras.length}');
-
-    // 릴리즈 빌드에서도 디버그 오버레이에 로그 표시
-    if (kDebugMode) {
-      debugPrint(logMsg.toString());
-    }
-    if (kEnableCameraDebugOverlay) {
-      _addDebugLog(logMsg.toString());
-    }
-
-    if (kDebugMode) {
-      debugPrint('[Petgram] 📷 _initCameraPipeline() called');
-    }
-
-    // 카메라 엔진 초기화 시작 (상태는 엔진에서 관리)
-
-    if (kDebugMode) {
-      debugPrint(
-        '[Petgram] 📷 _initCameraPipeline: starting, cameras.length=${widget.cameras.length}',
-      );
-    }
-
-    // 플랫폼 정보 확인
-    if (kDebugMode) {
-      debugPrint(
-        '[Petgram] 📱 Device info: platform=${isIOS
-            ? "iOS"
-            : isAndroid
-            ? "Android"
-            : "Other"}, '
-        'isPhysicalDevice=$isPhysicalDevice',
-      );
-    }
-
-    // ⚠️ iOS 실기기에서는 camera 플러그인의 availableCameras() 결과와 상관없이
-    //    항상 네이티브 카메라(AVFoundation)를 우선 시도한다.
-    //    일부 환경(iOS 17/18, 최신 기기)에서 availableCameras()가 0을 반환해
-    //    실기기임에도 Mock/검은 화면만 나오는 문제를 막기 위한 방어 로직이다.
-    if (isPhysicalDevice && isIOS) {
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] ✅ iOS physical device detected → forcing native camera (ignoring availableCameras count)',
-        );
-      }
-
-      // 🔥 Pattern A 보장: NativeCameraController는 onCreated에서만 생성
-      //    HomePage에서는 생성하지 않고, 디버그 리스너만 설정
-      _cameraEngine.addDebugLogListener((message) {
-        _addDebugLog(message);
-      });
-
-      if (kDebugMode) {
-        debugPrint('[Petgram] 📷 Using NATIVE camera (real device)');
-        debugPrint(
-          '[Petgram] 📷 NativeCameraController will be created in onCreated callback',
-        );
-      }
-      _addDebugLog(
-        '[Camera] 📷 iOS physical device: NativeCameraController will be created in onCreated',
-      );
-      _logPreviewState('initPipeline');
-      return;
-    }
-
-    // 그 외 플랫폼(Android, 시뮬레이터 등)은 기존 availableCameras 기반 분기를 유지
-    List<CameraDescription> availableCams = widget.cameras;
-    int retryCount = 0;
-    const maxRetries = 10; // 최대 10회 재시도
-
-    // 🔥 핵심 수정: cameras.length=0일 때 무한 루프 방지 (5-10회 재시도 후 강제 처리)
-    while (availableCams.isEmpty && retryCount < maxRetries) {
-      try {
-        availableCams = await availableCameras();
-        _addDebugLog(
-          '[CameraList] cameras.length = ${availableCams.length} (fetch attempt ${retryCount + 1})',
-        );
-        if (kDebugMode) {
-          debugPrint(
-            '[Petgram] 📷 availableCameras() result: ${availableCams.length} cameras (attempt ${retryCount + 1})',
-          );
-        }
-        if (availableCams.isNotEmpty) break;
-      } catch (e) {
-        if (kDebugMode) {
-          debugPrint('[Petgram] ⚠️ availableCameras() error: $e');
-        }
-      }
-
-      retryCount++;
-      if (availableCams.isEmpty && retryCount < maxRetries) {
-        await Future.delayed(const Duration(milliseconds: 200));
-      }
-    }
-
-    // 🔥 핵심 수정: 10회 재시도 후에도 cameras.length=0이면 강제로 카메라 사용 가능 처리
-    if (availableCams.isEmpty && retryCount >= maxRetries) {
-      _addDebugLog(
-        '[CameraList] cameras.length = 0 after $maxRetries retries, forcing camera available',
-      );
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] ⚠️ cameras.length=0 after $maxRetries retries, forcing camera available',
-        );
-      }
-      // iOS 실기기에서는 cameras.length=0이어도 네이티브 카메라 사용 가능
-      if (isPhysicalDevice && isIOS) {
-        availableCams = []; // 빈 리스트 유지하되, iOS 실기기 경로로 진행
-      }
-    }
-
-    final bool hasCamera = availableCams.isNotEmpty;
-
-    if (kDebugMode) {
-      debugPrint(
-        '[Petgram] 📷 Camera check: hasCamera=$hasCamera, count=${availableCams.length}',
-      );
-    }
-
-    // Android 실기기 + 카메라 있음 → 기존 로직 유지 (legacy/네이티브 카메라 사용)
-    if (isPhysicalDevice && isAndroid && hasCamera) {
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] ✅ Android physical device with camera detected, trying camera '
-          '(cameras.length=${availableCams.length}, selected=${availableCams.first.name})',
-        );
-      }
-      // 🔥 Pattern A 보장: NativeCameraController는 onCreated에서만 생성
-      //    HomePage에서는 생성하지 않고, 디버그 리스너만 설정
-      _cameraEngine.addDebugLogListener((message) {
-        _addDebugLog(message);
-      });
-
-      _addDebugLog(
-        '[Camera] 📷 Android physical device: NativeCameraController will be created in onCreated',
-      );
-      return;
-    }
-
-    // 시뮬레이터/카메라 없음 → Mock 카메라 직접 초기화
-    if (!isPhysicalDevice || !hasCamera) {
-      if (kDebugMode) {
-        if (!isPhysicalDevice) {
-          debugPrint(
-            '[Petgram] 🎭 Simulator/Emulator detected → using MOCK camera directly',
-          );
-        } else {
-          debugPrint(
-            '[Petgram] 🎭 No camera hardware available → using MOCK camera directly',
-          );
-        }
-      }
-
-      // Mock 카메라 직접 초기화 (네이티브 시도 안 함)
-      await _cameraEngine.initializeMock(
-        aspectRatio: aspectRatioOf(_aspectMode),
-      );
-
-      // 네이티브 디버그 로그 수신 설정 (Mock 모드에서도 설정)
-      _cameraEngine.addDebugLogListener((message) {
-        _addDebugLog(message);
-      });
-
-      if (kDebugMode) {
-        debugPrint('[Petgram] 🎭 Using MOCK camera');
-        debugPrint(
-          '[Petgram] 🎭 shouldUseMock=$_shouldUseMockCamera, isReady=$_isCameraReady',
-        );
-      }
-      _logPreviewState('initPipeline');
-      return;
-    }
-
-    // 🔥 Pattern A 보장: NativeCameraController는 onCreated에서만 생성
-    //    HomePage에서는 생성하지 않고, 디버그 리스너만 설정
-    _cameraEngine.addDebugLogListener((message) {
-      _addDebugLog(message);
-    });
-
-    _addDebugLog(
-      '[Camera] 📷 Android: NativeCameraController will be created in onCreated',
-    );
-
-    // 초기화 후 Mock 모드 확인
-    if (kDebugMode) {
-      debugPrint(
-        '[Petgram] 📷 Camera init completed: useMock=${_cameraEngine.useMockCamera}, shouldUseMock=${_shouldUseMockCamera}',
-      );
-    }
-    _addDebugLog('[InitFinal] FINAL READY (initPipeline ended)');
-    _logPreviewState('initPipeline');
-  }
-
   @override
   void dispose() {
     // 앱 라이프사이클 관찰자 해제
@@ -2325,6 +1883,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     _debugStatePollTimer?.cancel();
     _focusStatusPollTimer?.cancel();
+    _debugLogTimer?.cancel(); // 🔥 로그 업데이트 타이머 취소
     _hideFocusIndicatorTimer?.cancel(); // 포커스 인디케이터 숨김 타이머 취소
     _audioPlayer.dispose();
     // 🔥 카메라 제어용 MethodChannel 핸들러 제거
@@ -2334,24 +1893,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _petFaceStreamSubscription?.cancel();
 
     // 🔥 전면 재설계: dispose 시 한 번 초기화 플래그 리셋
-    _hasCalledInitOnce = false;
 
     super.dispose();
   }
 
   /// 🔥 로딩 문제 해결: 화면 복귀 시 이전 카메라 세션 완전히 정리
-  Future<void> _ensureCameraCleanup() async {
-    // 이전 세션이 있으면 완전히 정리
-    if (_cameraEngine.isInitialized || _cameraEngine.isInitializing) {
-      if (kDebugMode) {
-        debugPrint('[Petgram] 🧹 Cleaning up previous camera session...');
-      }
-      await _cameraEngine.dispose();
-      // 상태 초기화 대기
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
-  }
-
   /// 앱 라이프사이클 변경 감지 (화면 이동 시 리소스 정리)
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -2793,7 +2339,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         );
       }
 
-      // 🔥 좌표계 통일: _lastPreviewRect는 이제 _buildCameraStack에서 직접 업데이트됨
+      // 🔥 좌표계 통일: _getPreviewRect() 실시간 측정값 사용
       // _updatePreviewRectFromContext 호출 제거
       if (kDebugMode) {
         if (previewContext != null) {
@@ -4579,97 +4125,32 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    // 상태 변경 시 강제 재빌드를 위한 key 추가
-    // 밝기 값이 변경될 때마다 전체 위젯 트리 재빌드
-
-    // 카메라가 준비되었을 때 오토포커스 모드 활성화 표시
-    // 네이티브에서 포커스 모드 설정이 완료된 후 onCameraInitialized가 호출되므로,
-    // canUseCamera가 true가 되면 포커스 모드도 설정된 것으로 간주
-    // 한 번 활성화되면 카메라가 완전히 종료되기 전까지는 계속 표시 (깜빡임 방지)
-    if (canUseCamera && !_isAutoFocusEnabled && !_shouldUseMockCamera) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        // 약간의 지연을 두어 네이티브에서 포커스 모드 설정이 완료되도록 함
-        Future.delayed(const Duration(milliseconds: 300), () {
-          if (mounted && canUseCamera && !_shouldUseMockCamera) {
-            setState(() {
-              _isAutoFocusEnabled = true;
-            });
-            // 포커스 상태 폴링 시작
-            _startFocusStatusPolling();
-          }
-        });
-      });
-    } else if (_shouldUseMockCamera && _isAutoFocusEnabled) {
-      // Mock 카메라로 전환되면 오토포커스 모드 비활성화 (실제 카메라가 아니므로)
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          setState(() {
-            _isAutoFocusEnabled = false;
-            _isFocusAdjusting = false;
-            _focusStatus = _FocusStatus.unknown;
-            _focusStatus = _FocusStatus.unknown;
-          });
-          _stopFocusStatusPolling();
-        }
-      });
-    } else if (!canUseCamera && _isAutoFocusEnabled) {
-      // 카메라가 준비되지 않았으면 폴링 중지
-      _stopFocusStatusPolling();
-    }
-    // canUseCamera가 false가 되어도 인디케이터는 유지 (카메라 전환 중일 수 있음)
-
     return Scaffold(
-      key: const Key('home_scaffold'), // 고정 key로 변경하여 PlatformView 재생성 방지
-      // 🔥 리팩터링: Scaffold 배경색은 기본색(검정 또는 theme)으로 설정
-      // 연핑크 배경은 Stack의 첫 번째 children으로 배치
-      backgroundColor: const Color(0xFFFFF0F5), // 🔥 상단 노치바 배경: 연핑크로 설정
+      key: const Key('home_scaffold'),
+      backgroundColor: const Color(0xFFFFF0F5),
       body: SafeArea(
         top: true,
-        bottom: false, // bottomNavigationBar가 하단을 관리
+        bottom: false,
         child: Stack(
           children: [
-            // 1) 연핑크 전체 배경 (가장 아래 레이어)
             Positioned.fill(child: Container(color: const Color(0xFFFFF0F5))),
-            // 2) 카메라 프리뷰 레이어 (제스처 포함)
-            // 🔥 프리뷰는 전체 화면을 차지하지 않고, 내부에서 실제 프리뷰 영역만 차지하도록 수정
-            ValueListenableBuilder<CameraState>(
-              valueListenable: _cameraEngine.stateNotifier,
-              builder: (context, state, child) {
-                // 카메라 상태가 변경될 때만 프리뷰 레이어 재빌드
-                return _buildCameraPreviewLayer();
-              },
-            ),
-            // 3) 프레임/칩 UI (전체 화면 기준 고정 배치, preview rect와 완전 분리)
-            // 🚨 프레임 UI는 preview 레이어 안으로 들어가면 안 됨
-            // 🔥 실기기 프리뷰 문제 해결: IgnorePointer로 감싸서 프리뷰를 가리지 않도록 함
-            Positioned.fill(
-              child: IgnorePointer(
-                ignoring: true, // 프레임 UI는 터치를 받지 않음
-                child: _buildFrameUI(),
-              ),
-            ),
-            // 4) 카메라 오버레이 (옵션 패널, 필터 패널, 포커스 인디케이터 등)
-            // 🔥 버튼보다 먼저 배치하여 오버레이가 버튼을 덮지 않도록
+            _buildCameraPreviewLayer(),
+            Positioned.fill(child: IgnorePointer(ignoring: true)),
             _buildCameraOverlayLayer(),
-            // 5) 상단/하단 버튼 (항상 보이는 UI) - 🔥 오버레이보다 위에 배치하여 터치 가능하도록
             _buildTopControls(),
             _buildBottomControls(),
-            // 6) 디버그 오버레이 (왼쪽 상단 작은 박스)
-            // ⚠️ 디버그 오버레이: kDebugMode에서만 표시 가능
             if (_showDebugOverlay) _buildCameraDebugOverlay(),
           ],
         ),
       ),
       bottomNavigationBar: Container(
-        color: kPetgramNavColor, // 하단 네비 + 홈바 배경색 공통
+        color: kPetgramNavColor,
         child: SafeArea(
           top: false,
-          bottom: true, // 홈 인디케이터 영역까지 이 색으로 덮기
+          bottom: true,
           child: PetgramBottomNavBar(
             currentTab: PetgramNavTab.shot,
-            onShotTap: () {
-              // 이미 Shot 화면이므로 별도 동작 없음
-            },
+            onShotTap: () {},
             onDiaryTap: () => _openDiaryPage(context),
           ),
         ),
@@ -4681,35 +4162,178 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// ⚠️ 중요: 이 레이어는 Positioned.fill로 전체 화면을 차지하되, 내부 Stack은 실제 프리뷰 영역만 차지
   ///          연핑크 배경이 프리뷰 영역 밖에서 보이도록 함
   Widget _buildCameraPreviewLayer() {
-    // 🔥 _buildCameraBackground()는 _buildCameraPreview()를 호출하고,
-    //    _buildCameraPreview()는 _shouldUseMockCamera를 체크하여
-    //    시뮬레이터일 때 자동으로 Mock을 표시함
-    //    따라서 여기서는 항상 _buildCameraBackground()를 호출하면 됨
-    // 🔥 프리뷰 레이어는 Positioned.fill로 전체 화면을 차지하되,
-    //    내부 Stack은 실제 프리뷰 영역만 차지하고, 나머지 공간은 투명하게 처리
-    //    연핑크 배경이 프리뷰 영역 밖에서 보이도록 함
-    // 🔥 핑크색 오버레이 문제 해결: Positioned.fill 대신 투명한 배경으로 감싸서 프리뷰가 보이도록 함
-    // 🔥 실기기 프리뷰 문제 디버깅: 프리뷰 레이어 빌드 상태 로깅 (중복 체크 없이 항상 출력)
-    final shouldUseMock = _shouldUseMockCamera;
-    final isInitialized = _cameraEngine.isInitialized;
-    final isInitializing = _cameraEngine.isInitializing;
-    final canUseCameraNow = canUseCamera;
-    final logMsg =
-        '[PreviewLayer] Building: canUseCamera=$canUseCameraNow, shouldUseMock=$shouldUseMock, isInitialized=$isInitialized, isInitializing=$isInitializing';
-    if (logMsg != _lastPreviewLayerLog) {
-      _lastPreviewLayerLog = logMsg;
-      _addDebugLog(logMsg);
-    }
-
     return Positioned.fill(
-      child: Container(
-        color: Colors.transparent, // 🔥 투명 배경으로 설정하여 프리뷰가 보이도록 함
-        child: _buildCameraBackground(),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onScaleStart: _handleZoomScaleStart,
+        onScaleUpdate: _handleZoomScaleUpdate,
+        onScaleEnd: _handleZoomScaleEnd,
+        onTapUp: (details) {
+          final RenderBox? box =
+              _previewStackKey.currentContext?.findRenderObject() as RenderBox?;
+          if (box != null && box.hasSize) {
+            final local = box.globalToLocal(details.globalPosition);
+            _handleTapFocusAtPosition(local, box.size);
+          }
+        },
+        child: Container(
+          color: Colors.transparent,
+          child: _buildCameraBackground(),
+        ),
       ),
     );
+  }
 
-    // 🔥 좌표계 통일: _lastPreviewRect는 이제 _buildCameraStack에서 직접 업데이트됨
-    // postFrameCallback에서 _updatePreviewRectFromContext 호출 제거
+  /// 카메라 배경 및 프리뷰 영역 빌드
+  Widget _buildCameraBackground() {
+    final double targetRatio = _getTargetAspectRatio();
+    final bool isCameraInitializing = _cameraEngine.isInitializing;
+
+    // 프리뷰 소스 생성
+    final Widget source = _buildCameraPreview();
+
+    return _buildCameraStack(
+      targetRatio: targetRatio,
+      filter: null,
+      source: source,
+      isCameraInitializing: isCameraInitializing,
+    );
+  }
+
+  /// 카메라 Stack 빌드 (중첩 AspectRatio 제거로 레이아웃 충돌 방지)
+  /// 카메라 Stack 빌드 (가용 영역 꽉 채우기)
+  Widget _buildCameraStack({
+    required double targetRatio,
+    required PetFilter? filter,
+    required Widget source,
+    required bool isCameraInitializing,
+  }) {
+    return Container(
+      color: Colors.transparent,
+      // Stack을 Center가 아닌 Positioned.fill처럼 동작하게 하여 가용 영역을 꽉 채움
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final double maxWidth = constraints.maxWidth;
+          final double maxHeight = constraints.maxHeight;
+
+          // targetRatio를 유지하면서 가용 영역 내 최대 크기 계산
+          double width, height;
+          if (maxWidth / maxHeight > targetRatio) {
+            height = maxHeight;
+            width = height * targetRatio;
+          } else {
+            width = maxWidth;
+            height = width / targetRatio;
+          }
+
+          final double top = (maxHeight - height) / 2;
+          final double left = (maxWidth - width) / 2;
+
+          // 🔥 iOS 실기기 프리뷰 동기화: 레이아웃 확정 후 다음 프레임에서 수행
+          if (Platform.isIOS) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted) return;
+              final Rect? rect = _getPreviewRectFromKey();
+              if (rect != null && rect != _lastSyncedPreviewRect) {
+                _lastSyncedPreviewRect = rect;
+                _syncPreviewRectWithRetry(rect, context);
+              }
+            });
+          }
+
+          // 프레임 칩이 그려질 시작점 계산 (프리뷰 내부 상대 좌표)
+          // 저장 시 로직과 동일하게 프리뷰 상단 3% 지점을 기준으로 칩 배치 시작
+          final double topBarHeight = height * 0.03;
+          final double chipPadding = SharedImagePipeline.calculateChipPadding(
+            width,
+          );
+          final double relativeFrameTopOffset =
+              topBarHeight + chipPadding * 2.0;
+
+          return Stack(
+            children: [
+              Positioned(
+                top: top,
+                left: left,
+                width: width,
+                height: height,
+                child: RepaintBoundary(
+                  key: _previewStackKey,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      // 1. 카메라 프리뷰 (FittedBox로 최적화된 크롭)
+                      ClipRect(
+                        child: FittedBox(
+                          fit: BoxFit.cover,
+                          clipBehavior: Clip.hardEdge,
+                          child: SizedBox(
+                            width: width, // 실제 width 사용
+                            height:
+                                width /
+                                (_sensorAspectRatio > 0
+                                    ? _sensorAspectRatio
+                                    : 0.75),
+                            child: source,
+                          ),
+                        ),
+                      ),
+                      // 2. 격자선
+                      _buildGridLines(width, height),
+                      // 3. 포커스 인디케이터
+                      _buildFocusIndicatorLayer(width, height),
+                      // 4. 프레임 UI (계산된 상대 오프셋 전달)
+                      _buildFrameUILayer(width, height, relativeFrameTopOffset),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// 카메라 프리뷰 소스 (순수 위젯만 반환, AspectRatio 금지)
+  Widget _buildCameraPreview() {
+    // 🔥 시뮬레이터 또는 카메라 장치가 없는 경우 mock 이미지를 보여줌
+    final bool noCameras = widget.cameras.isEmpty;
+    final bool isMock = _cameraEngine.useMockCamera || _shouldUseMockCamera;
+
+    if (noCameras || isMock) {
+      return Image.asset(
+        'assets/images/mockup.png',
+        fit: BoxFit.cover,
+        // 이미지 로딩 에러 시 검은 배경 (에셋 누락 대비)
+        errorBuilder: (ctx, e, st) => Container(color: Colors.black),
+      );
+    }
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        NativeCameraPreview(
+          key: _nativePreviewKey,
+          onCreated: (int viewId) {
+            _cameraEngine.attachNativeView(viewId);
+          },
+        ),
+        if (!canUseCamera) Container(color: Colors.black),
+      ],
+    );
+  }
+
+  /// GlobalKey를 이용한 안전한 좌표 측정
+  Rect? _getPreviewRectFromKey() {
+    final contextObj = _previewStackKey.currentContext;
+    if (contextObj == null) return null;
+    final RenderBox? box = contextObj.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return null;
+    final RenderBox? stackBox = context.findRenderObject() as RenderBox?;
+    if (stackBox == null) return null;
+    final Offset position = box.localToGlobal(Offset.zero, ancestor: stackBox);
+    return position & box.size;
   }
 
   /// 카메라 오버레이 레이어 (프리뷰를 덮지 않는 투명 오버레이)
@@ -4779,7 +4403,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         // 프레임 칩 텍스트 디버그 표시 (디버그 모드에서만)
         if (kDebugMode) _buildFrameChipDebugIndicator(),
         // 초점 표시기
-        if (_showFocusIndicator) _buildFocusIndicator(),
         // 자동 초점 표시기
         if (_showAutoFocusIndicator) _buildAutoFocusIndicator(),
         // 타이머 카운트다운 표시
@@ -4845,199 +4468,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
       _cameraEngine.setZoom(_uiZoomScale);
     }
-  }
-
-  Widget _buildPreviewGestureLayer({
-    required BuildContext stackContext,
-    required Widget child,
-  }) {
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent, // 프리뷰 밖 터치는 통과시킴
-      onScaleStart: (details) {
-        // 🔥 프리뷰 영역 문제 해결: RenderBox 기준 hit test
-        final BuildContext? previewContext = _shouldUseMockCamera
-            ? _mockPreviewKey.currentContext
-            : _nativePreviewKey.currentContext;
-
-        bool isInPreview = false;
-        if (previewContext != null) {
-          final RenderBox? previewBox =
-              previewContext.findRenderObject() as RenderBox?;
-          final RenderBox? stackBox =
-              stackContext.findRenderObject() as RenderBox?;
-          if (previewBox != null &&
-              previewBox.hasSize &&
-              stackBox != null &&
-              stackBox.hasSize) {
-            // localFocalPoint를 stack 좌표계에서 global로 변환한 후, preview 좌표계로 변환
-            final Offset globalFocalPoint = stackBox.localToGlobal(
-              details.localFocalPoint,
-            );
-            final Offset local = previewBox.globalToLocal(globalFocalPoint);
-            final Size previewSize = previewBox.size;
-            isInPreview =
-                local.dx >= 0 &&
-                local.dx <= previewSize.width &&
-                local.dy >= 0 &&
-                local.dy <= previewSize.height;
-          }
-        }
-        if (isInPreview) {
-          _handleZoomScaleStart(details);
-        }
-      },
-      onScaleUpdate: (details) {
-        // 🔥 프리뷰 영역 문제 해결: RenderBox 기준 hit test
-        final BuildContext? previewContext = _shouldUseMockCamera
-            ? _mockPreviewKey.currentContext
-            : _nativePreviewKey.currentContext;
-
-        bool isInPreview = false;
-        if (previewContext != null) {
-          final RenderBox? previewBox =
-              previewContext.findRenderObject() as RenderBox?;
-          final RenderBox? stackBox =
-              stackContext.findRenderObject() as RenderBox?;
-          if (previewBox != null &&
-              previewBox.hasSize &&
-              stackBox != null &&
-              stackBox.hasSize) {
-            // localFocalPoint를 stack 좌표계에서 global로 변환한 후, preview 좌표계로 변환
-            final Offset globalFocalPoint = stackBox.localToGlobal(
-              details.localFocalPoint,
-            );
-            final Offset local = previewBox.globalToLocal(globalFocalPoint);
-            final Size previewSize = previewBox.size;
-            isInPreview =
-                local.dx >= 0 &&
-                local.dx <= previewSize.width &&
-                local.dy >= 0 &&
-                local.dy <= previewSize.height;
-          }
-        }
-        if (isInPreview) {
-          _handleZoomScaleUpdate(details);
-        }
-      },
-      onScaleEnd: (details) {
-        // 줌 종료는 항상 처리 (이미 시작된 줌은 완료해야 함)
-        _handleZoomScaleEnd(details);
-      },
-      onTapDown: (details) {
-        // 🔥 프리뷰 영역 문제 해결: RenderBox 기준 hit test
-        // 현재 활성 프리뷰 컨텍스트 가져오기
-        final BuildContext? previewContext = _shouldUseMockCamera
-            ? _mockPreviewKey.currentContext
-            : _nativePreviewKey.currentContext;
-
-        bool isInPreview = false;
-        Offset? local;
-        Size? previewSize;
-
-        if (previewContext != null) {
-          final RenderBox? box =
-              previewContext.findRenderObject() as RenderBox?;
-          if (box != null && box.hasSize) {
-            // 프리뷰 RenderBox 기준 local 좌표로 변환
-            local = box.globalToLocal(details.globalPosition);
-            previewSize = box.size;
-
-            // 프리뷰 영역 안에 있는지 판정 (0 <= local.dx <= width, 0 <= local.dy <= height)
-            isInPreview =
-                local.dx >= 0 &&
-                local.dx <= previewSize.width &&
-                local.dy >= 0 &&
-                local.dy <= previewSize.height;
-          }
-        }
-
-        if (kDebugMode) {
-          debugPrint(
-            '[Petgram] 🎯 TapDown check (local): local=$local, '
-            'size=$previewSize, isInPreview=$isInPreview, aspect=${_aspectMode}',
-          );
-        }
-
-        if (isInPreview) {
-          // 🔥 1:1 프리뷰 하단 터치 시 깜빡임 문제 해결: setState를 postFrameCallback으로 지연
-          // 모든 모드에서 상단 보호 영역 체크 제거하여 프리뷰 전체 영역 터치 허용
-          if (_filterPanelExpanded) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) {
-                setState(() {
-                  _filterPanelExpanded = false;
-                });
-              }
-            });
-            return;
-          }
-          if (_isBurstMode && _burstCount > 0) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) {
-                setState(() {
-                  _shouldStopBurst = true;
-                  _burstCount = 0;
-                });
-              }
-            });
-            return;
-          }
-          if (_isTimerCounting) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) {
-                setState(() {
-                  _shouldStopTimer = true;
-                  _isTimerCounting = false;
-                  _timerSeconds = 0;
-                });
-              }
-            });
-          }
-        }
-      },
-      onTapUp: (details) {
-        // 🔥 프리뷰 영역 문제 해결: RenderBox 기준 hit test
-        // 현재 활성 프리뷰 컨텍스트 가져오기
-        final BuildContext? previewContext = _shouldUseMockCamera
-            ? _mockPreviewKey.currentContext
-            : _nativePreviewKey.currentContext;
-
-        bool isInPreview = false;
-        Offset? local;
-        Size? previewSize;
-
-        if (previewContext != null) {
-          final RenderBox? box =
-              previewContext.findRenderObject() as RenderBox?;
-          if (box != null && box.hasSize) {
-            // 프리뷰 RenderBox 기준 local 좌표로 변환
-            local = box.globalToLocal(details.globalPosition);
-            previewSize = box.size;
-
-            // 프리뷰 영역 안에 있는지 판정 (0 <= local.dx <= width, 0 <= local.dy <= height)
-            isInPreview =
-                local.dx >= 0 &&
-                local.dx <= previewSize.width &&
-                local.dy >= 0 &&
-                local.dy <= previewSize.height;
-          }
-        }
-
-        if (kDebugMode) {
-          debugPrint(
-            '[Petgram] 🎯 TapUp check (local): local=$local, '
-            'size=$previewSize, isInPreview=$isInPreview, aspect=${_aspectMode}',
-          );
-        }
-
-        if (isInPreview && local != null && previewSize != null) {
-          // 모든 모드에서 상단 보호 영역 체크 제거하여 프리뷰 전체 영역 터치 허용
-          // Mock 모드이거나 카메라 엔진이 초기화되지 않았어도 탭 처리 (Mock 모드에서도 노출 탭 UI 표시)
-          _handleTapFocusAtPosition(local, previewSize);
-        }
-      },
-      child: child,
-    );
   }
 
   List<double> _getZoomPresets() {
@@ -5284,99 +4714,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// ⚠️ 이 함수는 이제 사용하지 않는 레거시 함수입니다.
   /// 실제로는 Stack의 첫 번째 children에서 Positioned.fill + Container로 연핑크 배경을 처리합니다.
   /// 이 함수는 호환성을 위해 유지하지만 항상 빈 위젯(SizedBox.shrink)을 반환합니다.
-  Widget _buildAspectRatioOverlay() {
-    // 실제로는 아무 것도 그리지 않음 (레거시 함수)
-    return const SizedBox.shrink();
-  }
 
   /// 🔥 리팩터링: 프레임/칩 UI (전체 화면 기준 고정 배치)
   /// 프리뷰 rect와 완전히 분리하여 전체 화면 Stack의 최상위 children으로 배치
   /// 프리뷰 영역의 실제 위치(offsetY)를 기준으로 chipPadding만큼 아래에 그리기
-  Widget _buildFrameUI() {
-    // 프레임이 비활성화되어 있으면 빈 위젯 반환
-    if (!_frameEnabled || _petList.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    // 🔥 리팩터링: 프리뷰 영역의 실제 위치를 기준으로 프레임 칩 위치 계산
-    // _lastPreviewRect가 유효하지 않으면 빈 위젯 반환
-    if (_lastPreviewRect == null ||
-        _lastPreviewRect!.width <= 0 ||
-        _lastPreviewRect!.height <= 0) {
-      // 🔥 실기기 프리뷰 문제 디버깅: _lastPreviewRect 상태를 디버그 오버레이에 표시
-      if (_lastPreviewRect == null) {
-        _addDebugLog('[FrameUI] ⚠️ _lastPreviewRect is null');
-      } else {
-        _addDebugLog(
-          '[FrameUI] ⚠️ _lastPreviewRect invalid: width=${_lastPreviewRect!.width}, height=${_lastPreviewRect!.height}',
-        );
-      }
-      return const SizedBox.shrink();
-    }
-
-    // 프리뷰 영역의 실제 위치와 크기
-    final double previewTop = _lastPreviewRect!.top;
-    final double previewWidth = _lastPreviewRect!.width;
-    final double previewHeight = _lastPreviewRect!.height;
-
-    // 🔥 프레임 칩 위치: 저장 시 FramePainter와 정확히 동일하게 계산
-    // 저장 시 FramePainter:
-    //   topBarHeight = canvasSize.height * 0.03
-    //   frameTopOffset = topBarHeight + chipPadding * 2.0
-    //   topChipY = frameTopOffset + chipPadding = topBarHeight + chipPadding * 3.0
-    //
-    // 프리뷰 영역이 이미지 전체와 같다면:
-    //   previewTop = 0 (프리뷰 영역이 화면 상단에서 시작)
-    //   topBarHeight = previewHeight * 0.03 (프리뷰 영역 높이의 3%)
-    //   topChipY = previewTop + topBarHeight + chipPadding * 3.0
-    //            = 0 + previewHeight * 0.03 + chipPadding * 3.0
-    //
-    // 하지만 FramePreviewPainter는 topChipY = chipPadding을 사용하므로,
-    // 저장 시와 다를 수 있습니다. 저장 시와 동일하게 맞추기 위해:
-    final double chipPadding = SharedImagePipeline.calculateChipPadding(
-      previewWidth,
-    );
-    // 저장 시 topBarHeight = previewHeight * 0.03
-    final double topBarHeight = previewHeight * 0.03;
-    // 저장 시와 동일한 계산
-    final double frameTopOffset = previewTop + topBarHeight + chipPadding * 2.0;
-    // topChipY는 FrameScreenPainter에서 계산 (frameTopOffset + chipPadding)
-
-    // 🔥 전체 화면 기준으로 프레임 칩 그리기
-    // CustomPaint는 전체 화면 크기를 받지만, 실제 칩은 frameTopOffset부터 시작
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final double screenWidth = constraints.maxWidth;
-        final double screenHeight = constraints.maxHeight;
-
-        // 화면 크기가 유효하지 않으면 빈 위젯 반환
-        if (screenWidth <= 0 || screenHeight <= 0) {
-          return const SizedBox.shrink();
-        }
-
-        return IgnorePointer(
-          ignoring: true, // 프레임 UI는 터치 이벤트를 받지 않음
-          child: CustomPaint(
-            size: Size(screenWidth, screenHeight),
-            painter: FrameScreenPainter(
-              petList: _petList,
-              selectedPetId: _selectedPetId,
-              dogIconImage: _dogIconImage,
-              catIconImage: _catIconImage,
-              location: _currentLocation,
-              screenWidth: screenWidth,
-              screenHeight: screenHeight,
-              frameTopOffset:
-                  frameTopOffset, // 🔥 frameTopOffset 전달 (topChipY 계산용)
-              previewWidth: previewWidth, // 🔥 프리뷰 영역 너비 전달 (칩 크기 계산용)
-              previewHeight: previewHeight, // 🔥 프리뷰 영역 높이 전달 (하단 칩 위치 계산용)
-            ),
-          ),
-        );
-      },
-    );
-  }
-
   /// 🔥 리팩터링: 상단 컨트롤 (최상위 Stack으로 이동)
   /// 로고, 프레임 토글, 설정 버튼 등
   Widget _buildTopControls() {
@@ -5659,123 +5000,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 초점 표시기 빌드
   /// - 상태에는 0~1 정규화 좌표만 저장하고
   /// - 실제 픽셀 좌표/크기는 LayoutBuilder 의 constraints 를 기준으로 계산한다.
-  Widget _buildFocusIndicator() {
-    // 🔥 하단 터치 좌표 문제 해결: _showFocusIndicator도 확인
-    if (!_showFocusIndicator || _focusIndicatorNormalized == null) {
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] 🎯 FocusIndicator: not rendering (showFocusIndicator=$_showFocusIndicator, normalized=${_focusIndicatorNormalized == null ? "null" : _focusIndicatorNormalized})',
-        );
-      }
-      return const SizedBox.shrink();
-    }
-    // 🔥 하단 터치 좌표 문제 해결: _focusIndicatorNormalized를 그대로 사용 (clamp 제거)
-    final Offset normalized = _focusIndicatorNormalized!;
-
-    // 🔥 _lastPreviewRect 기반 계산: _buildCameraStack에서 postFrameCallback으로 업데이트된 값 사용
-    //    _lastPreviewRect는 최상위 Stack 기준으로 계산되므로, _buildFocusIndicator에서도 그대로 사용
-    if (_lastPreviewRect == null ||
-        _lastPreviewRect!.width <= 0 ||
-        _lastPreviewRect!.height <= 0) {
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] 🎯 FocusIndicator: _lastPreviewRect is null or invalid, skipping',
-        );
-      }
-      return const SizedBox.shrink();
-    }
-
-    final Rect previewRect = _lastPreviewRect!;
-    final double w = previewRect.width;
-    final double h = previewRect.height;
-
-    if (w <= 0 || h <= 0) {
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] 🎯 FocusIndicator: invalid previewSize (${w}x$h)',
-        );
-      }
-      return const SizedBox.shrink();
-    }
-
-    // indicator 크기는 기존 로직 유지 (화면 전체 비율 기반)
-    final double indicatorSize = w * 0.18;
-    final double size = indicatorSize.clamp(40.0, 120.0);
-
-    // 위치는 previewRect 기준으로 normalized 좌표로 계산
-    final double cx = previewRect.left + previewRect.width * normalized.dx;
-    final double cy = previewRect.top + previewRect.height * normalized.dy;
-
-    // previewRect 내부로만 clamp
-    final double half = size / 2;
-    final double left = (cx - half).clamp(
-      previewRect.left,
-      previewRect.right - size,
-    );
-    final double top = (cy - half).clamp(
-      previewRect.top,
-      previewRect.bottom - size,
-    );
-
-    if (kDebugMode) {
-      debugPrint(
-        '[Petgram] 🎯 FocusIndicator build (_lastPreviewRect): normalized=$normalized, '
-        'previewRect=$previewRect, '
-        'previewSize=(${w.toStringAsFixed(1)}x${h.toStringAsFixed(1)}), '
-        'indicatorSize=${size.toStringAsFixed(1)}, position=(${left.toStringAsFixed(1)}, ${top.toStringAsFixed(1)})',
-      );
-    }
-
-    // 🔥 이미 Stack의 children으로 사용되므로 Positioned만 직접 반환
-    // Container를 제거하고 직접 child를 Positioned에 배치하여 중첩 방지
-    return Positioned(
-      left: left,
-      top: top,
-      width: size,
-      height: size,
-      child: IgnorePointer(
-        child: TweenAnimationBuilder<double>(
-          key: ValueKey('focus_indicator_${normalized.dx}_${normalized.dy}'),
-          tween: Tween(begin: 0.0, end: 1.0),
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-          builder: (context, value, child) {
-            // 페이드인 + 스케일 애니메이션
-            return AnimatedOpacity(
-              opacity: _showFocusIndicator ? 1.0 : 0.0,
-              duration: const Duration(milliseconds: 200),
-              curve: Curves.easeOut,
-              child: Transform.scale(
-                scale: _showFocusIndicator
-                    ? (0.3 + (value * 0.7))
-                    : (0.3 + (value * 0.7)) * 0.8, // 사라질 때 약간 축소
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: Colors.transparent,
-                    border: Border.all(color: Colors.white, width: 2.0),
-                  ),
-                  child: Center(
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.9),
-                          width: 1.5,
-                        ),
-                      ),
-                      child: SizedBox(width: size * 0.6, height: size * 0.6),
-                    ),
-                  ),
-                ),
-              ),
-            );
-          },
-        ),
-      ),
-    );
-  }
-
   /// 화면 중앙에 자동 초점 설정 (최초 진입 시)
   Future<void> _setAutoFocusAtCenter() async {
     if (_shouldUseMockCamera) {
@@ -6007,1285 +5231,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
-  /// 카메라 프리뷰 렌더 함수 (단일화)
-  /// 모든 카메라 프리뷰 렌더링은 이 함수만 사용
-  /// 카메라 프리뷰 위젯 빌드 (단일 함수로 통일)
-  /// 네이티브 카메라와 Mock 카메라를 동일한 레이아웃 컨테이너에서 처리
-  /// 🔥 핵심 수정: NativeCameraPreview는 isCameraReady와 무관하게 항상 트리에 포함되어야 함
-  Widget _buildCameraPreview() {
-    // 🔥 프리뷰 표시 로직 단순화: useMockCamera만 체크, canUseCamera는 오버레이로 처리
-    final bool shouldShowMock = _shouldUseMockCamera;
-    final bool canUseCameraNow = canUseCamera;
-
-    // 1. Mock 카메라 모드면 Mock 이미지 표시
-    if (shouldShowMock) {
-      _previewSourceLabel = 'MOCK';
-      final logMsg = '[PreviewRender] path=mock, shouldUseMock=true';
-      if (logMsg != _lastPreviewRenderLog) {
-        _lastPreviewRenderLog = logMsg;
-        _addDebugLog(logMsg);
-        if (kDebugMode) {
-          debugPrint('[Petgram] $logMsg');
-        }
-      }
-      // 🔥 프리뷰 비율 크롭 기반 처리: Mock 이미지도 센서 비율로 고정
-      // ⚠️ 중요: _buildPreviewContent에서 처리되므로 여기서는 센서 비율로 고정된 위젯만 반환
-      return AspectRatio(
-        aspectRatio: () {
-          return GeometrySafety.safeAspectRatio(
-            _sensorAspectRatio,
-            1.0,
-            fallback: 3.0 / 4.0,
-          );
-        }(),
-        child: Image.asset('assets/images/mockup.png', fit: BoxFit.cover),
-      );
-    }
-
-    // 2. 네이티브 카메라 모드면 항상 NativeCameraPreview 표시
-    _previewSourceLabel = 'NATIVE';
-    
-    // 🔥 프리뷰 비율 크롭 기반 처리: 초기화 중에도 센서 비율로 고정
-    return AspectRatio(
-      aspectRatio: () {
-        return GeometrySafety.safeAspectRatio(
-          _sensorAspectRatio,
-          1.0,
-          fallback: 3.0 / 4.0,
-        );
-      }(),
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          Positioned.fill(
-            child: NativeCameraPreview(
-              key: const ValueKey('native_camera_preview_fixed'),
-              onCreated: (viewId) {
-                  // 촬영 중에는 attach/init 금지
-                  final fenceActive =
-                      _captureFenceUntil != null &&
-                      DateTime.now().isBefore(_captureFenceUntil!);
-                  if (_cameraEngine.isCapturingPhoto || fenceActive) {
-                    _addDebugLog(
-                      '[PreviewBind] ⏸️ onCreated skipped: capture fence active (isCapturing=${_cameraEngine.isCapturingPhoto}, fenceUntil=$_captureFenceUntil)',
-                    );
-                    return;
-                  }
-                  // 🔥 iOS 실기기 프리뷰 보장: onCreated 콜백이 확실히 실행되도록 보장
-                  // PlatformView 생성 후 viewId 설정 및 초기화 (카메라 엔진을 통해)
-                  _addDebugLog(
-                    '[PreviewBind] NativeCameraPreview onCreated() called: viewId=$viewId',
-                  );
-                  if (kDebugMode) {
-                    debugPrint(
-                      '[Camera] 📷 Native preview onCreated CALLED: viewId=$viewId, '
-                      'nativeCamera=${_cameraEngine.nativeCamera != null}, '
-                      'isInitialized=${_cameraEngine.isInitialized}, '
-                      'isInitializing=${_cameraEngine.isInitializing}',
-                    );
-                  }
-                  _addDebugLog(
-                    '[NativeCamera] ✅ onCreated CALLED: viewId=$viewId, '
-                    'nativeCamera=${_cameraEngine.nativeCamera != null}, '
-                    'isInitialized=${_cameraEngine.isInitialized}, '
-                    'isInitializing=${_cameraEngine.isInitializing}',
-                  );
-
-                  // 🔥 Pattern A 보장: viewId가 -1 이하일 경우 initialize를 절대 호출하지 않음
-                  if (viewId < 0) {
-                    if (kDebugMode) {
-                      debugPrint(
-                        '[Camera] ❌ Invalid viewId: $viewId. Cannot initialize camera.',
-                      );
-                    }
-                    _addDebugLog(
-                      '[Camera] ❌ PROGRAMMING ERROR: Invalid viewId=$viewId. Cannot initialize camera.',
-                    );
-                    return;
-                  }
-
-                  // 🔥 재초기화 중이면 초기화 허용 (중복 호출 방지 제외)
-                  // 재초기화가 아닌 경우에만 중복 호출 방지
-                  if (!_isReinitializing) {
-                    if (_cameraEngine.isInitialized ||
-                        _cameraEngine.isInitializing) {
-                      if (kDebugMode) {
-                        debugPrint(
-                          '[Camera] ⏳ Skipping initialize: already initialized or initializing',
-                        );
-                      }
-                      _addDebugLog(
-                        '[Camera] ⏳ Skipping initialize: already initialized or initializing',
-                      );
-                      return;
-                    }
-                  } else {
-                    // 재초기화 중이면 기존 초기화 상태를 무시하고 재초기화 진행
-                    _addDebugLog(
-                      '[Camera] 🔄 Reinitializing: ignoring previous initialization state',
-                    );
-                  }
-
-                  // 🔥 Pattern A 보장: attachNativeView 후 initializeNativeCamera 호출
-                  if (kDebugMode) {
-                    debugPrint(
-                      '[Camera] 📷 onCreated: Calling attachNativeView with viewId=$viewId',
-                    );
-                  }
-                  _addDebugLog(
-                    '[Camera] 📷 onCreated: Calling attachNativeView: viewId=$viewId',
-                  );
-
-                  // 1) attachNativeView: viewId 저장 및 NativeCameraController 생성
-                  _cameraEngine.attachNativeView(viewId);
-
-                  // 네이티브 디버그 로그 수신 설정 (한 번만)
-                  _cameraEngine.addDebugLogListener((message) {
-                    _addDebugLog(message);
-                  });
-
-                  // 🔥 글로벌 보장: lifecycle이 resumed일 때만 초기화
-                  if (_lastLifecycleState != AppLifecycleState.resumed) {
-                    _addDebugLog(
-                      '[Camera] ⏸️ Skipping initializeNativeCamera because lifecycle=$_lastLifecycleState',
-                    );
-                    return;
-                  }
-
-                  // 🔥 촬영 중 재초기화 차단: 캡처 펜스 활성 시 초기화 스킵
-                  final now = DateTime.now();
-                  final fenceActiveInit =
-                      _captureFenceUntil != null &&
-                      now.isBefore(_captureFenceUntil!);
-                  if (_isProcessing ||
-                      _cameraEngine.isCapturingPhoto ||
-                      fenceActiveInit) {
-                    _addDebugLog(
-                      '[Camera] ⏸️ Skipping initializeNativeCamera: capture fence active (isProcessing=$_isProcessing, isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, fenceActive=$fenceActiveInit)',
-                    );
-                    return;
-                  }
-
-                  // 🔥 세션이 이미 healthy하면 중복 초기화 스킵
-                  // 🔥 sessionRunning=false라도 첫 프레임을 받은 상태면 resume만 시도하고 init은 차단
-                  final currentState = _cameraEngine.lastDebugState;
-                  if (currentState != null) {
-                    final hasGoodFrame =
-                        currentState.videoConnected &&
-                        currentState.hasFirstFrame &&
-                        !currentState.isPinkFallback;
-                    if (currentState.sessionRunning && hasGoodFrame) {
-                      _addDebugLog(
-                        '[Camera] ⏸️ Skipping initializeNativeCamera: camera already healthy (sessionRunning=${currentState.sessionRunning}, videoConnected=${currentState.videoConnected}, hasFirstFrame=${currentState.hasFirstFrame}, isPinkFallback=${currentState.isPinkFallback})',
-                      );
-                      return;
-                    }
-                    if (!currentState.sessionRunning && hasGoodFrame) {
-                      _addDebugLog(
-                        '[Camera] ⏸️ Skipping initializeNativeCamera: hasFirstFrame=true but sessionRunning=false → calling resume instead of init',
-                      );
-                      _resumeCameraSession();
-                      return;
-                    }
-                  }
-
-                  // 🔥 전면 재설계: onCreated에서 viewId를 받은 후, 한 번만 initializeNativeCameraOnce 호출
-                  // 이미 초기화했으면 절대 재초기화 금지
-                  if (_hasCalledInitOnce) {
-                    _addDebugLog(
-                      '[PreviewBind] ⏸️ onCreated: already initialized once (viewId=$viewId), skipping init',
-                    );
-                    if (kDebugMode) {
-                      debugPrint(
-                        '[Camera] ⏸️ onCreated: already initialized once (viewId=$viewId), skipping init',
-                      );
-                    }
-                    return;
-                  }
-
-                  // 촬영 중에는 초기화 금지
-                  final fenceActiveOnCreated =
-                      _captureFenceUntil != null &&
-                      DateTime.now().isBefore(_captureFenceUntil!);
-                  if (_isProcessing ||
-                      _cameraEngine.isCapturingPhoto ||
-                      fenceActiveOnCreated) {
-                    _addDebugLog(
-                      '[PreviewBind] ⏸️ onCreated: capture fence active, deferring init (isCapturing=${_cameraEngine.isCapturingPhoto}, fenceUntil=$_captureFenceUntil)',
-                    );
-                    return;
-                  }
-
-                  // 🔥 전면 재설계: 한 번만 초기화
-                  _hasCalledInitOnce = true;
-                  _addDebugLog(
-                    '[PreviewBind] ✅ onCreated: calling initializeNativeCameraOnce (viewId=$viewId, first time only)',
-                  );
-                  if (kDebugMode) {
-                    debugPrint(
-                      '[Camera] ✅ onCreated: calling initializeNativeCameraOnce (viewId=$viewId, first time only)',
-                    );
-                  }
-
-                  // 1) attachNativeView: viewId 저장 및 NativeCameraController 생성
-                  _cameraEngine.attachNativeView(viewId);
-
-                  // 네이티브 디버그 로그 수신 설정 (한 번만)
-                  _cameraEngine.addDebugLogListener((message) {
-                    _addDebugLog(message);
-                  });
-
-                  // 2) initializeNativeCameraOnce: 네이티브에 한 번만 초기화 요청
-                  _cameraEngine
-                      .initializeNativeCameraOnce(
-                        viewId: viewId,
-                        cameraPosition:
-                            _cameraLensDirection == CameraLensDirection.back
-                            ? 'back'
-                            : 'front',
-                      )
-                      .then((_) async {
-                        // 🔥 초기화 성공
-                        if (mounted) {
-                          // 🔥 초기화 성공 확인 및 상태 로깅
-                          final bool isInit = _cameraEngine.isInitialized;
-                          final bool isReady = _cameraEngine.isCameraReady;
-                          final bool useMock = _cameraEngine.useMockCamera;
-
-                          if (kDebugMode) {
-                            debugPrint(
-                              '[Camera] ✅ Native camera initialized successfully',
-                            );
-                            debugPrint(
-                              '[Camera] 📊 State after init: isInitialized=$isInit, isCameraReady=$isReady, useMock=$useMock',
-                            );
-                          }
-                          _addDebugLog(
-                            '[Camera] ✅ Initialized: isInit=$isInit, isReady=$isReady, useMock=$useMock',
-                          );
-
-                          // ⚠️ 중요: 초기화가 성공했는데도 isInitialized가 false면 문제
-                          if (!isInit) {
-                            debugPrint(
-                              '[Camera] ⚠️ WARNING: initialize() completed but isInitialized=false!',
-                            );
-                            _addDebugLog(
-                              '[Camera] ⚠️ WARNING: initialize() completed but isInitialized=false',
-                            );
-                          }
-
-                          // 🔥 iOS 실기기 프리뷰 보장: 초기화 후 실제 세션 상태 확인
-                          if (isInit && Platform.isIOS) {
-                            // 짧은 딜레이 후 세션 상태 확인 (네이티브 세션이 시작될 시간 제공)
-                            await Future.delayed(
-                              const Duration(milliseconds: 500),
-                            );
-
-                            try {
-                              final debugState = await _cameraEngine
-                                  .getDebugState();
-                              if (debugState != null) {
-                                // 🔥 실제 세션 상태 값 읽기 (getDebugState에서 session.isRunning 직접 확인)
-                                final sessionRunning =
-                                    debugState['sessionRunning'] as bool? ??
-                                    false;
-                                final videoConnected =
-                                    debugState['videoConnected'] as bool? ??
-                                    false;
-                                final connectionEnabled =
-                                    debugState['connectionEnabled'] as bool? ??
-                                    false;
-                                final sampleBufferCount =
-                                    debugState['sampleBufferCount'] as int? ??
-                                    0;
-                                final hasFirstFrame =
-                                    debugState['hasFirstFrame'] as bool? ??
-                                    false;
-
-                                if (kDebugMode) {
-                                  debugPrint(
-                                    '[Camera] 🔍 Session status check (from getDebugState): '
-                                    'sessionRunning=$sessionRunning, '
-                                    'videoConnected=$videoConnected, '
-                                    'connectionEnabled=$connectionEnabled, '
-                                    'sampleBufferCount=$sampleBufferCount, '
-                                    'hasFirstFrame=$hasFirstFrame',
-                                  );
-                                }
-                                _addDebugLog(
-                                  '[Camera] 🔍 Session status (actual): '
-                                  'sessionRunning=$sessionRunning, '
-                                  'videoConnected=$videoConnected, '
-                                  'connectionEnabled=$connectionEnabled, '
-                                  'sampleBufferCount=$sampleBufferCount, '
-                                  'hasFirstFrame=$hasFirstFrame',
-                                );
-
-                                // 🔥 세션이 시작되지 않았거나 프레임이 들어오지 않으면 경고
-                                if (!sessionRunning) {
-                                  _addDebugLog(
-                                    '[Camera] ⚠️ WARNING: sessionRunning=false after initialization!',
-                                  );
-                                }
-                                if (sampleBufferCount == 0) {
-                                  _addDebugLog(
-                                    '[Camera] ⚠️ WARNING: sampleBufferCount=0 after initialization!',
-                                  );
-                                }
-
-                                // 🔥 세션이 실행되지 않았으면 재시도 및 추가 확인
-                                if (!sessionRunning) {
-                                  _addDebugLog(
-                                    '[Camera] ⚠️ WARNING: Session not running after initialization!',
-                                  );
-                                  _addDebugLog(
-                                    '[Camera] 🔍 Diagnosis: sessionRunning=$sessionRunning, videoConnected=$videoConnected, connectionEnabled=$connectionEnabled',
-                                  );
-
-                                  // 네이티브에서 세션 재시작 시도
-                                  if (_cameraEngine.nativeCamera
-                                      is NativeCameraController) {
-                                    final controller =
-                                        _cameraEngine.nativeCamera
-                                            as NativeCameraController;
-                                    // startSession 메서드 호출
-                                    try {
-                                      _addDebugLog(
-                                        '[Camera] 🔄 Attempting to start session via startSession()...',
-                                      );
-                                      await controller.startSession();
-
-                                      // 재시도 후 상태 재확인
-                                      await Future.delayed(
-                                        const Duration(milliseconds: 500),
-                                      );
-                                      final retryDebugState =
-                                          await _cameraEngine.getDebugState();
-                                      if (retryDebugState != null) {
-                                        final retrySessionRunning =
-                                            retryDebugState['sessionRunning']
-                                                as bool? ??
-                                            false;
-                                        final retrySampleBufferCount =
-                                            retryDebugState['sampleBufferCount']
-                                                as int? ??
-                                            0;
-                                        _addDebugLog(
-                                          '[Camera] 🔄 After startSession(): sessionRunning=$retrySessionRunning, sampleBufferCount=$retrySampleBufferCount',
-                                        );
-                                      }
-                                    } catch (e) {
-                                      _addDebugLog(
-                                        '[Camera] ⚠️ startSession failed: $e',
-                                      );
-                                    }
-                                  }
-                                }
-                              }
-                            } catch (e) {
-                              if (kDebugMode) {
-                                debugPrint(
-                                  '[Camera] ⚠️ Failed to check session status: $e',
-                                );
-                              }
-                              _addDebugLog(
-                                '[Camera] ⚠️ Failed to check session status: $e',
-                              );
-                            }
-                          }
-
-                          // 전면 카메라는 플래시를 지원하지 않으므로 플래시 모드 설정 전에 체크
-                          if (_cameraLensDirection ==
-                              CameraLensDirection.front) {
-                            if (_flashMode != FlashMode.off) {
-                              setState(() {
-                                _flashMode = FlashMode.off;
-                              });
-                              _saveFlashMode();
-                              debugPrint(
-                                '[Petgram] ⚠️ 전면 카메라는 플래시를 지원하지 않아 플래시를 끕니다',
-                              );
-                            }
-                          } else {
-                            // 후면 카메라는 플래시 모드 설정
-                            String flashModeStr = 'off';
-                            if (_flashMode == FlashMode.auto) {
-                              flashModeStr = 'auto';
-                            } else if (_flashMode == FlashMode.always ||
-                                _flashMode == FlashMode.torch) {
-                              flashModeStr = 'on';
-                            }
-                            _cameraEngine.setFlashMode(flashModeStr);
-                          }
-
-                          // 🔥 화각 정확도: 초기화 후 줌을 명시적으로 1.0으로 설정
-                          // 아이폰 기본 카메라의 1x 화각과 동일하게 맞추기 위함
-                          if (_uiZoomScale != 1.0) {
-                            setState(() {
-                              _uiZoomScale = 1.0;
-                              _baseUiZoomScale = 1.0;
-                            });
-                          }
-                          _cameraEngine.setZoom(1.0);
-
-                          if (kDebugMode) {
-                            debugPrint(
-                              '[Petgram] 📐 FOV debug: uiZoomScale=1.0, nativeZoom=1.0, '
-                              'lens=wide (initialized)',
-                            );
-                          }
-
-                          // 최초 진입 시 화면 중앙에 자동 초점 설정
-                          _setAutoFocusAtCenter();
-
-                          // 🔥 문제 1 해결: 카메라 초기화 완료 후 위치정보 다시 불러오기
-                          // 최초 앱 시동 시 카메라가 초기화되기 전에 위치정보를 불러오려고 하면
-                          // _frameEnabled나 _petList.isEmpty 조건 때문에 실패할 수 있음
-                          _checkAndFetchLocation();
-
-                          // 🔥 문제 2 해결: 카메라 초기화 완료 후 필터 다시 적용
-                          // 실기기에서 카메라 초기화가 완료되기 전에 필터가 변경되면
-                          // _isNativeCameraActive가 false여서 필터가 적용되지 않음
-                          if (_isNativeCameraActive) {
-                            _applyFilterIfChanged(
-                              _shootFilterKey,
-                              _liveIntensity.clamp(0.0, 1.0),
-                            );
-                            if (kDebugMode) {
-                              debugPrint(
-                                '[Petgram] 🎨 Filter re-applied after camera init: key=$_shootFilterKey, intensity=$_liveIntensity',
-                              );
-                            }
-                          }
-
-                          // 🔥 좌표계 통일: _lastPreviewRect는 이제 _buildCameraStack에서 직접 업데이트됨
-                          // postFrameCallback에서 _updatePreviewRectFromContext 호출 제거
-
-                          // 상태 업데이트를 위해 setState 호출
-                          setState(() {
-                            // 상태가 변경되었음을 알림
-                          });
-                        }
-                      })
-                      .catchError((e, stackTrace) {
-                        // 🔥 초기화 실패 시 플래그 리셋하여 재시도 가능하게
-                        _hasCalledInitOnce = false;
-                        _addDebugLog(
-                          '[PreviewBind] ❌ INIT FAILED: Resetting _hasCalledInitOnce flag for retry',
-                        );
-
-                        String errorMessage = 'Unknown error';
-                        if (e is PlatformException) {
-                          errorMessage = e.message ?? e.toString();
-                          if (e.details != null && e.details is Map) {
-                            final details = e.details as Map;
-                            if (details.containsKey('errorMessage')) {
-                              errorMessage = details['errorMessage'] as String;
-                            }
-                          }
-                        } else {
-                          errorMessage = e.toString();
-                        }
-                        // 🔥 에러 타입별 처리
-                        if (e is StateError &&
-                            e.toString().contains('ViewId not set')) {
-                          // 프로그래밍 버그 → 명확한 로그 및 상태 확인
-                          debugPrint(
-                            '[Petgram] ❌ PROGRAMMING ERROR: ViewId not set before initialize()',
-                          );
-                          debugPrint(
-                            '[Petgram] ❌ This should not happen if onCreated callback is working correctly',
-                          );
-                          debugPrint('[Petgram] ❌ Error: $e');
-                          _addDebugLog(
-                            '[Camera] ❌ PROGRAMMING ERROR: ViewId not set',
-                          );
-
-                          // 상태 확인
-                          final bool isInit = _cameraEngine.isInitialized;
-                          final bool useMock = _cameraEngine.useMockCamera;
-                          debugPrint(
-                            '[Camera] 📊 State after programming error: isInitialized=$isInit, useMock=$useMock',
-                          );
-                          _addDebugLog(
-                            '[Camera] ❌ Programming error state: isInit=$isInit, useMock=$useMock',
-                          );
-
-                          // 프로그래밍 버그이므로 mock으로 fallback하지 않음
-                          // 상태 업데이트를 위해 setState 호출
-                          if (mounted) {
-                            setState(() {
-                              // 상태가 변경되었음을 알림
-                            });
-                          }
-                        } else {
-                          // 다른 에러 (카메라 불가능 등)
-                          debugPrint(
-                            '[Petgram] ❌ Native camera init error: $errorMessage',
-                          );
-                          debugPrint('[NativeCamera] ERROR → $e');
-                          _addDebugLog('[NativeCamera] ERROR → $e');
-
-                          // 🔥 에러 발생 시 상태 확인 및 로깅
-                          final bool isInit = _cameraEngine.isInitialized;
-                          final bool useMock = _cameraEngine.useMockCamera;
-                          final bool shouldUseMock =
-                              _cameraEngine.shouldUseMockCamera;
-
-                          debugPrint(
-                            '[Camera] 📊 State after error: isInitialized=$isInit, useMock=$useMock, shouldUseMock=$shouldUseMock',
-                          );
-                          _addDebugLog(
-                            '[Camera] ❌ Error state: isInit=$isInit, useMock=$useMock, shouldUseMock=$shouldUseMock',
-                          );
-
-                          // ⚠️ 중요: CameraEngine.initialize() 내부에서 진짜 카메라 불가능 상황만 Mock으로 전환
-                          //          프로그래밍 버그는 그대로 throw되므로 여기서 catch됨
-
-                          // 상태 업데이트를 위해 setState 호출
-                          if (mounted) {
-                            setState(() {
-                              // 상태가 변경되었음을 알림
-                            });
-                          }
-                        }
-                      });
-                },
-              ),
-            ), // Positioned.fill 닫기
-            // 🔥 REFACTORING: 단일 상태 소스 기반 오버레이 표시
-            // _shouldShowPinkOverlay 게터 사용으로 일관성 보장
-            if (_shouldShowPinkOverlay)
-              Positioned.fill(
-                child: IgnorePointer(
-                  ignoring: true, // 터치 이벤트는 NativeCameraPreview로 전달
-                  child: Container(
-                    color: Colors.black, // 검은 오버레이
-                  ),
-                ),
-              ),
-            // 디버그용 오버레이 제거됨
-          ],
-        ), // Stack 닫기
-      ), // AspectRatio 닫기
-  }
-
-  /// 카메라 / 목업 배경
-  Widget _buildCameraBackground() {
-    final double targetRatio = aspectRatioOf(_aspectMode);
-    final PetFilter? filter = allFilters[_shootFilterKey];
-
-    // 카메라 프리뷰는 단일 함수로 통일
-    final Widget source = _buildCameraPreview();
-
-    // 상태가 변경될 때만 로그 출력
-    final buildLog =
-        '[Camera] 📐 _buildCameraBackground: targetRatio=$targetRatio, canUseCamera=${canUseCamera}, _cameraEngine.isInitializing=${_cameraEngine.isInitializing}, _shouldUseMockCamera=$_shouldUseMockCamera, cameras.length=${widget.cameras.length}, nativeInitialized=${_cameraEngine.isInitialized}';
-    if (kDebugMode && buildLog != _lastBuildCameraBackgroundLog) {
-      debugPrint(buildLog);
-      _lastBuildCameraBackgroundLog = buildLog;
-    }
-
-    // Mock Preview든 실제 Preview든, 초기화 중이든 항상 Stack을 반환하여
-    // 오버레이, 밝기, 초점 표시기 등이 항상 표시되도록 함
-
-    // Builder 제거하고 직접 계산 - 상태 변경 시 항상 재빌드되도록 보장
-    // MediaQuery는 build 메서드에서 이미 접근 가능하므로 Builder 불필요
-    final stackWidget = _buildCameraStack(
-      targetRatio: targetRatio,
-      filter: filter,
-      source: source,
-      isCameraInitializing: _cameraEngine.isInitializing,
-    );
-
-    // ⚠️ 중요: 제스처 레이어로 감싸서 핀치줌/탭 포커스가 동작하도록
-    // ⚠️ 중요: 제스처 레이어로 감싸서 핀치줌/탭 포커스가 동작하도록
-    //          Builder로 Stack의 context를 전달
-    return Builder(
-      builder: (stackContext) {
-        return _buildPreviewGestureLayer(
-          stackContext: stackContext,
-          child: stackWidget,
-        );
-      },
-    );
-  }
-
-  /// 카메라 Stack 빌드 (상태 변경 시 항상 재빌드되도록 분리)
-  Widget _buildCameraStack({
-    required double targetRatio,
-    required PetFilter? filter,
-    required Widget source,
-    required bool isCameraInitializing,
-  }) {
-    return Builder(
-      builder: (safeAreaContext) {
-        final bool canUseCameraNow = canUseCamera;
-        // 카메라 프리뷰는 원본 비율을 유지, 남는 영역은 연핑크 배경이 보이도록 함
-        // ⚠️ 중요: SizedBox.expand로 전체 화면을 차지하되, Stack 내부는 실제 프리뷰 영역만 차지
-        //          Stack 자체는 투명하므로 연핑크 배경이 프리뷰 영역 밖에서 보임
-        // 🔥 핑크색 오버레이 문제 해결: Container로 감싸서 투명하게 처리
-        // 🔥 실기기 프리뷰 문제 디버깅: _buildCameraStack 빌드 상태 로깅 (중복 방지)
-        final logMsg =
-            '[CameraStack] Building: canUseCamera=$canUseCameraNow, isCameraInitializing=$isCameraInitializing';
-        if (logMsg != _lastCameraStackLog) {
-          _lastCameraStackLog = logMsg;
-          _addDebugLog(logMsg);
-        }
-
-        return Container(
-          color: Colors.transparent, // 🔥 투명 배경으로 설정하여 프리뷰가 보이도록 함
-          child: SizedBox.expand(
-            child: LayoutBuilder(
-              builder: (layoutContext, constraints) {
-                // LayoutBuilder로 실제 AspectRatio가 결정한 크기 측정
-                final double maxWidth = constraints.maxWidth;
-                final double maxHeight = constraints.maxHeight;
-
-                // 레이아웃 크기가 0이 되는 경우를 방지
-                // 상태가 변경될 때만 로그 출력
-                final layoutLog =
-                    '[Petgram] 📐 LayoutBuilder constraints: maxWidth=$maxWidth, maxHeight=$maxHeight';
-                if (kDebugMode && layoutLog != _lastLayoutBuilderLog) {
-                  debugPrint(layoutLog);
-                  _lastLayoutBuilderLog = layoutLog;
-                }
-
-                // 레이아웃 크기가 0이 되는 경우를 방지 (최소값 보장)
-                final double safeMaxWidth = maxWidth > 0 ? maxWidth : 200.0;
-                final double safeMaxHeight = maxHeight > 0 ? maxHeight : 200.0;
-
-                if (maxWidth <= 0 || maxHeight <= 0) {
-                  if (kDebugMode) {
-                    debugPrint(
-                      '[Petgram] ⚠️ Invalid layout constraints (maxWidth=$maxWidth, maxHeight=$maxHeight), '
-                      'using safe values (safeMaxWidth=$safeMaxWidth, safeMaxHeight=$safeMaxHeight)',
-                    );
-                  }
-                }
-
-                // 🔥 프리뷰 비율 크롭 기반 처리: 센서 비율 고정 + 비율별 크롭
-                // 1. 센서 비율은 고정 (FOV 고정, 줌 없음)
-                // 2. targetRatio는 크롭 영역 비율 (센서 프리뷰에서 얼마만큼 보여줄지)
-                final double targetRatio = aspectRatioOf(_aspectMode);
-                // 🔥 이슈 2 수정: 센서 비율이 0이거나 잘못된 경우 기본값 사용 (카메라 재시작 시 풀화면 방지)
-                final double sensorAspect =
-                    (_sensorAspectRatio > 0 && _sensorAspectRatio.isFinite)
-                    ? _sensorAspectRatio
-                    : 3.0 / 4.0; // 기본값: 3:4
-
-                // 🔥 센서 프리뷰 크기 계산 (센서 비율 고정, 항상 동일)
-                // 센서 프리뷰는 센서 비율로 고정되어 있고, 비율 변경과 무관하게 항상 동일한 크기
-                // 프리뷰/저장 영역이 확대되지 않도록 센서 프리뷰는 항상 고정
-                double sensorPreviewW;
-                double sensorPreviewH;
-
-                if (sensorAspect > 1.0) {
-                  // 센서가 가로가 더 긴 경우: 가로를 기준으로 계산
-                  sensorPreviewW = safeMaxWidth;
-                  sensorPreviewH = sensorPreviewW / sensorAspect;
-                  if (sensorPreviewH > safeMaxHeight) {
-                    sensorPreviewH = safeMaxHeight;
-                    sensorPreviewW = sensorPreviewH * sensorAspect;
-                  }
-                } else {
-                  // 센서가 세로가 더 긴 경우 (일반적): 가로를 기준으로 계산
-                  sensorPreviewW = safeMaxWidth;
-                  sensorPreviewH = sensorPreviewW / sensorAspect;
-                  if (sensorPreviewH > safeMaxHeight) {
-                    sensorPreviewH = safeMaxHeight;
-                    sensorPreviewW = sensorPreviewH * sensorAspect;
-                  }
-                }
-
-                // 🔥 크롭 영역 크기 계산 (targetRatio 기반, 화면 가로 100% 기준)
-                // 센서 프리뷰는 고정되어 있고, 크롭 박스는 항상 화면 가로 100%를 차지
-                // 상하단 크롭 범위만 조정하여 targetRatio를 맞춤
-                // 프리뷰/저장 영역이 확대되지 않고, 상하단 오버레이만 조정됨
-                double cropBoxW;
-                double cropBoxH;
-
-                // 크롭 박스는 항상 화면 가로 100%를 차지 (센서 프리뷰 제한 없음)
-                // 센서 프리뷰는 고정되어 있고, 크롭 박스는 센서 프리뷰를 넘어서도 됨
-                // 🔥 9:16 비율에서도 가로 100%를 유지하기 위해 가로를 우선으로 계산
-                cropBoxW = safeMaxWidth;
-                cropBoxH = cropBoxW / targetRatio;
-
-                // 🔥 중요: 9:16 같은 세로 비율에서는 가로를 항상 100%로 유지
-                // 센서 프리뷰 높이를 넘어도 가로는 유지하고, 높이만 조정
-                // 센서 프리뷰를 확대하지 않으므로 크롭 박스가 센서 프리뷰를 넘어도 됨
-                // (센서 프리뷰는 고정되어 있고, 크롭 박스는 그 위에 오버레이되는 개념)
-
-                // 최종 크기 검증 (0 이하 방지)
-                cropBoxW = cropBoxW > 0 ? cropBoxW : 200.0;
-                cropBoxH = cropBoxH > 0 ? cropBoxH : 200.0;
-                sensorPreviewW = sensorPreviewW > 0 ? sensorPreviewW : 200.0;
-                sensorPreviewH = sensorPreviewH > 0 ? sensorPreviewH : 200.0;
-
-                // 중앙 정렬을 위한 오프셋 (센서 프리뷰 기준)
-                final double sensorOffsetY = (maxHeight - sensorPreviewH) / 2;
-
-                // 크롭 박스 오프셋 (센서 프리뷰 내에서 중앙 정렬)
-                // 크롭 박스가 센서 프리뷰보다 클 수 있으므로, 센서 프리뷰를 기준으로 계산
-                final double cropOffsetY = (sensorPreviewH - cropBoxH) / 2;
-
-                // 최종 크롭 박스 위치 (화면 기준)
-                // 크롭 박스는 화면 가로 100%를 차지하므로, 가로는 0으로 설정
-                final double offsetX = 0.0; // 크롭 박스 가로는 항상 화면 가로 100%
-                final double offsetY = sensorOffsetY + cropOffsetY;
-
-                // 🔥 디버그 로그: 센서 비율, 타겟 비율, 크롭 영역 크기
-                if (kDebugMode) {
-                  final cropLog =
-                      '[Petgram] 📐 Crop-based preview: sensorAspectRatio=${sensorAspect.toStringAsFixed(3)} (fixed), '
-                      'targetRatio=${targetRatio.toStringAsFixed(3)}, '
-                      'sensorPreview=${sensorPreviewW.toStringAsFixed(1)}x${sensorPreviewH.toStringAsFixed(1)}, '
-                      'cropBox=${cropBoxW.toStringAsFixed(1)}x${cropBoxH.toStringAsFixed(1)}, '
-                      'offset=(${offsetX.toStringAsFixed(1)}, ${offsetY.toStringAsFixed(1)})';
-                  if (cropLog != _lastPreviewBoxLog) {
-                    debugPrint(cropLog);
-                    _lastPreviewBoxLog = cropLog;
-                  }
-                }
-
-                // 🔥 프리뷰 안 보이는 문제 해결: cropBox 기준으로 통일
-                // previewBoxW/H는 cropBoxW/H와 동일하지만, 명확성을 위해 cropBox 변수 사용
-                // 디버그용으로만 previewBoxW/H 유지
-                final double previewBoxW = cropBoxW;
-                final double previewBoxH = cropBoxH;
-
-                // 상태가 변경될 때만 로그 출력
-                final widgetSizeLog =
-                    '[Petgram] 📷 Camera preview widget size: W=$previewBoxW, H=$previewBoxH, offsetX=$offsetX, offsetY=$offsetY';
-                if (kDebugMode && widgetSizeLog != _lastPreviewWidgetSizeLog) {
-                  debugPrint(widgetSizeLog);
-                  _lastPreviewWidgetSizeLog = widgetSizeLog;
-                  if (previewBoxW <= 0 || previewBoxH <= 0) {
-                    debugPrint(
-                      '[Petgram] ⚠️ WARNING: Camera preview widget has zero or negative size!',
-                    );
-                  }
-                }
-
-                // 오버레이 계산은 더 이상 필요 없음 (프리뷰 박스가 이미 targetRatio를 따름)
-                // 하지만 기존 코드 호환성을 위해 0으로 설정
-                double actualOverlayTop = 0;
-
-                // frameTopOffset 계산 (프리뷰 박스 기준으로 재계산)
-                double frameTopOffset = 0;
-                if (_aspectMode == AspectRatioMode.nineSixteen ||
-                    _aspectMode == AspectRatioMode.threeFour) {
-                  final double safeAreaTop = MediaQuery.of(context).padding.top;
-                  final double topBarHeight = 8 + 48 + 8;
-                  final double screenTopBarHeight = safeAreaTop + topBarHeight;
-                  final double previewTop = offsetY + actualOverlayTop;
-
-                  if (screenTopBarHeight > previewTop) {
-                    frameTopOffset = screenTopBarHeight - previewTop;
-                    frameTopOffset = frameTopOffset.clamp(0.0, previewBoxH);
-                  }
-                }
-
-                // ⚠️ 참고: 연핑크 배경은 이제 전체 화면에 항상 표시되므로 showPinkOverlay 로직 제거됨
-                // 프리뷰 존재 여부는 디버그 목적으로만 확인 (사용하지 않음)
-                // final hasNativePreview =
-                //     _nativeHasFirstFrame ||
-                //     (_nativeHasCurrentImage == true) ||
-                //     ((_nativePreviewFrameCount ?? 0) > 0);
-
-                // 🔥 좌표계 통일: _lastPreviewRect를 Stack 로컬 좌표로 직접 업데이트
-                // previewBoxW/H와 offsetX/Y는 이미 Stack 로컬 좌표계 기준으로 계산되었음
-                final Rect newPreviewRect = Rect.fromLTWH(
-                  offsetX,
-                  offsetY,
-                  previewBoxW,
-                  previewBoxH,
-                );
-                // 🔥 1:1 프리뷰 하단 터치 시 깜빡임 문제 해결: 빌드 중 setState 금지
-                // 이전 rect와 비교해서 "유의미한 차이"가 있을 때만 업데이트 (threshold 사용)
-                // 미세한 차이(1px 미만)는 무시하여 불필요한 프리뷰 재attach 방지
-                const double rectChangeThreshold = 1.0; // 1px 이상 차이만 감지
-                bool shouldUpdateRect = false;
-
-                if (_lastPreviewRect == null) {
-                  shouldUpdateRect = true;
-                } else {
-                  final double dx =
-                      (newPreviewRect.left - _lastPreviewRect!.left).abs();
-                  final double dy = (newPreviewRect.top - _lastPreviewRect!.top)
-                      .abs();
-                  final double dw =
-                      (newPreviewRect.width - _lastPreviewRect!.width).abs();
-                  final double dh =
-                      (newPreviewRect.height - _lastPreviewRect!.height).abs();
-
-                  // 위치나 크기가 1px 이상 변경되었을 때만 업데이트
-                  shouldUpdateRect =
-                      dx >= rectChangeThreshold ||
-                      dy >= rectChangeThreshold ||
-                      dw >= rectChangeThreshold ||
-                      dh >= rectChangeThreshold;
-                }
-
-                if (shouldUpdateRect) {
-                  if (kDebugMode) {
-                    debugPrint(
-                      '[Petgram] 🎯 PreviewRect changed (significant): $_lastPreviewRect → $newPreviewRect',
-                    );
-                  }
-                  // 🔥 빌드 중 setState 방지: postFrameCallback으로 지연 업데이트
-                  // newPreviewRect를 클로저에서 캡처
-                  final Rect capturedRect = newPreviewRect;
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (mounted) {
-                      // postFrameCallback 시점에 다시 체크하여 중복 업데이트 방지
-                      final double dx = _lastPreviewRect == null
-                          ? double.infinity
-                          : (capturedRect.left - _lastPreviewRect!.left).abs();
-                      final double dy = _lastPreviewRect == null
-                          ? double.infinity
-                          : (capturedRect.top - _lastPreviewRect!.top).abs();
-                      final double dw = _lastPreviewRect == null
-                          ? double.infinity
-                          : (capturedRect.width - _lastPreviewRect!.width)
-                                .abs();
-                      final double dh = _lastPreviewRect == null
-                          ? double.infinity
-                          : (capturedRect.height - _lastPreviewRect!.height)
-                                .abs();
-
-                      if (_lastPreviewRect == null ||
-                          dx >= rectChangeThreshold ||
-                          dy >= rectChangeThreshold ||
-                          dw >= rectChangeThreshold ||
-                          dh >= rectChangeThreshold) {
-                        setState(() {
-                          _lastPreviewRect = capturedRect;
-                        });
-                        if (kDebugMode) {
-                          debugPrint(
-                            '[Petgram] 🎯 PreviewRect updated (postFrameCallback): offsetX=${offsetX.toStringAsFixed(1)}, '
-                            'offsetY=${offsetY.toStringAsFixed(1)}, previewBoxW=${previewBoxW.toStringAsFixed(1)}, '
-                            'previewBoxH=${previewBoxH.toStringAsFixed(1)}, rect=$capturedRect',
-                          );
-                        }
-                      }
-                    }
-                  });
-                  // 🔥 빌드 중에는 임시로 newPreviewRect 사용 (setState 없이)
-                  // 네이티브 sync는 postFrameCallback에서 처리
-                  final Rect tempPreviewRect = newPreviewRect;
-                  // 🔥 validSize 문제 해결: 네이티브 sync는 프리뷰 Rect가 유효할 때 항상 호출
-                  // NativeCameraPreview가 화면에 떠 있고, rect가 0이 아닐 때는 무조건 보내도록 수정
-                  // _cameraEngine.isInitialized 체크를 완화하여 프리뷰 Rect 계산 시점에 바로 전달
-                  if (kDebugMode) {
-                    debugPrint(
-                      '[Petgram] 🔍 _buildCameraStack: Checking updatePreviewLayout conditions:',
-                    );
-                    debugPrint('  - Platform.isIOS: ${Platform.isIOS}');
-                    debugPrint(
-                      '  - _cameraEngine.nativeCamera != null: ${_cameraEngine.nativeCamera != null}',
-                    );
-                    debugPrint(
-                      '  - tempPreviewRect.width > 0: ${tempPreviewRect.width > 0}',
-                    );
-                    debugPrint(
-                      '  - tempPreviewRect.height > 0: ${tempPreviewRect.height > 0}',
-                    );
-                    debugPrint('  - tempPreviewRect: $tempPreviewRect');
-                  }
-                  // 🔥 수정 1 & 3: PlatformView 레이아웃 동기화 (촬영 중 제외)
-                  // 촬영 중에는 레이아웃 변경을 차단하여 세션 안정성 보장
-                  if (Platform.isIOS &&
-                      tempPreviewRect.width > 0 &&
-                      tempPreviewRect.height > 0) {
-                    // 🔥 네이티브 카메라가 아직 null이거나 촬영 중이면 재시도 스케줄
-                    _syncPreviewRectWithRetry(
-                      tempPreviewRect,
-                      layoutContext,
-                      maxRetry: 6,
-                      delayMs: 80,
-                    );
-                  } else {
-                    if (kDebugMode) {
-                      String reason = '';
-                      if (!Platform.isIOS) {
-                        reason = 'Platform.isIOS=false';
-                      } else if (_cameraEngine.nativeCamera == null) {
-                        reason = '_cameraEngine.nativeCamera is null';
-                      } else if (tempPreviewRect.width <= 0) {
-                        reason =
-                            'tempPreviewRect.width <= 0 (${tempPreviewRect.width})';
-                      } else if (tempPreviewRect.height <= 0) {
-                        reason =
-                            'tempPreviewRect.height <= 0 (${tempPreviewRect.height})';
-                      }
-                      debugPrint(
-                        '[Petgram] ⚠️ _buildCameraStack: Skipping updatePreviewLayout - $reason',
-                      );
-                    }
-                  }
-                }
-
-                // 🔥 디버그: Stack 빌드 확인
-                if (kDebugMode) {
-                  debugPrint(
-                    '[Petgram] 🎨 _buildCameraStack: Building Stack with pink background',
-                  );
-                }
-
-                // 🔥 리팩터링: 프리뷰 Stack에는 프리뷰만 포함 (프레임/칩 UI 제거)
-                // 프레임/칩 UI는 최상위 Stack으로 이동하여 paint skip 문제 해결
-                return Stack(
-                  children: [
-                    // 1️⃣ Centered camera preview box (cropped by targetRatio)
-                    // 프리뷰만 포함, 프레임/칩 UI는 최상위 Stack으로 이동
-                    Positioned(
-                      left: offsetX,
-                      top: offsetY,
-                      width: cropBoxW,
-                      height: cropBoxH,
-                      child: ClipRect(
-                        child: _buildPreviewContent(
-                          targetRatio: targetRatio,
-                          previewBoxW: cropBoxW,
-                          previewBoxH: cropBoxH,
-                          frameTopOffset: frameTopOffset,
-                          source: source,
-                          isCameraInitializing: isCameraInitializing,
-                          constraints: constraints,
-                        ),
-                      ),
-                    ),
-                    // 2️⃣ Optional debug rectangle for the preview area (only in debug mode)
-                    // 🔥 프레임/칩 UI는 최상위 Stack으로 이동 (paint skip 문제 해결)
-                  ],
-                );
-              },
-            ),
-          ),
-        ); // Container 닫기
-      },
-    );
-  }
-
-  /// 프리뷰 콘텐츠 빌드 (Builder 제거로 구조 단순화)
-  Widget _buildPreviewContent({
-    required double targetRatio,
-    required double previewBoxW,
-    required double previewBoxH,
-    required double frameTopOffset,
-    required Widget source,
-    required bool isCameraInitializing,
-    required BoxConstraints constraints,
-  }) {
-    // ⚠️ 실 카메라와 mock 분리 처리
-    //     실기기에서 카메라가 있고 초기화되었으면 실 카메라 사용
-    // ⚠️ 중요: legacy 경로에서도 프리뷰가 보이도록 수정
-    //     _cameraController가 존재하면 legacy 경로로 간주하여 실 카메라로 처리
-    final bool hasNativeCamera = _cameraEngine.isInitialized;
-
-    // 🔥 iOS 실기기 프리뷰 보장: iOS 실기기에서 Mock이 아니면 초기화 여부와 관계없이 NativeCameraPreview가 트리에 올라가 있음
-    //    따라서 초기화 전에도 isRealCamera를 true로 설정하여 renderPath를 REAL_CAMERA로 설정
-    final bool isIOS = Platform.isIOS;
-    final bool isRealCamera = isIOS && !_shouldUseMockCamera
-        ? true // iOS 실기기에서 Mock이 아니면 항상 REAL_CAMERA (초기화 전에도 NativeCameraPreview가 트리에 올라가 있음)
-        : (!_shouldUseMockCamera &&
-              hasNativeCamera); // Android나 다른 플랫폼은 초기화 여부 확인
-
-    // 상태가 변경될 때만 로그 출력
-    final renderDecisionLog =
-        '[Camera] 📷 Preview render decision: isRealCamera=$isRealCamera, _shouldUseMockCamera=$_shouldUseMockCamera, canUseCamera=$canUseCamera, hasNativeCamera=$hasNativeCamera';
-    if (kDebugMode && renderDecisionLog != _lastPreviewRenderDecisionLog) {
-      debugPrint(renderDecisionLog);
-      _lastPreviewRenderDecisionLog = renderDecisionLog;
-    }
-
-    if (isRealCamera) {
-      // ========== 실 카메라 경로 (단순화된 패턴) ==========
-      // ⚠️ 중요: postFrameCallback 제거로 debugFrameWasSentToEngine 오류 방지
-      //          GlobalKey를 사용하여 preview rect 업데이트는 별도로 처리
-
-      // 🔥 센서 비율은 고정 (FOV 고정, 줌 없음)
-      // 카메라 센서 비율은 _sensorAspectRatio에 저장되어 있음
-      final double sensorAspect = _sensorAspectRatio;
-
-      // 🔥 프리뷰 비율 로그 (디버그용)
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] 📐 Preview crop layout: '
-          'aspectMode=$_aspectMode, '
-          'targetRatio=${targetRatio.toStringAsFixed(3)}, '
-          'sensorAspect=${sensorAspect.toStringAsFixed(3)} (fixed), '
-          'cropBox=${previewBoxW.toStringAsFixed(1)}x${previewBoxH.toStringAsFixed(1)}',
-        );
-      }
-
-      // 프리뷰 매트릭스 계산 (FilterPage와 동일한 로직)
-      final previewMatrix = _buildPreviewColorMatrix();
-      final bool hasFilter = !colorMatrixEquals(previewMatrix, kIdentityMatrix);
-
-      // 카메라 프리뷰 위젯 생성
-      // 🔥 핵심 수정: source(NativeCameraPreview)는 항상 표시, 로딩 오버레이는 별도로 처리
-      //              source는 이미 _buildCameraPreview()에서 항상 NativeCameraPreview로 설정됨
-      // ⚠️ 네이티브 카메라: source는 이미 AspectRatio와 FittedBox로 감싸져 있음
-      //    _buildCameraStack의 Positioned가 이미 크기를 제공하므로,
-      //    source를 SizedBox.expand로 감싸서 Positioned의 크기를 채우도록 함
-      // 🔥 프리뷰 렌더링 수정: FittedBox(BoxFit.cover)를 사용하여 선택된 비율에 맞춰 센서를 크롭하여 보여줌
-      //    아이폰 기본 카메라 앱과 동일하게 동작하도록 (4:3 센서를 9:16 등으로 꽉 채움)
-      Widget cameraPreviewWidget = FittedBox(
-        fit: BoxFit.cover,
-        clipBehavior: Clip.hardEdge,
-        child: source,
-      );
-
-      // 필터 적용된 카메라 프리뷰
-      // ⚠️ 중요: 네이티브 카메라는 FilterEngine으로 이미 필터 적용 중이므로
-      //          Flutter ColorFiltered는 사용하지 않음 (중복 필터링 방지)
-      Widget filteredPreview;
-
-      // 네이티브 카메라 서비스가 준비된 경우:
-      // - 실제 줌은 AVFoundation의 videoZoomFactor(하드웨어/디지털 줌)로 처리
-      // - Flutter 쪽 Transform.scale은 사용하지 않고 항상 1.0 배로 그려서
-      //   프리뷰 해상도가 추가로 깨지지 않도록 한다.
-      final bool useNativeHardwareZoomOnly = _cameraEngine.isInitialized;
-
-      final bool ultraSupported =
-          _nativeLensKind == 'ultraWide' || _nativeDeviceType == 'ultraWide';
-
-      final double effectiveScale = useNativeHardwareZoomOnly
-          ? 1.0
-          : ultraSupported
-          ? _uiZoomScale.clamp(_uiZoomMin, _uiZoomMax)
-          : (_uiZoomScale >= 1.0 ? _uiZoomScale : 1.0);
-
-      // 🔥 프리뷰 비율 크롭 기반 처리: 줌과 비율은 완전히 분리
-      // 네이티브 카메라 사용 시: ColorFiltered 제거 (네이티브 FilterEngine 사용)
-      // Mock 모드에서만: ColorFiltered 사용
-      // ⚠️ 중요: 줌은 네이티브에서 처리하므로 Flutter Transform.scale 사용 안 함
-      if (useNativeHardwareZoomOnly) {
-        // 네이티브 카메라 - ColorFiltered 없이 사용, 줌도 네이티브에서 처리
-        // 🔥 크롭 기반 처리: source는 이미 센서 비율로 고정되어 있음
-        filteredPreview = cameraPreviewWidget;
-      } else if (hasFilter) {
-        // Mock 모드 + 필터 적용
-        filteredPreview = ColorFiltered(
-          colorFilter: ColorFilter.matrix(previewMatrix),
-          child: effectiveScale > 1.0
-              ? ClipRect(
-                  child: Transform.scale(
-                    scale: effectiveScale,
-                    alignment: Alignment.center,
-                    child: cameraPreviewWidget,
-                  ),
-                )
-              : cameraPreviewWidget,
-        );
-      } else {
-        // Mock 모드 + 필터 없음
-        filteredPreview = effectiveScale > 1.0
-            ? ClipRect(
-                child: Transform.scale(
-                  scale: effectiveScale,
-                  alignment: Alignment.center,
-                  child: cameraPreviewWidget,
-                ),
-              )
-            : cameraPreviewWidget;
-      }
-
-      // 🔥 프리뷰 비율 크롭 기반 처리: 크롭 레이어는 이미 위에서 적용됨
-      // 여기서는 오버레이(격자 라인, 로딩 오버레이 등)만 추가
-      // ⚠️ 중요: filteredPreview는 이미 크롭 레이어 안에 있음
-      // ⚠️ 중요: Stack 구조 단순화로 debugFrameWasSentToEngine 오류 방지
-      // 🔥 네이티브 카메라 프리뷰 렌더링 수정: filteredPreview를 Stack으로 감싸서 제대로 렌더링되도록 함
-      // 🔥 핵심 수정: canUseCamera=false일 때만 검은 오버레이 추가 (NativeCameraPreview는 항상 표시)
-      //              canUseCamera는 sessionRunning과 videoConnected를 포함하므로 더 정확함
-
-      Widget preview;
-      if (_showGridLines) {
-        preview = Stack(
-          key: ValueKey(
-            'camera_stack_${_aspectMode}_${_brightnessValue}_${_showFocusIndicator}_${_uiZoomScale}',
-          ),
-          clipBehavior: Clip.hardEdge,
-          fit: StackFit.expand,
-          children: [
-            // 1. 카메라 프리뷰 (이미 크롭 레이어 안에 있음)
-            // 🔥 네이티브 카메라는 source가 AspectRatio로 감싸져 있으므로 Positioned.fill 사용
-            Positioned.fill(child: filteredPreview),
-            // 2. 격자 라인 오버레이 - 크롭 영역 위에 표시
-            Positioned.fill(
-              child: _buildGridLines(previewBoxW, previewBoxH, frameTopOffset),
-            ),
-            // 3. 🔥 REFACTORING: 단일 상태 소스 기반 오버레이 표시
-            if (_shouldShowPinkOverlay)
-              Positioned.fill(
-                child: IgnorePointer(
-                  ignoring: true,
-                  child: Container(
-                    color: Colors.black,
-                  ), // 🔥 검은색 오버레이로 핑크 배경 가림
-                ),
-              ),
-          ],
-        );
-      } else {
-        // 격자 라인이 없으면 Stack으로 감싸서 Positioned.fill로 렌더링
-        // 🔥 네이티브 카메라는 source가 AspectRatio로 감싸져 있으므로 Stack 안에서 렌더링해야 함
-        // 🔥 REFACTORING: 단일 상태 소스 기반 오버레이 표시
-        final shouldShowOverlay = _shouldShowPinkOverlay;
-
-        preview = Stack(
-          fit: StackFit.expand,
-          children: [
-            Positioned.fill(child: filteredPreview),
-            // 🔥 핑크 오버레이 근본 해결: canUseCamera=false 또는 재초기화 중 또는 PINK FALLBACK일 때 검은색 오버레이
-            // 네이티브 뷰가 렌더링되지 않을 때 핑크 배경이 보이지 않도록 검은색으로 덮음
-            if (shouldShowOverlay)
-              Positioned.fill(
-                child: IgnorePointer(
-                  ignoring: true,
-                  child: Container(
-                    color: Colors.black,
-                  ), // 🔥 검은색 오버레이로 핑크 배경 가림
-                ),
-              ),
-          ],
-        );
-      }
-      // 🔥 크롭 레이어는 이미 위에서 적용되었으므로 여기서는 그대로 반환
-      // 🔥 _nativePreviewKey 할당: previewRect 업데이트를 위해 RepaintBoundary로 감싸기
-      return RepaintBoundary(key: _nativePreviewKey, child: preview);
-    } else {
-      // ========== Mock 경로 ==========
-      // 🔥 Mock 이미지도 센서 비율로 고정 (네이티브 카메라와 동일한 처리)
-      // Mock 이미지 비율은 센서 비율과 동일하게 처리 (3:4 = 0.75)
-      final double mockSensorRatio = _sensorAspectRatio; // 센서 비율 사용
-
-      // ⚠️ 중요: postFrameCallback 제거로 debugFrameWasSentToEngine 오류 방지
-      //          GlobalKey를 사용하여 preview rect 업데이트는 별도로 처리
-
-      // 상태가 변경될 때만 로그 출력
-      final mockCameraLog =
-          '[Preview] 🎨 Mock camera: previewBox=${previewBoxW.toStringAsFixed(1)}x${previewBoxH.toStringAsFixed(1)}, targetRatio=${targetRatio.toStringAsFixed(3)}, sensorRatio=${mockSensorRatio.toStringAsFixed(3)}';
-      if (kDebugMode && mockCameraLog != _lastMockCameraLog) {
-        debugPrint(mockCameraLog);
-        _lastMockCameraLog = mockCameraLog;
-      }
-
-      // Mock 모드에서도 프리뷰 매트릭스 계산 (FilterPage와 동일한 로직)
-      final previewMatrix = _buildPreviewColorMatrix();
-      final bool hasFilter = !colorMatrixEquals(previewMatrix, kIdentityMatrix);
-
-      // 🔥 Mock 모드에서도 줌은 네이티브와 동일하게 처리
-      //    0.5~0.9 구간에서도 줌이 적용되도록 수정
-      //    Transform.scale을 사용하되 ClipRect로 잘라내어 프리뷰가 줄어들지 않도록 처리
-      final double mockZoom = _uiZoomScale.clamp(_uiZoomMin, _uiZoomMax);
-
-      // Mock 이미지 위젯 생성 (센서 비율로 고정)
-      // AspectRatio를 사용하여 센서 비율로 고정하고, Transform.scale로 줌 적용
-      final double safeSensorAspectRatio = GeometrySafety.safeAspectRatio(
-        _sensorAspectRatio,
-        1.0,
-        fallback: 3.0 / 4.0,
-      );
-
-      Widget mockImageWidget = AspectRatio(
-        aspectRatio: safeSensorAspectRatio,
-        child: Image.asset('assets/images/mockup.png', fit: BoxFit.cover),
-      );
-
-      // 줌 배율에 따라 이미지 크기 조정
-      // 줌이 작을수록(0.5) 더 넓은 영역을 보여주므로, 이미지를 축소하여 더 넓은 영역 표시
-      // 줌이 클수록(2.0) 더 좁은 영역을 보여주므로, 이미지를 확대하여 일부만 보이도록 함
-      // 모든 줌 배율에서 줌이 적용되도록 Transform.scale 사용
-      Widget zoomedMockImage;
-      if (mockZoom != 1.0) {
-        // 줌 배율에 따라 이미지 크기 조정
-        // Transform.scale을 사용하되 ClipRect로 잘라내어 프리뷰 크기는 유지
-        zoomedMockImage = ClipRect(
-          child: Transform.scale(
-            scale: mockZoom,
-            alignment: Alignment.center,
-            child: mockImageWidget,
-          ),
-        );
-      } else {
-        zoomedMockImage = mockImageWidget;
-      }
-
-      // 필터 적용된 Mock 이미지 (ColorFiltered > 줌 적용된 이미지)
-      Widget filteredMockPreview;
-      if (hasFilter) {
-        filteredMockPreview = ColorFiltered(
-          colorFilter: ColorFilter.matrix(previewMatrix),
-          child: zoomedMockImage,
-        );
-      } else {
-        // 필터가 없으면 ColorFiltered 없이 줌만 적용
-        filteredMockPreview = zoomedMockImage;
-      }
-
-      // 🔥 Mock 모드에서도 크롭 기반 처리: 센서 비율 고정 + 크롭 레이어
-      // Mock 이미지도 센서 비율로 고정하고, 크롭 박스 크기에 맞춰 center crop
-      // ⚠️ 중요: 크롭 박스 크기(previewBoxW, previewBoxH)는 이미 _buildCameraStack에서 계산되어 전달됨
-      //          Mock 이미지는 센서 비율로 고정하되, 크롭 박스 크기 안에서 center crop
-      // 🔥 _mockPreviewKey 할당: previewRect 업데이트를 위해 RepaintBoundary로 감싸기
-      Widget mockPreview;
-      if (_showGridLines) {
-        mockPreview = Stack(
-          key: ValueKey('mock_camera_stack_${_aspectMode}_${_uiZoomScale}'),
-          clipBehavior: Clip.hardEdge,
-          children: [
-            // 1. Mock 이미지 (센서 비율로 고정, 크롭 박스 크기에 맞춰 center crop)
-            // 🔥 크롭 레이어: Mock 이미지를 센서 비율로 고정하고, 크롭 박스 크기 안에서 center crop
-            //    FittedBox를 제거하고 직접 줌 효과를 적용하여 줌이 정상 동작하도록 수정
-            Positioned.fill(
-              child: ClipRect(
-                child: Align(
-                  alignment: Alignment.center,
-                  // 크롭 박스 크기에 맞춰 센서 비율로 고정된 Mock 이미지를 center crop
-                  child: SizedBox(
-                    width: previewBoxW,
-                    height: previewBoxH,
-                    child: filteredMockPreview,
-                  ),
-                ),
-              ),
-            ),
-            // 2. 격자 라인 오버레이 - 크롭 영역 위에 표시
-            Positioned.fill(
-              child: _buildGridLines(previewBoxW, previewBoxH, frameTopOffset),
-            ),
-          ],
-        );
-      } else {
-        // 격자 라인이 없으면 Stack 없이 직접 반환
-        // 🔥 크롭 레이어: Mock 이미지를 센서 비율로 고정하고, 크롭 박스 크기 안에서 center crop
-        //    격자가 켜져 있을 때와 동일한 구조로 통일하여 줌 효과가 동일하게 적용되도록 수정
-        mockPreview = ClipRect(
-          child: Align(
-            alignment: Alignment.center,
-            // 크롭 박스 크기에 맞춰 센서 비율로 고정된 Mock 이미지를 center crop
-            child: SizedBox(
-              width: previewBoxW,
-              height: previewBoxH,
-              child: filteredMockPreview,
-            ),
-          ),
-        );
-      }
-
-      // 🔥 _mockPreviewKey 할당: previewRect 업데이트를 위해 RepaintBoundary로 감싸기
-      // 네이티브 카메라와 동일하게 처리하여 previewContext를 찾을 수 있도록 함
-      return RepaintBoundary(key: _mockPreviewKey, child: mockPreview);
-    }
-  }
-
-  /// 라이브 필터 적용 (촬영 화면 미리보기) - 펫톤 + 필터 + 밝기 모두 적용
-  /// 프리뷰용 ColorMatrix 계산 (FilterPage와 동일한 로직)
-  /// FilterPage의 _buildPreviewColorMatrix와 동일한 계산 방식 사용
   List<double> _buildPreviewColorMatrix() {
     if (_isPureOriginalMode) {
       if (kDebugMode) {
@@ -7365,20 +5310,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // FilterPage는 _editContrast를 지원하지만, HomePage는 밝기만 지원
 
     return base;
-  }
-
-  /// 그리드라인 오버레이 (풀 오버레이 기준으로 한번에 그리기)
-  /// 비율을 바꾸면 상하단 오버레이가 자연스럽게 가려짐
-  /// 프레임 유무와 관계없이 항상 풀 오버레이 기준으로 그려짐
-  Widget _buildGridLines(double width, double height, double frameTopOffset) {
-    // 실제 프리뷰 영역(오버레이 제외)에만 격자 표시
-    return IgnorePointer(
-      ignoring: true,
-      child: CustomPaint(
-        painter: GridLinesPainter(),
-        size: Size(width, height),
-      ),
-    );
   }
 
   /// 상단 로고 + 프레임 설정 + 설정 버튼
@@ -8934,4 +6865,142 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final debugInfo = _buildDebugInfoString();
     return '--- FILE LOGS ---\n$fileLogs\n\n--- CURRENT STATE ---\n$debugInfo';
   }
+
+  double _getTargetAspectRatio() {
+    switch (_aspectMode) {
+      case AspectRatioMode.threeFour:
+        return 3.0 / 4.0;
+      case AspectRatioMode.nineSixteen:
+        return 9.0 / 16.0;
+      case AspectRatioMode.oneOne:
+        return 1.0;
+    }
+  }
+
+  Widget _buildGridLines(double width, double height) {
+    if (!_showGridLines) return const SizedBox.shrink();
+    return Positioned.fill(
+      child: CustomPaint(
+        painter: _GridLinesPainter(color: Colors.white.withValues(alpha: 0.3)),
+      ),
+    );
+  }
+
+  Widget _buildFocusIndicatorLayer(double width, double height) {
+    if (!_showFocusIndicator || _focusIndicatorNormalized == null) {
+      return const SizedBox.shrink();
+    }
+
+    return Positioned(
+      left: _focusIndicatorNormalized!.dx * width - 35,
+      top: _focusIndicatorNormalized!.dy * height - 35,
+      child: TweenAnimationBuilder<double>(
+        key: ValueKey(
+          'focus_${_focusIndicatorNormalized!.dx}_${_focusIndicatorNormalized!.dy}',
+        ),
+        tween: Tween<double>(begin: 0.0, end: 1.0),
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOutBack, // 확대되며 살짝 튕기는 효과
+        builder: (context, value, child) {
+          return Opacity(
+            opacity: value.clamp(0.0, 1.0),
+            child: Transform.scale(
+              scale: 0.5 + (value * 0.5), // 0.5 -> 1.0으로 확대
+              child: _buildFocusIndicator(70),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildFrameUILayer(double width, double height, double topOffset) {
+    if (!_frameEnabled) return const SizedBox.shrink();
+
+    return Positioned.fill(
+      child: IgnorePointer(
+        ignoring: true, // 프레임 UI 자체는 터치를 방해하지 않음
+        child: CustomPaint(
+          size: Size(width, height),
+          painter: FrameScreenPainter(
+            petList: _petList,
+            selectedPetId: _selectedPetId,
+            dogIconImage: _dogIconImage,
+            catIconImage: _catIconImage,
+            location: _currentLocation,
+            screenWidth: width,
+            screenHeight: height,
+            frameTopOffset: topOffset, // 전달받은 상대 오프셋 사용
+            previewWidth: width,
+            previewHeight: height,
+            showDebugInfo: kShowFrameDebugInfo, // 🔥 추가
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFocusIndicator(double size) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        border: Border.all(color: kMainPink, width: 2),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.3),
+            blurRadius: 4,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Center(
+        child: Icon(
+          Icons.center_focus_strong,
+          color: kMainPink,
+          size: size * 0.4,
+        ),
+      ),
+    );
+  }
+}
+
+class _GridLinesPainter extends CustomPainter {
+  final Color color;
+  _GridLinesPainter({required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 1.0;
+
+    // 가로선
+    canvas.drawLine(
+      Offset(0, size.height / 3),
+      Offset(size.width, size.height / 3),
+      paint,
+    );
+    canvas.drawLine(
+      Offset(0, 2 * size.height / 3),
+      Offset(size.width, 2 * size.height / 3),
+      paint,
+    );
+
+    // 세로선
+    canvas.drawLine(
+      Offset(size.width / 3, 0),
+      Offset(size.width / 3, size.height),
+      paint,
+    );
+    canvas.drawLine(
+      Offset(2 * size.width / 3, 0),
+      Offset(2 * size.width / 3, size.height),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

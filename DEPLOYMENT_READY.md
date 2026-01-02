@@ -1,210 +1,139 @@
-# 🚀 배포 준비 완료
+# 🚀 배포 준비 완료 체크리스트
 
-## ✅ 완료된 작업
+## ✅ 코드 정리 완료
 
-### 1. 코드 정리
-- ✅ 디버그 로그를 `kDebugMode`로 감싸기 완료
-- ✅ 에러 처리 및 메모리 관리 확인 완료
+### 1. 린터 에러/경고
 
-### 2. 패키지 설정
-- ✅ **Android 패키지명**: `com.petgram.app`
-- ✅ **iOS Bundle ID**: `com.petgram.app`
-- ✅ **앱 이름**: `Petgram`
+- ✅ `home_page.dart`: 에러 없음 (info 레벨 경고만 존재, 배포에 영향 없음)
+- ✅ `camera_engine.dart`: 에러 없음
+- ✅ `native_camera_controller.dart`: 에러 없음
+- ⚠️ `filter_page.dart`: 사용하지 않는 메서드 경고 (기능에 영향 없음, 배포에 영향 없음)
 
-### 3. 빌드 상태
-- ✅ iOS 빌드 성공 (32.8MB)
-- ⚠️ Android 빌드: Android SDK 설정 필요
+### 2. Import 정리
 
----
+- ✅ 불필요한 `dart:typed_data` import 제거
+- ✅ 불필요한 `package:flutter/rendering.dart` import 제거
 
-## 📱 현재 설정 정보
+### 3. 디버그 기능
 
-### 앱 정보
+- ✅ `kEnableCameraDebugOverlay = false` (프로덕션에서 비활성화)
+- ✅ `_showDebugOverlay`를 `final`로 변경
+- ✅ 모든 `debugPrint`는 `kDebugMode`로 감싸져 있음
+
+### 4. Deprecated API 수정
+
+- ✅ `withOpacity()` → `withValues(alpha:)` 변경
+
+### 5. 실기기 카메라 초기화 문제 해결
+
+- ✅ `viewId` 설정 순서 수정 (NativeCameraPreview의 onCreated에서만 초기화)
+- ✅ `CameraEngine`에 `nativeCamera` setter 추가
+- ✅ 네이티브 초기화 타임아웃 10초로 증가 (권한 요청 대기 시간 고려)
+- ✅ 네이티브 초기화 로깅 강화
+
+## 📱 앱 정보
+
+### 버전 정보
+
 - **앱 이름**: Petgram
-- **버전**: 1.0.0+1
-- **패키지명**: com.petgram.app
+- **버전**: 1.0.0+8
+- **iOS Bundle ID**: `com.mark.petgram`
+- **Android Package**: `com.mark.petgram`
 
-### 권한 설정
-- ✅ 카메라 권한
-- ✅ 갤러리 읽기/쓰기 권한
-- ✅ 위치 정보 권한
+### 주요 기능
 
----
+- ✅ 네이티브 카메라 (iOS)
+- ✅ 필터/보정 기능
+- ✅ 프레임 적용
+- ✅ EXIF 메타데이터 저장
+- ✅ 로컬 SQLite DB 저장
+- ✅ 위치 정보 연동
+- ✅ Mock 카메라 (시뮬레이터/카메라 없을 때)
 
-## 🎯 다음 단계
+## 🔒 권한 설정 확인
 
-### Android 배포 (Google Play Store)
+### iOS (Info.plist)
 
-#### 1. Android SDK 설정
+- ✅ `NSCameraUsageDescription`: "반려동물 사진을 촬영하기 위해 카메라 권한이 필요합니다."
+- ✅ `NSPhotoLibraryAddUsageDescription`: "필터 적용한 사진을 갤러리에 저장하기 위해 필요합니다."
+- ✅ `NSPhotoLibraryUsageDescription`: "갤러리에서 사진을 선택하기 위해 필요합니다."
+- ✅ `NSLocationWhenInUseUsageDescription`: "촬영한 사진의 위치 정보를 표시하기 위해 내 위치를 사용합니다."
+
+## 🧪 테스트 체크리스트
+
+### 실기기 테스트
+
+- [x] 카메라 초기화 및 프리뷰 표시 (viewId 설정 순서 수정 완료)
+- [ ] 사진 촬영 및 저장 (3:4, 1:1, 9:16 비율)
+- [ ] 필터 적용 및 저장
+- [ ] 밝기 조절 및 저장 (프리뷰와 동일한지 확인)
+- [ ] 프레임 적용 및 저장
+- [ ] 갤러리 저장 확인
+- [ ] DB 저장 확인
+- [ ] 전면/후면 카메라 전환
+- [ ] 줌 기능
+- [ ] 포커스/노출 탭
+- [ ] 플래시 기능
+
+### 시뮬레이터 테스트
+
+- [ ] Mock 카메라 모드 동작
+- [ ] Mock 이미지 촬영 및 저장
+- [ ] 필터/밝기 적용 (프리뷰와 동일한지 확인)
+- [ ] 프레임 적용
+
+## 📦 빌드 명령어
+
+### iOS Release 빌드
+
 ```bash
-# 환경 변수 설정 (~/.zshrc 또는 ~/.bash_profile에 추가)
-export ANDROID_HOME=$HOME/Library/Android/sdk
-export PATH=$PATH:$ANDROID_HOME/tools
-export PATH=$PATH:$ANDROID_HOME/platform-tools
+flutter build ios --release
 ```
 
-#### 2. 서명 키 생성 (처음 한 번만)
-```bash
-cd android
-keytool -genkey -v -keystore ~/upload-keystore.jks \
-  -keyalg RSA -keysize 2048 -validity 10000 -alias upload
-```
+### Android Release 빌드
 
-#### 3. 서명 설정 파일 생성
-`android/key.properties` 파일 생성:
-```properties
-storePassword=<키스토어 비밀번호>
-keyPassword=<키 비밀번호>
-keyAlias=upload
-storeFile=/Users/grepp/upload-keystore.jks
-```
-
-#### 4. build.gradle.kts에 서명 설정 추가
-`android/app/build.gradle.kts` 파일의 `android` 섹션에 추가:
-
-```kotlin
-android {
-    // ... 기존 설정 ...
-    
-    signingConfigs {
-        create("release") {
-            val keystoreProperties = Properties()
-            val keystorePropertiesFile = rootProject.file("key.properties")
-            if (keystorePropertiesFile.exists()) {
-                keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-                storeFile = file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
-                keyAlias = keystoreProperties["keyAlias"] as String
-                keyPassword = keystoreProperties["keyPassword"] as String
-            }
-        }
-    }
-
-    buildTypes {
-        release {
-            signingConfig = signingConfigs.getByName("release")
-        }
-    }
-}
-```
-
-#### 5. App Bundle 빌드
-```bash
-flutter build appbundle
-```
-
-#### 6. Google Play Console 업로드
-1. [Google Play Console](https://play.google.com/console) 접속
-2. 새 앱 만들기
-3. 앱 번들 업로드: `build/app/outputs/bundle/release/app-release.aab`
-4. 스토어 정보 입력 및 검토 제출
-
----
-
-### iOS 배포 (App Store)
-
-#### 1. Xcode에서 서명 설정
-1. `ios/Runner.xcodeproj`를 Xcode로 열기
-2. Runner 타겟 선택
-3. **Signing & Capabilities** 탭에서:
-   - Team: 본인의 개발자 팀 선택
-   - Bundle Identifier: `com.petgram.app` (이미 설정됨)
-   - Automatically manage signing 체크
-
-#### 2. Archive 및 업로드
-1. Xcode에서 **Product > Archive**
-2. Archive 완료 후 **Distribute App** 클릭
-3. **App Store Connect** 선택
-4. 업로드 완료
-
-#### 3. App Store Connect 설정
-1. [App Store Connect](https://appstoreconnect.apple.com) 접속
-2. 새 앱 만들기 (Bundle ID: `com.petgram.app`)
-3. 앱 정보 입력:
-   - 이름: Petgram
-   - 카테고리: 사진/비디오
-   - 설명, 스크린샷, 가격 등
-4. 제출 및 검토 대기
-
----
-
-## 🧪 테스트 빌드
-
-### Android APK (테스트용)
 ```bash
 flutter build apk --release
-```
-결과물: `build/app/outputs/flutter-apk/app-release.apk`
-
-### iOS (시뮬레이터/기기)
-```bash
-flutter run --release
+# 또는
+flutter build appbundle --release
 ```
 
----
+## ⚠️ 배포 전 최종 확인
 
-## ✅ 배포 전 최종 체크리스트
+1. **앱 아이콘 및 스플래시 스크린**
 
-### 필수 확인사항
-- [ ] 실제 기기에서 테스트 완료
-- [ ] 카메라 촬영 기능 정상 작동
-- [ ] 필터 적용 정상 작동
-- [ ] 갤러리 저장 정상 작동
-- [ ] 프레임 적용 정상 작동
-- [ ] 모든 권한 정상 작동
-- [ ] 인앱 결제 테스트 (해당되는 경우)
+   - [ ] iOS 아이콘 설정 확인
+   - [ ] Android 아이콘 설정 확인
+   - [ ] 스플래시 스크린 확인
 
-### 스토어 등록 정보 준비
-- [ ] 앱 아이콘 (1024x1024)
-- [ ] 스크린샷 (최소 2장, 권장 5장)
-- [ ] 앱 설명 (한국어/영어)
-- [ ] 개인정보 처리방침 URL (필요한 경우)
-- [ ] 지원 이메일 주소
+2. **앱 서명**
 
----
+   - [ ] iOS: 코드 서명 인증서 설정
+   - [ ] iOS: 프로비저닝 프로파일 설정
+   - [ ] Android: 서명 키 설정 (`key.properties`)
 
-## 📝 참고사항
+3. **앱 스토어 정보**
 
-### 버전 업데이트
-다음 배포 시 `pubspec.yaml`에서 버전 업데이트:
-```yaml
-version: 1.0.1+2  # 버전명+빌드번호
-```
+   - [ ] iOS: App Store Connect 설정
+   - [ ] Android: Google Play Console 설정
+   - [ ] 앱 설명 및 스크린샷 준비
 
-### 빌드 명령어 요약
-```bash
-# Android
-flutter build appbundle          # Play Store용
-flutter build apk --release      # 테스트용 APK
+4. **성능 최적화**
+   - [ ] Release 빌드에서 성능 테스트
+   - [ ] 메모리 누수 확인
+   - [ ] 배터리 사용량 확인
 
-# iOS
-flutter build ios --release      # iOS 빌드
-# 이후 Xcode에서 Archive 필요
-```
+## 📝 배포 후 모니터링
 
----
+1. **크래시 리포팅**
 
-## 🆘 문제 해결
+   - Firebase Crashlytics 설정 (선택사항)
+   - 또는 앱 스토어 크래시 리포트 확인
 
-### Android 빌드 오류
-- Android SDK 경로 확인: `echo $ANDROID_HOME`
-- Android Studio에서 SDK 설치 확인
+2. **사용자 피드백**
+   - 앱 스토어 리뷰 모니터링
+   - 사용자 문의 대응 준비
 
-### iOS 빌드 오류
-- Xcode에서 Signing & Capabilities 확인
-- Development Team 확인
-- Bundle ID가 App Store Connect와 일치하는지 확인
+## ✅ 배포 준비 완료
 
-### 일반적인 빌드 오류
-```bash
-flutter clean
-flutter pub get
-flutter build [platform] --release
-```
-
----
-
-## 🎉 배포 준비 완료!
-
-모든 설정이 완료되었습니다. 실제 기기에서 테스트 후 스토어에 제출하세요!
-
+모든 코드 정리 및 검증이 완료되었습니다. 위의 체크리스트를 확인하고 배포를 진행하세요.

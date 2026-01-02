@@ -16,7 +16,7 @@ publish_to: "none" # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.0+8
+version: 1.0.0+9
 
 environment:
   sdk: ^3.10.0
@@ -35,9 +35,11 @@ dependencies:
   image_picker: ^1.1.2 # 사진 가져오기
   audioplayers: ^6.5.1 # 소리 재생 (고양이/강아지)  [oai_citation:0‡Dart packages](https://pub.dev/packages/audioplayers?utm_source=chatgpt.com)
   path_provider: ^2.1.1
+  sqflite: ^2.3.3+2
   camera: ^0.11.0+2
   shared_preferences: ^2.2.2
   image: ^4.2.0
+  exif: ^3.3.0 # EXIF 메타데이터 읽기
   google_fonts: ^6.3.2
   gal: ^2.0.1 # 갤러리에 사진 저장
   in_app_purchase: ^3.2.0 # 인앱 결제
@@ -77,6 +79,7 @@ flutter:
   assets:
     - assets/sounds/dog_bark.mp3
     - assets/sounds/cat_meow.mp3
+    - assets/sounds/petgram_shutter.m4a
     - assets/images/app_icon.png
     - assets/images/splash.png
     - assets/images/logo.png
