@@ -86,6 +86,7 @@ class CameraEngine {
   bool _isInitializingNative = false; // 🔥 네이티브 초기화 중 플래그 (중복 호출 방지)
   bool _isResuming = false; // 🔥 resume 중 플래그 (중복 호출 방지)
   bool _useMockCamera = false;
+  bool _isSimulator = false; // 🔥 시뮬레이터 여부 캐시
   String? _initErrorMessage;
   bool _isCapturingPhoto = false; // 🔥 촬영 중 플래그 (재초기화 차단용)
   DateTime? _captureFenceUntil; // 🔥 촬영 직후 재초기화/재개 차단 펜스
@@ -133,10 +134,12 @@ class CameraEngine {
   IPetgramCamera? get nativeCamera => _nativeCamera;
   bool get isInitializing => _isInitializing;
   bool get useMockCamera => _useMockCamera;
+  bool get isSimulator => _isSimulator; // 🔥 시뮬레이터 여부 공개
   String? get initErrorMessage => _initErrorMessage;
 
   /// 🔥 실기기에 카메라 장치가 없는지 여부 (시뮬레이터 판정용)
-  bool get isDeviceEmpty => _useMockCamera && !Platform.isAndroid && !Platform.isIOS;
+  bool get isDeviceEmpty =>
+      _useMockCamera && !Platform.isAndroid && !Platform.isIOS;
   // 🔥 Single Source of Truth: 네이티브 상태만 반환 (Flutter 자체 계산 금지)
   bool get isInitialized => _nativeInit ?? false; // 네이티브에서만 갱신
   bool get isCapturingPhoto => _isCapturingPhoto; // 🔥 촬영 중 여부
@@ -181,9 +184,11 @@ class CameraEngine {
     // 🔥 Single Source of Truth: _useMockCamera가 true면 무조건 true (시뮬레이터 판정 후 또는 에러 시)
     if (_useMockCamera) return true;
 
-    // iOS 정책: _useMockCamera가 false면 무조건 false를 반환하여 NativeCameraPreview 빌드 유도
-    // 이를 통해 onCreated -> attachNativeView -> NativeCameraController 생성 기회를 보장
-    if (Platform.isIOS) return false;
+    // iOS 정책: 시뮬레이터이면 무조건 true, 실기기면 NativeCameraPreview 빌드 유도
+    if (Platform.isIOS) {
+      if (_isSimulator) return true;
+      return false;
+    }
 
     // Android/기타 플랫폼: 기본적으로 _useMockCamera 상태를 따름
     return _useMockCamera;
@@ -274,7 +279,7 @@ class CameraEngine {
 
   /// viewId를 저장하고 NativeCameraController를 생성 (attachNativeView)
   /// NativeCameraPreview.onCreated에서만 호출됨
-  void attachNativeView(int viewId) {
+  void attachNativeView(int viewId) async {
     _viewId = viewId;
 
     if (_nativeCamera == null) {
@@ -283,6 +288,24 @@ class CameraEngine {
 
     if (_nativeCamera is NativeCameraController) {
       (_nativeCamera as NativeCameraController).setViewId(viewId);
+
+      // 🔥 시뮬레이터 여부 즉시 확인
+      try {
+        _isSimulator = await (_nativeCamera as NativeCameraController)
+            .isSimulator();
+        if (kDebugMode) {
+          debugPrint('[CameraEngine] 📱 Simulator check: $_isSimulator');
+        }
+
+        // iOS 시뮬레이터이면 즉시 Mock 모드 준비
+        if (Platform.isIOS && _isSimulator) {
+          _useMockCamera = true;
+          useMockCameraNotifier.value = true;
+          _notifyListeners();
+        }
+      } catch (e) {
+        debugPrint('[CameraEngine] ⚠️ Failed to check simulator state: $e');
+      }
     }
 
     _startCameraStateListener();
@@ -324,6 +347,16 @@ class CameraEngine {
     final isPinkFallback = _toBool(stateMap['isPinkFallback']);
     final nativeInit = _toBool(stateMap['nativeInit']);
     final String stateStr = stateMap['state'] as String? ?? 'idle';
+    
+    // 🔥 카메라 초기화 완료 감지: sessionRunning && videoConnected && hasFirstFrame이면 초기화 완료
+    final bool cameraReady = sessionRunning && videoConnected && hasFirstFrame;
+    if (cameraReady && _isInitializing) {
+      _isInitializing = false;
+      _isInitializingNative = false;
+      _emitDebugLog(
+        '[CameraEngine] ✅ Camera initialization completed: sessionRunning=$sessionRunning, videoConnected=$videoConnected, hasFirstFrame=$hasFirstFrame',
+      );
+    }
 
     // CameraDebugState 업데이트
     _lastDebugState = CameraDebugState(
@@ -422,11 +455,13 @@ class CameraEngine {
       }
 
       // 🔥 네이티브 디버그 정보 확인
-      final sessionRunning = result['sessionRunning'] as bool? ?? false;
-      final hasFirstFrame = result['hasFirstFrame'] as bool? ?? false;
+      // sessionRunning, hasFirstFrame은 로깅용으로 사용 가능하나 현재는 체크 용도로만 존재
+      final bool nativeDeviceExists =
+          result['device'] != null &&
+          (result['device'] is! Map || (result['device'] as Map).isNotEmpty);
 
       // 🔥🔥🔥 핵심 수정: 카메라 디바이스가 없으면 즉시 Mock 모드로 전환
-      if (result['device'] == null || (result['device'] is Map && (result['device'] as Map).isEmpty)) {
+      if (!nativeDeviceExists) {
         await initializeMock(aspectRatio: aspectRatio);
         return;
       }
@@ -449,9 +484,9 @@ class CameraEngine {
           });
         } catch (_) {}
       }
-    } on PlatformException catch (e, st) {
+    } on PlatformException catch (_) {
       rethrow;
-    } catch (e, st) {
+    } catch (_) {
       rethrow;
     }
   }
@@ -502,57 +537,55 @@ class CameraEngine {
         return; // Mock 모드에서는 first frame이 없으므로 체크 스킵
       }
 
-      // 🔥 재시도 성공 시 initialize() 호출 스킵 (이미 초기화 완료)
-      if (!retrySucceeded) {
-        // 재시도 없이 정상 완료된 경우에만 initialize() 호출
-        await initialize(
-          cameraPosition: cameraPosition,
-          aspectRatio: aspectRatio,
-        );
+      // 🔥🔥🔥 성능 최적화: initialize() 호출 제거 (일반 카메라 앱처럼 즉시 진입)
+      // initialize()는 Flutter 측 상태만 업데이트하는데, 이미 네이티브 초기화가 완료되었으므로
+      // 세션이 시작되면 즉시 초기화 완료로 간주하고, 첫 프레임은 백그라운드에서 수신
+      // UI는 먼저 표시하고 프리뷰는 준비되면 자동으로 표시됨
+      // initialize() 호출은 블로킹될 수 있으므로 제거
+      
+      // 🔥 성능 최적화: 세션 상태 확인 (짧은 대기)
+      // 네이티브 초기화가 완료되었으므로 세션이 곧 시작될 것임
+      // 최대 500ms 대기 후 세션 상태 확인
+      bool sessionRunning = false;
+      for (int i = 0; i < 5; i++) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        final debugState = await getDebugState();
+        sessionRunning = debugState?['sessionRunning'] as bool? ?? false;
+        if (sessionRunning) {
+          break;
+        }
       }
-
-      // 🔥 초기화 성공 확인: hasFirstFrame이 true가 아니면 실패로 간주
-      final debugState = await getDebugState();
-      final hasFirstFrame = debugState?['hasFirstFrame'] as bool? ?? false;
-      final sessionRunning = debugState?['sessionRunning'] as bool? ?? false;
-
-      if (!hasFirstFrame && sessionRunning) {
-        // 세션이 실행 중이지만 프레임이 없으면 타임아웃 대기 (최대 2초)
+      
+      if (sessionRunning) {
+        // 세션이 실행 중이면 초기화 완료로 간주 (첫 프레임은 나중에 수신)
         _emitDebugLog(
-          '[InitOnce] ⏳ Waiting for first frame (sessionRunning=true, hasFirstFrame=false)',
+          '[InitOnce] ✅ Camera session started (first frame will arrive asynchronously)',
         );
-        int waitCount = 0;
-        const maxWait = 20; // 20 * 100ms = 2초
-        while (waitCount < maxWait) {
-          await Future.delayed(const Duration(milliseconds: 100));
-          final state = await getDebugState();
-          final frameReceived = state?['hasFirstFrame'] as bool? ?? false;
-          if (frameReceived) {
-            _emitDebugLog(
-              '[InitOnce] ✅ First frame received after ${waitCount * 100}ms',
-            );
-            break;
-          }
-          waitCount++;
-        }
-
-        // 최종 확인: 여전히 프레임이 없으면 실패로 간주
-        final finalState = await getDebugState();
-        final finalHasFirstFrame =
-            finalState?['hasFirstFrame'] as bool? ?? false;
-        if (!finalHasFirstFrame) {
-          _emitDebugLog(
-            '[InitOnce] ❌ INIT FAILED: No first frame received within 2s timeout',
-          );
-          // 🔥 실패 시 플래그는 아직 false이므로 재시도 가능
-          throw StateError(
-            'Camera initialization failed: no first frame received within timeout',
-          );
-        }
+        // 🔥 Flutter 측 상태 업데이트 (initialize() 대신 직접 업데이트)
+        _useMockCamera = false;
+        _initErrorMessage = null;
+        _nativeInit = true;
+        _isReady = true;
+        useMockCameraNotifier.value = false;
+        isInitializedNotifier.value = true;
+        _setState(CameraState.ready);
+        _hasInitializedOnce = true;
+      } else {
+        // 세션이 시작되지 않았어도 초기화 완료로 간주 (네이티브에서 곧 시작될 것)
+        // 일반 카메라 앱처럼 UI를 먼저 표시하고 세션은 백그라운드에서 시작
+        _emitDebugLog(
+          '[InitOnce] ⚠️ Session not running yet, but initialization completed (session will start in background)',
+        );
+        // 🔥 Flutter 측 상태 업데이트
+        _useMockCamera = false;
+        _initErrorMessage = null;
+        _nativeInit = true;
+        _isReady = true;
+        useMockCameraNotifier.value = false;
+        isInitializedNotifier.value = true;
+        _setState(CameraState.ready);
+        _hasInitializedOnce = true;
       }
-
-      // 🔥 초기화 완전히 성공했을 때만 플래그 설정
-      _hasInitializedOnce = true;
     } catch (e, stackTrace) {
       // 🔥 Mock 모드로 전환되었으면 에러를 다시 던지지 않음
       if (_useMockCamera) {
@@ -615,8 +648,7 @@ class CameraEngine {
         }
         // 타임아웃이어도 계속 진행 (플래그가 잘못 설정되었을 수 있음)
       } else {
-        final resumeLog =
-            '[Init] init resuming: photo capture completed';
+        final resumeLog = '[Init] init resuming: photo capture completed';
         _emitDebugLog(resumeLog);
         if (kDebugMode) {
           debugPrint('[CameraEngine] ✅ $resumeLog');
@@ -702,7 +734,8 @@ class CameraEngine {
                 _notifyListeners();
                 throw PlatformException(
                   code: 'INIT_RETRY_FAILED',
-                  message: 'Camera initialization failed after $maxRetries retries: operation still in progress',
+                  message:
+                      'Camera initialization failed after $maxRetries retries: operation still in progress',
                   details: null,
                 );
               }
@@ -766,7 +799,8 @@ class CameraEngine {
           // Mock으로 전환
           _nativeCamera = null;
           _useMockCamera = true;
-          _initErrorMessage = 'Native camera unavailable, using mock: ${e.message ?? e.code}';
+          _initErrorMessage =
+              'Native camera unavailable, using mock: ${e.message ?? e.code}';
           useMockCameraNotifier.value = true;
           isInitializedNotifier.value = false;
           _setState(CameraState.ready);
@@ -930,7 +964,7 @@ class CameraEngine {
           _setState(CameraState.error, errorMessage: e.toString());
           _notifyListeners();
           rethrow;
-        } on PlatformException catch (e, stack) {
+        } on PlatformException catch (e) {
           // 🔥 플랫폼 예외: 에러 코드로 진짜 카메라 불가능 상황만 선별
           final int? errorViewId = _nativeCamera is NativeCameraController
               ? (_nativeCamera as NativeCameraController).viewId
@@ -1004,7 +1038,7 @@ class CameraEngine {
             _notifyListeners();
             rethrow;
           }
-        } catch (e, stack) {
+        } catch (e) {
           // 🔥 일반 예외: 메시지로 판단하여 mock fallback 여부 결정
           final int? errorViewId = _nativeCamera is NativeCameraController
               ? (_nativeCamera as NativeCameraController).viewId
@@ -1080,7 +1114,7 @@ class CameraEngine {
         // Android는 추후 구현
         throw UnimplementedError('Android camera not implemented');
       }
-    } catch (e, stack) {
+    } catch (e) {
       _initErrorMessage = e.toString();
 
       // 🔥 최종 예외: iOS 실기기에서는 Mock으로 도망가지 않고 에러 상태로 유지
@@ -1151,26 +1185,42 @@ class CameraEngine {
   }
 
   /// 카메라 전환
-  Future<void> switchCamera() async {
-    if (_nativeCamera == null) return;
-    await _nativeCamera!.switchCamera();
+  /// 반환: 실제 설정된 줌 값 등 카메라 정보
+  Future<Map<String, dynamic>?> switchCamera() async {
+    if (_nativeCamera == null) return null;
+    final result = await _nativeCamera!.switchCamera();
     _notifyListeners();
+    return result;
   }
 
   /// 줌 설정
   /// 🔥 줌 범위 확장: 0.5 ~ 10.0 (3배 이상 줌 데드존 제거)
-  Future<void> setZoom(double zoom) async {
-    if (_nativeCamera == null) return;
+  /// 🔥🔥🔥 반환값: 네이티브에서 실제 설정된 줌 값 (동기화용)
+  Future<double?> setZoom(double zoom) async {
+    if (_nativeCamera == null) return null;
+    if (_nativeCamera is! NativeCameraController) return null;
+    
     // 🔥 UI에서 전달된 zoom(0.5~10.0)을 네이티브에 그대로 전달
     // 네이티브에서 디바이스별 min/maxZoomFactor를 확인하여 최종 clamp 수행
     // Flutter 레벨에서는 최소한의 범위 체크만 수행
     final clamped = zoom.clamp(0.5, 10.0);
-    await _nativeCamera!.setZoom(clamped);
-    if (kDebugMode && clamped != zoom) {
-      debugPrint(
-        '[CameraEngine] 🔍 setZoom: ui=$zoom → clamped=$clamped (sent to native, range: 0.5~10.0)',
-      );
+    
+    // 🔥🔥🔥 setZoomAndGetActual 사용: 한 번의 호출로 setZoom + actualZoom 반환 (중복 호출 방지)
+    final actualZoom = await (_nativeCamera as NativeCameraController).setZoomAndGetActual(clamped);
+    
+    if (kDebugMode) {
+      if (actualZoom != null && (actualZoom - clamped).abs() > 0.01) {
+        debugPrint(
+          '[CameraEngine] 🔄 setZoom: ui=$zoom → clamped=$clamped → actual=$actualZoom',
+        );
+      } else if (clamped != zoom) {
+        debugPrint(
+          '[CameraEngine] 🔍 setZoom: ui=$zoom → clamped=$clamped (sent to native, range: 0.5~10.0)',
+        );
+      }
     }
+    
+    return actualZoom;
   }
 
   /// 포커스 포인트 설정
@@ -1404,6 +1454,10 @@ class CameraEngine {
       _emitDebugLog(
         '[CameraEngine] 🔓 isCapturingPhoto = false (takePicture completed/failed)',
       );
+      // 🔥🔥🔥 연속 촬영 문제 디버깅: debugPrint로 항상 출력하여 리셋 확인
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] 🔓🔓🔓 isCapturingPhoto RESET to false in finally block');
+      }
     }
   }
 
@@ -1634,13 +1688,16 @@ class CameraEngine {
   void _emitDebugLog(String message) {
     // ⚠️ 릴리즈 빌드 및 일반적인 상황에서는 로그 출력 안함
     if (!kDebugMode) return;
-    
+
     // 🔥 중요 로그(📸, ❌, ⚠️)만 출력하거나, 필요할 때만 활성화
-    final isCritical = message.contains('📸') || message.contains('❌') || message.contains('⚠️');
+    final isCritical =
+        message.contains('📸') ||
+        message.contains('❌') ||
+        message.contains('⚠️');
     if (isCritical) {
       debugPrint(message);
     }
-    
+
     // 디버그 오버레이 리스너에게는 전달 (오버레이 표시 여부는 HomePage에서 결정)
     for (final listener in _debugLogListeners) {
       try {
@@ -1696,6 +1753,9 @@ class CameraEngine {
   Future<void> resume() async {
     // 🔥 핵심 수정: 중복 호출 방지
     if (_isResuming) {
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] ⏸️ Resume already in progress, skipping duplicate call');
+      }
       return;
     }
 
@@ -1715,49 +1775,51 @@ class CameraEngine {
       }
     }
 
-    // 🔥 Single Source of Truth: 네이티브 상태만 확인 (Flutter 내부 플래그 무시)
-    final currentDebugState = await getDebugState();
-    if (currentDebugState == null) {
-      return;
-    }
-
-    final nativeInit = currentDebugState['nativeInit'] as bool? ?? false;
-    final isReady = currentDebugState['isReady'] as bool? ?? false;
-    final currentSessionRunning =
-        currentDebugState['sessionRunning'] as bool? ?? false;
-    final currentVideoConnected =
-        currentDebugState['videoConnected'] as bool? ?? false;
-
-    // 🔥 네이티브 상태 기반으로 판단
-    if (!nativeInit || !isReady) {
-      // 🔥 핵심 수정: 준비되지 않은 상태면 배경에서 재초기화 시도
-      _isResuming = false; // 플래그 리셋
-      _performInitializeNativeCamera(
-        viewId: _viewId ?? 0,
-        cameraPosition: 'back', // 기본값 'back' 사용
-        aspectRatio: _currentAspectRatio,
-      );
-      return;
-    }
-
-    // 🔥 이미 세션이 실행 중이면 resume 불필요
-    if (currentSessionRunning == true && currentVideoConnected == true) {
-      return;
-    }
-
-    _isResuming = true;
-    try {
-      if (_nativeCamera == null) return;
-      if (_nativeCamera is! NativeCameraController) return;
-
-      // 🔥 네이티브 쪽 세션 재시작용 메서드만 호출 (재초기화는 하지 않음)
-      await (_nativeCamera as NativeCameraController).resumeSession();
-    } catch (e) {
+    // 🔥🔥🔥 백그라운드 복귀 시 처리: 무조건 resumeSession 시도
+    // 백그라운드에서 복귀할 때는 세션이 중지되어 있을 가능성이 높으므로
+    // 상태 체크를 완화하고 무조건 resumeSession을 시도
+    if (_nativeCamera == null) {
       if (kDebugMode) {
-        debugPrint('[CameraEngine] ❌ Failed to resume session: $e');
+        debugPrint('[CameraEngine] ⚠️ Resume skipped: nativeCamera is null');
       }
-    } finally {
-      _isResuming = false;
+      return;
+    }
+    if (_nativeCamera is! NativeCameraController) {
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] ⚠️ Resume skipped: nativeCamera is not NativeCameraController');
+      }
+      return;
+    }
+
+    // 🔥 플래그 설정 (try 블록 시작 전에 설정)
+    _isResuming = true;
+
+    try {
+      // 🔥🔥🔥 백그라운드 복귀 시 무조건 resumeSession 시도
+      await (_nativeCamera as NativeCameraController).resumeSession();
+      
+      // 🔥🔥🔥 핵심 수정: Flutter에서 재초기화를 완전히 제거
+      // 네이티브 FSM이 자동으로 복구하므로 Flutter는 resumeSession만 호출하고 기다림
+      // 상태 확인을 최소화하여 Flutter-네이티브 동기화 문제 방지
+      _isResuming = false; // 플래그 즉시 리셋 (네이티브가 처리하도록)
+      
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] ✅ Resume called: native FSM will handle recovery automatically');
+      }
+      
+      // 🔥🔥🔥 네이티브 FSM이 자동으로 복구하므로 Flutter는 기다리기만 함
+      // 상태 폴링 타이머가 자동으로 상태를 업데이트하므로 여기서는 아무것도 하지 않음
+      return;
+    } catch (e) {
+      _isResuming = false; // 플래그 리셋
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] ❌ resumeSession failed: $e');
+      }
+      // 🔥🔥🔥 보수적 접근: 예외 발생 시에도 재초기화하지 않음
+      // 네이티브 FSM이 자동으로 복구하므로 Flutter는 기다리기만 함
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] ⚠️ Resume error handled: native FSM will handle recovery');
+      }
     }
   }
 }

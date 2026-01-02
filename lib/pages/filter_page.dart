@@ -129,6 +129,8 @@ class _FilterPageState extends State<FilterPage> {
   double _currentScale = 1.0;
   Offset _offset = Offset.zero;
   Offset _lastFocalPoint = Offset.zero;
+  // 🔥🔥🔥 성능 최적화: Pinch zoom 로그 출력 빈도 제어
+  int _pinchZoomLogCounter = 0;
 
   // 성능 최적화: 슬라이더 변경 debounce 타이머
   Timer? _sliderDebounceTimer;
@@ -486,11 +488,18 @@ class _FilterPageState extends State<FilterPage> {
           }
         });
 
+        // 🔥🔥🔥 성능 최적화: 로그 출력 빈도 감소 (10프레임마다 1회 또는 scale 변화가 있을 때만)
         if (kDebugMode) {
-          debugPrint(
-            '[FilterPage] 🔍 Pinch zoom update: scale=${details.scale.toStringAsFixed(2)}, '
-            '_currentScale=${_currentScale.toStringAsFixed(2)}, offset=$_offset',
-          );
+          // scale이 1.0에서 벗어나거나, 마지막 로그 출력 후 10프레임 이상 경과했을 때만 로그 출력
+          final shouldLog = (details.scale - 1.0).abs() > 0.01 || 
+                           (_pinchZoomLogCounter % 10 == 0);
+          if (shouldLog) {
+            debugPrint(
+              '[FilterPage] 🔍 Pinch zoom update: scale=${details.scale.toStringAsFixed(2)}, '
+              '_currentScale=${_currentScale.toStringAsFixed(2)}, offset=$_offset',
+            );
+          }
+          _pinchZoomLogCounter++;
         }
       },
       onScaleEnd: (details) {

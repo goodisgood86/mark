@@ -24,7 +24,8 @@ abstract class IPetgramCamera {
   Size? get previewSize;
 
   /// 전면/후면 카메라 전환
-  Future<void> switchCamera();
+  /// 반환: {'aspectRatio': double, 'previewWidth': double, 'previewHeight': double, 'minZoom': double, 'maxZoom': double} 또는 null
+  Future<Map<String, dynamic>?> switchCamera();
 
   /// 플래시 모드 설정
   /// [mode] 'off' | 'auto' | 'on' | 'torch'

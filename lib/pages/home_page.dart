@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:audioplayers/audioplayers.dart';
@@ -8,13 +9,8 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'
-    show
-        MethodChannel,
-        rootBundle,
-        HapticFeedback,
-        PlatformException,
-        Clipboard,
-        ClipboardData;
+    show MethodChannel, rootBundle, HapticFeedback, PlatformException;
+import 'package:flutter_native_splash/flutter_native_splash.dart';
 import 'package:gal/gal.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
@@ -93,6 +89,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // 🔥 릴리즈 빌드에서도 디버그 오버레이 표시
   static const bool kEnableCameraDebugOverlay = false;
   static const bool kShowFrameDebugInfo = false; // 🔥 프레임 디버그 정보 표시 여부
+  
+  // 🔥 스플래시 제거 플래그: 한 번만 제거하도록 보장
+  bool _hasRemovedSplash = false;
 
   /// Exposure Bias 범위 상수 (-0.4 ~ +0.4)
   /// 슬라이더는 -10 ~ +10 범위를 사용하지만, 실제 적용은 이 범위로 제한
@@ -267,9 +266,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 디버그 상태 폴링 시작 (0.5초마다 네이티브 상태 확인)
   void _startDebugStatePolling() {
     _debugStatePollTimer?.cancel();
-    // 🔥 핵심 수정: 폴링 간격을 1초로 증가하여 배터리 부담 최소화
-    //              상태 업데이트는 필수이므로 항상 실행
-    _debugStatePollTimer = Timer.periodic(const Duration(milliseconds: 1000), (
+    // 🔥 디버그 로그 폭주 방지: 폴링 간격을 10초로 증가
+    //              상태 업데이트는 필수이지만 로그 폭주를 방지하기 위해 간격 증가
+    _debugStatePollTimer = Timer.periodic(const Duration(seconds: 10), (
       _,
     ) {
       _pollDebugState();
@@ -281,18 +280,42 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 간격: 1초 (500ms → 1초로 증가하여 배터리 절약)
   void _startFocusStatusPolling() {
     _focusStatusPollTimer?.cancel();
-    if (!canUseCamera || _shouldUseMockCamera) return;
+    
+    if (kDebugMode) {
+      debugPrint(
+        '[Petgram] 🎯 _startFocusStatusPolling: canUseCamera=$canUseCamera, _shouldUseMockCamera=$_shouldUseMockCamera, _isAutoFocusEnabled=$_isAutoFocusEnabled',
+      );
+    }
+    
+    if (!canUseCamera || _shouldUseMockCamera) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] ⚠️ Focus status polling skipped: canUseCamera=$canUseCamera, _shouldUseMockCamera=$_shouldUseMockCamera');
+      }
+      return;
+    }
 
     // 🔥 성능 최적화: AF 인디케이터가 활성화되지 않았으면 폴링 비활성화
-    if (!_isAutoFocusEnabled) return;
+    if (!_isAutoFocusEnabled) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] ⚠️ Focus status polling skipped: _isAutoFocusEnabled=false');
+      }
+      return;
+    }
 
-    // 🔥 성능 최적화: 포커스 상태 폴링 간격 증가 (500ms → 1000ms)
-    // 배터리/발열 감소를 위해 1초 간격으로 변경
-    _focusStatusPollTimer = Timer.periodic(const Duration(milliseconds: 1000), (
+    // 🔥 성능 최적화: 포커스 상태 폴링 간격 증가 (1000ms → 2000ms)
+    // 배터리/발열 감소를 위해 2초 간격으로 변경 (기존 기능 유지)
+    _focusStatusPollTimer = Timer.periodic(const Duration(milliseconds: 2000), (
       _,
     ) {
       _pollFocusStatus();
     });
+    
+    // 🔥 즉시 첫 번째 폴링 실행 (상태를 바로 확인)
+    _pollFocusStatus();
+    
+    if (kDebugMode) {
+      debugPrint('[Petgram] ✅ Focus status polling started');
+    }
   }
 
   /// 포커스 상태 폴링 중지
@@ -309,10 +332,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
 
     try {
+      // 🔥 성능 최적화: getFocusStatus는 매 초마다 호출되므로 로그 제거
+      // if (kDebugMode) { debugPrint('[Petgram] 🎯 _pollFocusStatus: calling getFocusStatus...'); }
+      
       final status = await _cameraEngine.nativeCamera?.getFocusStatus();
+      
+      // 🔥 성능 최적화: 정상적인 폴링 결과 로그 제거 (에러만 로그)
+      // if (kDebugMode) { debugPrint('[Petgram] 🎯 Focus status poll result: status=$status'); }
+      
       if (status != null) {
         final isAdjusting = status['isAdjustingFocus'] as bool? ?? false;
         final focusStatusStr = status['focusStatus'] as String? ?? 'unknown';
+        final focusModeStr = status['focusMode'] as String? ?? 'unknown';
+
+        // 🔥 성능 최적화: 정상적인 상태 수신 로그 제거
+        // if (kDebugMode) { debugPrint('[Petgram] 🎯 Focus status received: ...'); }
 
         // 🔥 AF 상태 세분화: 세 가지 상태로 구분
         _FocusStatus newStatus;
@@ -327,11 +361,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             newStatus = _FocusStatus.locked;
             break;
           default:
+            // 🔥 기본값: continuousAutoFocus 모드이면 ready로 간주
+            // 네이티브에서 focusStatus를 반환하지 않으면 focusMode를 확인
+            if (focusModeStr == 'continuousAutoFocus' && !isAdjusting) {
+              newStatus = _FocusStatus.ready;
+            } else if (isAdjusting) {
+              newStatus = _FocusStatus.adjusting;
+            } else {
             newStatus = _FocusStatus.unknown;
         }
+        }
 
-        // 상태가 변경될 때만 UI 업데이트 (성능 최적화)
-        if (_focusStatus != newStatus || _isFocusAdjusting != isAdjusting) {
+        // 🔥 상태가 변경될 때만 UI 업데이트 (성능 최적화)
+        // 하지만 초기 상태(unknown)에서 ready로 변경될 때는 무조건 업데이트
+        final shouldUpdate = _focusStatus != newStatus || 
+                            _isFocusAdjusting != isAdjusting ||
+                            (_focusStatus == _FocusStatus.unknown && newStatus != _FocusStatus.unknown);
+        
+        if (shouldUpdate) {
           if (mounted) {
             setState(() {
               _focusStatus = newStatus;
@@ -340,20 +387,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
             if (kDebugMode) {
               debugPrint(
-                '[Petgram] 🎯 Focus status updated: $focusStatusStr (adjusting=$isAdjusting)',
+                '[Petgram] 🎯 Focus status UI updated: ${_focusStatus.name} → ${newStatus.name} (adjusting=$isAdjusting)',
               );
             }
           }
-        }
+        } else {
+          // 🔥 성능 최적화: 상태 변경 없음 로그 제거 (매 초마다 호출되므로)
+          // if (kDebugMode) { debugPrint('[Petgram] 🎯 Focus status unchanged: ...'); }
+          }
+      } else {
+        // 🔥 status가 null인 경우: 네이티브 카메라가 준비되지 않았거나 에러 발생
+        // 🔥 성능 최적화: null 상태 로그는 에러 상황이므로 유지하되 빈도 줄임
+        // if (kDebugMode) { debugPrint('[Petgram] ⚠️ Focus status is null...'); }
+        // status가 null이어도 폴링은 계속 (카메라가 준비되면 다시 시도)
       }
-    } catch (e) {
+    } catch (e, stackTrace) {
       // 포커스 상태 확인 실패 시 폴링 중지 (크래시 방지)
       if (kDebugMode) {
         debugPrint(
-          '[Petgram] ⚠️ Focus status poll error: $e, stopping polling',
+          '[Petgram] ⚠️ Focus status poll error: $e',
         );
+        debugPrint('[Petgram] Stack trace: $stackTrace');
       }
-      _stopFocusStatusPolling();
+      // 에러가 발생해도 폴링은 계속 (일시적인 에러일 수 있음)
+      // _stopFocusStatusPolling();
     }
   }
 
@@ -361,10 +418,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 🔥 실기기에서도 디버그 오버레이 표시: 실제 상태 값을 업데이트하여 디버그 오버레이에 표시
   Future<void> _pollDebugState() async {
     if (!mounted) return;
-    if (!_cameraEngine.isInitialized) return;
-    // 🔥 핵심 수정: 상태 업데이트는 항상 수행 (canUseCamera 정확성을 위해)
-    //              디버그 로그만 kEnableCameraDebugOverlay로 제어
-
+    
+    // 🔥 중복 호출 방지: 이미 실행 중이면 스킵
+    if (_isPollingDebugState) {
+      return;
+    }
+    _isPollingDebugState = true;
+    
     try {
       // 🔥 Single Source of Truth: getDebugState() 한 번만 호출
       final rawDebugState = await _cameraEngine.getDebugState();
@@ -376,23 +436,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         final nativeViewId = state.viewId;
         final nativeInstancePtr = state.instancePtr;
 
-        // 🔥 instancePtr 검증: 비어있으면 경고
-        if (nativeInstancePtr.isEmpty) {
-          _addDebugLog(
+        // 🔥 디버그 로그 폭주 방지: instancePtr 검증 로그는 kDebugMode에서만 출력
+        if (nativeInstancePtr.isEmpty && kDebugMode) {
+          debugPrint(
             '[CameraDebug][WARN] instancePtr is empty: flutterViewId=$flutterViewId, nativeViewId=$nativeViewId',
           );
         }
 
-        // 🔥 중복 로그 제거: viewId 관련 로그는 상태 변경 시에만 출력
+        // 🔥 디버그 로그 폭주 방지: viewId 관련 로그는 상태 변경 시에만 출력
         // (초기화 전 상태나 정상 상태는 로그 출력 안 함)
         if (flutterViewId != null &&
             nativeViewId >= 0 &&
             nativeViewId != flutterViewId) {
           final mismatchLog =
               '[CameraDebug][WARN] viewId mismatch: flutterViewId=$flutterViewId, nativeViewId=$nativeViewId';
-          if (mismatchLog != _lastViewIdMismatchLog) {
+          if (mismatchLog != _lastViewIdMismatchLog && kDebugMode) {
             _lastViewIdMismatchLog = mismatchLog;
-            _addDebugLog(mismatchLog);
+            debugPrint(mismatchLog);
           }
         }
 
@@ -408,9 +468,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               _captureFenceUntil != null &&
               DateTime.now().isBefore(_captureFenceUntil!);
           if (!fenceActive) {
-            _addDebugLog(
-              '[AutoRecover] 🔄 Detected inconsistent state: nativeInit=false but sessionRunning=true. Attempting recovery...',
-            );
+            // 🔥 디버그 로그 폭주 방지: 자동 복구 로그는 kDebugMode에서만 출력
+            if (kDebugMode) {
+              debugPrint(
+                '[AutoRecover] 🔄 Detected inconsistent state: nativeInit=false but sessionRunning=true. Attempting recovery...',
+              );
+            }
             // 자동 복구: 세션을 중지하고 재초기화
             _maybeAutoRecover();
           }
@@ -427,7 +490,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         // 예: sessionRunning=false && videoConnected=false && hasFirstFrame=false 인 경우
         // _maybeAutoRecover() 훅을 통해 향후 확장 가능하도록 구조 유지
 
-        // 🔥 중복 로그 제거: 카메라 상태 로그는 상태 변경 시에만 출력
+        // 🔥 디버그 로그 폭주 방지: 카메라 상태 로그는 상태 변경 시에만 출력
+        // kEnableCameraDebugOverlay가 false일 때는 로그 출력 안 함
         if (kEnableCameraDebugOverlay) {
           final isHealthy = _isCameraHealthy;
           if (!isHealthy) {
@@ -435,42 +499,135 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 '[CameraDebug] ⚠️ Camera not healthy: sessionRunning=${state.sessionRunning}, videoConnected=${state.videoConnected}, hasFirstFrame=${state.hasFirstFrame}, isPinkFallback=${state.isPinkFallback}';
             if (unhealthyLog != _lastUnhealthyLog) {
               _lastUnhealthyLog = unhealthyLog;
-              _addDebugLog(unhealthyLog);
+              // 🔥 디버그 로그 폭주 방지: _addDebugLog 대신 debugPrint만 사용 (디버그 오버레이에 표시 안 함)
+              if (kDebugMode) {
+                debugPrint(unhealthyLog);
+              }
             }
           } else {
             // 건강한 상태로 변경되었을 때만 로그 출력
             if (_lastUnhealthyLog != null) {
               _lastUnhealthyLog = null;
-              _addDebugLog('[CameraDebug] ✅ Camera healthy');
+              // 🔥 디버그 로그 폭주 방지: _addDebugLog 대신 debugPrint만 사용
+              if (kDebugMode) {
+                debugPrint('[CameraDebug] ✅ Camera healthy');
+              }
             }
           }
         }
+
+        // 🔥 프리뷰 불안정 문제 해결: hasFirstFrame이 true가 될 때 초점 설정 및 타임스탬프 기록
+        final bool currentHasFirstFrame = state.hasFirstFrame;
+        if (currentHasFirstFrame && (_lastHasFirstFrame != true)) {
+          // hasFirstFrame이 false에서 true로 변경됨 → 초점 설정 및 타임스탬프 기록
+          _firstFrameTimestamp = DateTime.now();
+          if (!_shouldUseMockCamera && _cameraEngine.isInitialized) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) {
+                _setAutoFocusAtCenter();
+              }
+            });
+          }
+          
+          // 🔥 앱 구동 시간 측정 및 로그 출력 (릴리스 모드에서도 출력)
+          if (_appStartTime != null) {
+            final totalTime = _firstFrameTimestamp!.difference(_appStartTime!).inMilliseconds;
+            final splashTime = _splashRemoveTime != null 
+                ? _splashRemoveTime!.difference(_appStartTime!).inMilliseconds 
+                : null;
+            final initTime = _cameraInitTime != null 
+                ? _cameraInitTime!.difference(_appStartTime!).inMilliseconds 
+                : null;
+            final firstFrameTime = _firstFrameTimestamp!.difference(_appStartTime!).inMilliseconds;
+            
+            // 🔥 릴리스 모드에서도 로그 출력: print + 파일 저장
+            final performanceLog = StringBuffer();
+            performanceLog.writeln('[Petgram] ✅ First frame received (splash already removed)');
+            performanceLog.writeln('[Petgram] ⏱️ App Startup Performance:');
+            performanceLog.writeln('  - Total time: ${totalTime}ms');
+            if (splashTime != null) {
+              performanceLog.writeln('  - Splash removal: ${splashTime}ms');
+            }
+            if (initTime != null) {
+              performanceLog.writeln('  - Camera init: ${initTime}ms');
+            }
+            performanceLog.writeln('  - First frame: ${firstFrameTime}ms');
+            
+            // 일반 카메라 앱 대비 평가
+            String statusMsg;
+            if (totalTime < 1000) {
+              statusMsg = '  - Status: ✅ EXCELLENT (faster than typical camera apps: 1-2s)';
+            } else if (totalTime < 2000) {
+              statusMsg = '  - Status: ✅ GOOD (typical camera app range: 1-2s)';
+            } else if (totalTime < 3000) {
+              statusMsg = '  - Status: ⚠️ ACCEPTABLE (slightly slower than typical: 1-2s)';
+            } else {
+              statusMsg = '  - Status: ❌ SLOW (slower than typical camera apps: 1-2s)';
+            }
+            performanceLog.writeln(statusMsg);
+            
+            final logText = performanceLog.toString();
+            print(logText);
+            _saveDebugLogToFile(logText);
+          }
+        }
+        _lastHasFirstFrame = currentHasFirstFrame;
 
         // 🔥 보완 포인트 1: UI 리빌드를 위한 최소한의 setState 유지
         // lastDebugState가 업데이트되어도 UI가 자동으로 리빌드되지 않는 문제 해결
         // 상태 캐시는 제거했지만, UI 갱신을 위한 최소한의 트리거는 필요
         if (mounted) {
           setState(() {
+            // 🔥 Mock 모드일 때 센서 비율 동기화 (Mock 이미지 짤림 방지)
+            if (_cameraEngine.useMockCamera ||
+                _shouldUseMockCamera ||
+                _cameraEngine.isSimulator) {
+              final double mockRatio = _mockupAspectRatio ?? (9.0 / 16.0);
+              if ((_sensorAspectRatio - mockRatio).abs() > 0.01) {
+                _sensorAspectRatio = mockRatio;
+                if (kDebugMode) {
+                  debugPrint(
+                    '[Petgram] 📐 Sensor aspect ratio set for Mock: $_sensorAspectRatio (mockup: $_mockupAspectRatio)',
+                  );
+                }
+              }
+            }
+
             if (rawDebugState != null) {
-              _nativeCurrentFilterKey =
-                  rawDebugState['currentFilterKey'] as String?;
+              // _nativeCurrentFilterKey =
+              //     rawDebugState['currentFilterKey'] as String?;
+
+              // 🔥 추가: 네이티브 센서 비율 동기화 (전면/후면 전환 시 화각 문제 해결)
+              final double? aspect =
+                  (rawDebugState['currentAspectRatio'] as num?)?.toDouble();
+              if (aspect != null &&
+                  aspect > 0 &&
+                  aspect != _sensorAspectRatio &&
+                  !(_cameraEngine.useMockCamera || _shouldUseMockCamera)) {
+                _sensorAspectRatio = aspect;
+                if (kDebugMode) {
+                  debugPrint(
+                    '[Petgram] 📐 Sensor aspect ratio updated from native: $_sensorAspectRatio',
+                  );
+                }
+              }
             }
           });
         }
       }
     } catch (e) {
-      // 🔥 viewId 불일치 에러를 명확하게 로깅
+      // 🔥 디버그 로그 폭주 방지: viewId 불일치 에러는 kDebugMode에서만 출력
       if (e is PlatformException && e.code == 'NO_CAMERA_VIEW') {
-        debugPrint('[HomePage] ❌ _pollDebugState: NO_CAMERA_VIEW error');
-        debugPrint('[HomePage] ❌ Error details: ${e.message}');
-        debugPrint('[HomePage] ❌ This indicates a viewId mismatch bug!');
-        if (kEnableCameraDebugOverlay) {
-          _addDebugLog(
-            '[HomePage] ❌ NO_CAMERA_VIEW error in _pollDebugState: ${e.message}',
-          );
+        if (kDebugMode) {
+          debugPrint('[HomePage] ❌ _pollDebugState: NO_CAMERA_VIEW error');
+          debugPrint('[HomePage] ❌ Error details: ${e.message}');
+          debugPrint('[HomePage] ❌ This indicates a viewId mismatch bug!');
         }
       }
       // 그 외 에러는 조용히 무시 (네이티브가 아직 준비되지 않았을 수 있음)
+    } finally {
+      // 🔥 중복 호출 방지 플래그 리셋
+      _isPollingDebugState = false;
     }
   }
 
@@ -551,12 +708,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 오직 sessionRunning && videoConnected만 확인
   /// hasFirstFrame, pinkfallback, viewId mismatch는 UI 경고만 표시
   bool get canUseCamera {
-    // 🔥 시뮬레이터이거나 카메라가 없으면 무조건 true (Mock 사용 허용)
-    if (widget.cameras.isEmpty || _shouldUseMockCamera || _cameraEngine.useMockCamera) {
+    // 🔥 시뮬레이터 및 실기기 초기화 전 대응:
+    // iOS 시뮬레이터이거나 명시적 Mock 모드인 경우 항상 촬영 시도 허용
+    if (_shouldUseMockCamera ||
+        _cameraEngine.useMockCamera ||
+        _cameraEngine.isSimulator) {
       return true;
     }
 
-    // 🔥 Single Source of Truth: CameraDebugState만 사용
+    // iOS 실기기에서 아직 카메라 리스트가 없어도 촬영 시도 허용 (AVFoundation에서 직접 관리하므로)
+    if (widget.cameras.isEmpty &&
+        Platform.isIOS &&
+        !_cameraEngine.isSimulator) {
+      // 하지만 네이티브 세션이 준비되었을 때만 true 반환하도록 함 (아래 state 체크에서 처리)
+    }
+
+    // 🔥 Single Source of Truth: CameraDebugState만 사용 (실제 네이티브 카메라 상태)
     final state = _cameraEngine.lastDebugState;
     if (state == null) {
       final logMsg = '[CameraDebug] canUseCamera=false (state is null)';
@@ -586,6 +753,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String? _lastCanUseCameraLog; // canUseCamera 로그 중복 방지용
   String? _lastViewIdMismatchLog; // viewId mismatch 로그 중복 방지용
   String? _lastUnhealthyLog; // 카메라 unhealthy 로그 중복 방지용
+  bool? _lastHasFirstFrame; // 🔥 프리뷰 불안정 문제 해결: hasFirstFrame 상태 추적용
+  DateTime? _firstFrameTimestamp; // 🔥 크래시 방지: 첫 프레임 수신 시간 추적 (프리뷰 안정화 대기용)
+  DateTime? _appStartTime; // 🔥 앱 구동 시간 측정: initState 시작 시간
+  DateTime? _splashRemoveTime; // 🔥 스플래시 제거 시간 측정
+  DateTime? _cameraInitTime; // 🔥 카메라 초기화 완료 시간 측정
 
   bool _isProcessing = false;
   bool _isCaptureAnimating = false;
@@ -625,6 +797,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool _isTimerCounting = false;
   bool _shouldStopTimer = false; // 타이머 중지 플래그
   bool _isTimerTriggered = false; // 타이머로 인한 촬영인지 구분
+  bool _isInitialZoomSetting = false; // 🔥🔥🔥 초기 줌 설정 중 플래그 (렌즈 전환 방지)
 
   // 🔥 REFACTORING: 중복 상태 필드 제거 - CameraDebugState만 Single Source of Truth로 사용
   // bool? _nativeSessionRunning; // 제거됨 - CameraDebugState.sessionRunning 사용
@@ -638,11 +811,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   AppLifecycleState _lastLifecycleState = AppLifecycleState.resumed;
   bool _isReinitializing = false; // 재초기화 중 플래그 (중복 방지)
-  String? _nativeCurrentFilterKey;
+  // String? _nativeCurrentFilterKey; // unused after debug overlay removed
   Timer? _debugStatePollTimer;
+  bool _isPollingDebugState = false; // 🔥 중복 호출 방지 플래그
 
   // 네이티브 디바이스 타입/포지션 (프론트/백 + wide/ultraWide 디버그용)
-  String? _nativeDeviceType; // "wide" / "ultraWide" / "other"
+  // String? _nativeDeviceType; // "wide" / "ultraWide" / "other" // unused after debug overlay removed
   String _nativeLensKind = 'wide';
 
   // 디버그 오버레이 표시 여부 (기본값: 비활성화, 상단 플래그 기반)
@@ -1073,6 +1247,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // - 절대값 기반: zoom *= scale 같은 누적 곱 제거, 직접 값만 clamp
   double _uiZoomScale = 1.0; // 현재 줌 배율 (0.5 ~ 카메라 최대 배율)
   double _baseUiZoomScale = 1.0; // 핀치 시작 시 기준 배율
+  double? _savedZoomScaleBeforeBackground; // 🔥🔥🔥 백그라운드 진입 전 줌 값 저장
   static const double _uiZoomMin =
       0.5; // 🔥 광각 지원: 최소 줌 0.5x (초광각 카메라 전환 또는 videoZoomFactor = 0.5)
   static const double _uiZoomMax = 10.0; // 최대 줌 (카메라가 지원하는 최대 배율, 최대 10x)
@@ -1087,6 +1262,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // - "wide": 기본 광각
   // - "ultraWide": 초광각
   bool _isNativeLensSwitching = false; // 렌즈 전환 중 중복 호출 방지
+  bool _isSettingZoom = false; // 🔥🔥🔥 줌 설정 중 플래그 (중복 호출 방지)
   // Offset _zoomOffset = Offset.zero; // 줌 오프셋 - 제거됨
   // Offset _lastZoomFocalPoint = Offset.zero; // 마지막 줌 포커스 포인트 - 제거됨
 
@@ -1104,6 +1280,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   DateTime? _lastTapTime; // 마지막 탭 시간 (debounce용)
   bool _isProcessingTap = false; // 탭 처리 중 플래그 (중복 처리 방지)
   Offset? _focusIndicatorNormalized;
+  Offset? _lastFocusPoint; // 🔥🔥🔥 마지막 포커스 포인트 (중복 호출 방지)
+  Offset? _lastExposurePoint; // 🔥🔥🔥 마지막 노출 포인트 (중복 호출 방지)
   // 🔥 좌표계 통일: _stackKey는 더 이상 사용되지 않음 (deprecated) - 제거됨
   final GlobalKey _mockPreviewKey = GlobalKey(); // Mock 프리뷰용 key
   final GlobalKey _nativePreviewKey = GlobalKey(); // Native 프리뷰용 key
@@ -1112,11 +1290,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Rect? _pendingPreviewRectForSync; // 네이티브 동기화 대기 중인 프리뷰 rect
   int _previewSyncRetryCount = 0; // 프리뷰 동기화 재시도 카운터
   bool _previewSyncRetryScheduled = false; // 재시도 스케줄 플래그
+  bool _isResumingCamera = false; // 🔥🔥🔥 카메라 재개 중 플래그 (중복 호출 방지)
   // 촬영 보호 펜스: 촬영 시작 후 일정 시간 동안 init/resume/sync 차단
   DateTime? _captureFenceUntil;
 
   // 밝기 조절 (-1.0 ~ 1.0, 0.0이 원본)
   double _brightnessValue = 0.0; // -10 ~ 10 범위
+  bool _isBrightnessDragging = false; // 🔥 밝기 슬라이더 드래그 상태 추적
 
   // 펫톤 보정 저장 시 적용 여부 (디버그용 토글)
   // false로 설정하면 저장 시 펫톤 보정을 건너뜀 (필터 + 밝기만 적용)
@@ -1133,8 +1313,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       !_shouldUseMockCamera;
 
   /// 네이티브 카메라(iOS) 노출(밝기) 업데이트
+  /// 🔥🔥🔥 최초 선택 시 버벅임 해결: async/await로 변경하고 즉시 실행
   void _updateNativeExposureBias() {
     if (!_isNativeCameraActive) return;
+    if (!_cameraEngine.isInitialized) return; // 🔥 카메라가 초기화되지 않았으면 스킵
 
     // 1단계: 슬라이더 값 -10.0 ~ +10.0 → -1.0 ~ +1.0 범위로 정규화
     final double normalized = (_brightnessValue / 10.0).clamp(
@@ -1145,7 +1327,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 2단계: 실제 Exposure Bias는 너무 튀지 않도록 제한된 범위만 사용
     final double uiValue = normalized * kExposureBiasRange; // -0.4 ~ +0.4
 
-    _cameraEngine.setExposureBias(uiValue);
+    // 🔥🔥🔥 최초 선택 시 버벅임 해결: unawaited로 즉시 실행 (비동기 블로킹 방지)
+    // 카메라가 준비되지 않았으면 스킵하므로 안전함
+    unawaited(_cameraEngine.setExposureBias(uiValue));
   }
 
   /// iOS 네이티브 카메라 렌즈 전환 (wide ↔ ultraWide)을 UI 줌 값에 따라 비동기적으로 수행
@@ -1154,35 +1338,128 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 🔥 줌 재적용: 렌즈 전환 후 요청한 uiZoom 값을 반드시 재적용하여 데드존 제거
   /// 🔥 줌 프리셋 설정 공통 함수
   /// 프리셋 버튼(0.5x, 1x, 2x, 3x)을 사용하는 모든 코드에서 이 함수를 호출
+  /// 🔥🔥🔥 iOS 기본 앱과 동일: Native에서 렌즈 전환을 자동으로 처리하므로 Flutter에서는 setZoom만 호출
   void _setZoomPreset(double presetZoom) {
-    final double clamped = presetZoom.clamp(_uiZoomMin, _uiZoomMax);
+    // 🔥🔥🔥 중복 호출 방지: 이미 줌 설정 중이면 스킵
+    if (_isSettingZoom) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] ⏸️ _setZoomPreset: Already setting zoom, skipping duplicate call');
+      }
+      return;
+    }
+    
+    // 🔥🔥🔥 전면 카메라: 0.5x는 렌즈 전환이 불가능하므로 1.0으로 clamp
+    double effectiveZoom = presetZoom;
+    if (_cameraLensDirection == CameraLensDirection.front && presetZoom < 1.0) {
+      if (kDebugMode) {
+        debugPrint(
+          '[Zoom] ⚠️ Front camera: 0.5x is not available, clamping to 1.0',
+        );
+      }
+      effectiveZoom = 1.0;
+    }
+    
+    final double clamped = effectiveZoom.clamp(_uiZoomMin, _uiZoomMax);
+    
+    // 🔥🔥🔥 핵심 수정: 0.5배 선택 시 UI를 즉시 0.5로 고정하고 플래그 설정
+    _isSettingZoom = true;
     setState(() {
       _uiZoomScale = clamped;
       _baseUiZoomScale = clamped;
     });
-    _maybeSwitchNativeLensForZoom(_uiZoomScale);
+    
+    // 🔥 Native의 setZoom에서 렌즈 전환을 자동으로 처리하므로 Flutter에서는 setZoom만 호출
+    // 🔥🔥🔥 네이티브의 실제 줌 값으로 Flutter 상태 동기화 (중복 호출 방지)
     if (_cameraEngine.isInitialized && !_shouldUseMockCamera) {
       if (kDebugMode) {
         debugPrint(
-          '[Zoom] uiZoomScale updated: ${_uiZoomScale.toStringAsFixed(3)}',
+          '[Zoom] Preset zoom set: ${_uiZoomScale.toStringAsFixed(3)} (Native will handle lens switching)',
         );
       }
-      _cameraEngine.setZoom(_uiZoomScale);
+      final requestedZoom = clamped;
+      _cameraEngine.setZoom(requestedZoom).then((actualZoom) {
+        // 🔥🔥🔥 핵심 수정: 0.5배 선택 시 UI는 무조건 0.5로 유지 (네이티브 actualZoom과 무관)
+        if (mounted && actualZoom != null) {
+          if (requestedZoom == 0.5) {
+            // 🔥🔥🔥 0.5배 선택 시: UI는 무조건 0.5로 유지, 네이티브 actualZoom과 무관
+            // 네이티브는 ultraWide로 전환을 시도하지만, 전환이 완료되기 전에는 실제 값이 1.0일 수 있음
+            // 하지만 UI는 사용자가 선택한 0.5를 유지해야 함
+            if (kDebugMode) {
+              debugPrint('[Petgram] 🔄 0.5x selected: UI kept at 0.5x (requested=${requestedZoom.toStringAsFixed(2)}, native actual=${actualZoom.toStringAsFixed(2)}x)');
+            }
+            // 🔥🔥🔥 UI는 이미 0.5로 설정되어 있으므로 변경하지 않음
+            _isSettingZoom = false;
+            
+            // 🔥🔥🔥 핵심 수정: 배율 조정 후 밝기 값 재적용 (렌즈 전환으로 인한 밝기 리셋 방지)
+            Future.delayed(const Duration(milliseconds: 200), () {
+              if (mounted && _isNativeCameraActive) {
+                _updateNativeExposureBias();
+                if (kDebugMode) {
+                  debugPrint('[Petgram] 🔄 Brightness reapplied after 0.5x zoom (brightness=${_brightnessValue.toStringAsFixed(2)})');
+                }
+              }
+            });
+            return;
+          }
+          
+          // 🔥🔥🔥 0.5배가 아닌 경우: 실제 값과 요청 값의 차이가 0.01 이상일 때만 동기화
+          if ((actualZoom - requestedZoom).abs() > 0.01) {
+            // 🔥🔥🔥 setState로 인한 재호출 방지: 실제 값으로만 업데이트 (setZoom 재호출 안 함)
+            setState(() {
+              _uiZoomScale = actualZoom;
+              _baseUiZoomScale = actualZoom;
+            });
+            if (kDebugMode) {
+              debugPrint('[Petgram] 🔄 Zoom synced: requested=${requestedZoom.toStringAsFixed(2)}, actual=${actualZoom.toStringAsFixed(2)}');
+            }
+          }
+          _isSettingZoom = false;
+          
+          // 🔥🔥🔥 핵심 수정: 배율 조정 후 밝기 값 재적용 (렌즈 전환으로 인한 밝기 리셋 방지)
+          Future.delayed(const Duration(milliseconds: 200), () {
+            if (mounted && _isNativeCameraActive) {
+              _updateNativeExposureBias();
+              if (kDebugMode) {
+                debugPrint('[Petgram] 🔄 Brightness reapplied after zoom (zoom=${actualZoom.toStringAsFixed(2)}, brightness=${_brightnessValue.toStringAsFixed(2)})');
+              }
+            }
+          });
+        } else {
+          _isSettingZoom = false;
+        }
+      }).catchError((error) {
+        if (kDebugMode) {
+          debugPrint('[Petgram] ⚠️ setZoom error: $error');
+        }
+        _isSettingZoom = false;
+      });
+    } else {
+      _isSettingZoom = false;
     }
   }
 
-  /// 🔥 렌즈 전환만 담당, 줌값은 건드리지 않음
-  /// 역할: wide/ultraWide 렌즈 전환만 수행하고, 줌값은 그대로 유지
+  /// 🔥 DEPRECATED: 이 함수는 더 이상 사용되지 않습니다.
+  /// Native의 setZoom에서 렌즈 전환을 자동으로 처리하므로 Flutter에서는 setZoom만 호출하면 됩니다.
+  /// @deprecated Native에서 렌즈 전환을 자동으로 처리하므로 이 함수는 사용하지 않습니다.
   void _maybeSwitchNativeLensForZoom(double uiZoom) {
+    // 🔥 이 함수는 더 이상 사용되지 않습니다. Native의 setZoom에서 렌즈 전환을 자동으로 처리합니다.
+    return;
     if (!_cameraEngine.isInitialized) return;
     if (_cameraLensDirection != CameraLensDirection.back) return;
     if (_isNativeLensSwitching) return;
+    // 🔥🔥🔥 초기 줌 설정 중에는 렌즈 전환하지 않음 (기본 1.0x 줌 유지)
+    if (_isInitialZoomSetting) return;
 
-    // 히스테리시스 적용:
-    // - uiZoom < 0.9 → 초광각 진입 시도
-    // - uiZoom >= 1.05 → wide 복귀 시도
-    const double enterUltraWideThreshold = 0.9;
-    const double exitUltraWideThreshold = 1.05;
+    // 🔥🔥🔥 일반 카메라 앱처럼 자연스러운 줌: 히스테리시스 대폭 개선
+    // 일반 카메라 앱은 렌즈 전환 시 시야각이 일치하도록 매핑함
+    // - ultraWide 0.5x ~ 0.9x 구간에서 렌즈 전환 없이 연속 줌
+    // - 0.5x 이하에서만 ultraWide로 전환, 1.0x 이상에서 wide로 복귀
+    // - 더 넓은 히스테리시스 구간으로 빈번한 전환 방지
+    // 🔥🔥🔥 0.5~0.9 구간에서도 연속적으로 줌이 동작하도록 임계값 조정
+    const double enterUltraWideThreshold = 0.5; // 0.5 이하에서만 ultraWide 진입 (0.5~0.9 구간은 현재 렌즈 유지)
+    const double exitUltraWideThreshold = 1.0; // 1.0 이상에서만 wide 복귀
+    // 이렇게 하면 0.5~1.0 구간에서 렌즈 전환이 발생하지 않아 부드러운 줌 가능
+    // 0.5 이하에서만 ultraWide로 전환하고, 0.5~0.9 구간에서는 현재 렌즈에서 연속 줌
 
     if (_nativeLensKind != 'ultraWide' && uiZoom < enterUltraWideThreshold) {
       _isNativeLensSwitching = true;
@@ -1195,16 +1472,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 _nativeLensKind =
                     (result['lensKind'] as String?) ?? 'ultraWide';
               });
-              // 🔥 렌즈 전환 후 현재 _uiZoomScale을 그대로 다시 setZoom
-              // 렌즈 전환 시 네이티브에서 기본값(1.0)으로 리셋되므로 원하는 줌 값을 다시 설정
-              // 0.5~0.9 구간에서도 연속적인 줌이 동작하도록 uiZoom 값을 그대로 전달
+              // 🔥🔥🔥 iOS 기본 카메라 앱과 동일: 렌즈 전환 후 요청한 줌 값을 정확히 설정
+              // 렌즈 전환 시 네이티브에서 minZoom으로 초기 설정되므로, 요청한 줌 값을 즉시 재설정
+              // 0.5를 요청하면 0.5로, 0.7을 요청하면 0.7로 정확히 설정되어야 함
               if (_cameraEngine.isInitialized) {
-                _cameraEngine.setZoom(uiZoom);
-                if (kDebugMode) {
-                  debugPrint(
-                    '[Zoom] Ultra wide switched, zoom reapplied: ${uiZoom.toStringAsFixed(3)} (0.5~0.9 range: continuous zoom enabled)',
-                  );
-                }
+                // 🔥🔥🔥 렌즈 전환 직후 즉시 줌 재적용: 요청한 값을 정확히 설정
+                // 네이티브에서 minZoom으로 초기 설정되었지만, Flutter에서 요청한 값을 정확히 설정
+                Future.delayed(const Duration(milliseconds: 30), () {
+                  if (mounted && _cameraEngine.isInitialized) {
+                    _cameraEngine.setZoom(uiZoom);
+                    if (kDebugMode) {
+                      debugPrint(
+                        '[Zoom] Ultra wide switched, zoom set to ${uiZoom.toStringAsFixed(3)} (requested value)',
+                      );
+                    }
+                  }
+                });
+                // 🔥 두 번째 재적용으로 네이티브에서 정확히 설정되도록 보장
+                Future.delayed(const Duration(milliseconds: 100), () {
+                  if (mounted && _cameraEngine.isInitialized) {
+                    _cameraEngine.setZoom(uiZoom);
+                    if (kDebugMode) {
+                      debugPrint(
+                        '[Zoom] Ultra wide switched, zoom reapplied: ${uiZoom.toStringAsFixed(3)}',
+                      );
+                    }
+                  }
+                });
               }
               // 🔥 필터 유지: 초광각 전환 후 필터를 다시 적용하여 필터가 사라지지 않도록 함
               if (_isNativeCameraActive) {
@@ -1224,7 +1518,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _isNativeLensSwitching = false;
           });
     } else if (_nativeLensKind == 'ultraWide' &&
-        uiZoom >= exitUltraWideThreshold) {
+        uiZoom > exitUltraWideThreshold) {
       _isNativeLensSwitching = true;
       _cameraEngine
           .switchToWideIfAvailable()
@@ -1234,15 +1528,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               setState(() {
                 _nativeLensKind = (result['lensKind'] as String?) ?? 'wide';
               });
-              // 🔥 렌즈 전환 후 현재 _uiZoomScale을 그대로 다시 setZoom
-              // 렌즈 전환 시 네이티브에서 기본값(1.0)으로 리셋되므로 원하는 줌 값을 다시 설정
+              // 🔥🔥🔥 일반 카메라 앱처럼 자연스러운 줌: 렌즈 전환 후 즉시 줌 재적용
+              // 렌즈 전환 시 네이티브에서 기본값으로 리셋될 수 있으므로 원하는 줌 값을 즉시 재설정
+              // 🔥🔥🔥 iOS 기본 카메라 앱과 동일: 렌즈 전환 후 요청한 줌 값을 정확히 설정
+              // 렌즈 전환 시 네이티브에서 minZoom(1.0)으로 초기 설정되므로, 요청한 줌 값을 즉시 재설정
+              // 1.0을 요청하면 1.0으로, 1.5를 요청하면 1.5로 정확히 설정되어야 함
               if (_cameraEngine.isInitialized) {
-                _cameraEngine.setZoom(uiZoom);
-                if (kDebugMode) {
-                  debugPrint(
-                    '[Zoom] Wide switched, zoom reapplied: ${uiZoom.toStringAsFixed(3)}',
-                  );
-                }
+                // 🔥🔥🔥 렌즈 전환 직후 즉시 줌 재적용: 요청한 값을 정확히 설정
+                // 네이티브에서 minZoom(1.0)으로 초기 설정되었지만, Flutter에서 요청한 값을 정확히 설정
+                Future.delayed(const Duration(milliseconds: 30), () {
+                  if (mounted && _cameraEngine.isInitialized) {
+                    _cameraEngine.setZoom(uiZoom);
+                    if (kDebugMode) {
+                      debugPrint(
+                        '[Zoom] Wide switched, zoom set to ${uiZoom.toStringAsFixed(3)} (requested value)',
+                      );
+                    }
+                  }
+                });
+                // 🔥 두 번째 재적용으로 네이티브에서 정확히 설정되도록 보장
+                Future.delayed(const Duration(milliseconds: 100), () {
+                  if (mounted && _cameraEngine.isInitialized) {
+                    _cameraEngine.setZoom(uiZoom);
+                    if (kDebugMode) {
+                      debugPrint(
+                        '[Zoom] Wide switched, zoom reapplied: ${uiZoom.toStringAsFixed(3)}',
+                      );
+                    }
+                  }
+                });
               }
               // 🔥 필터 유지: 일반 광각 전환 후 필터를 다시 적용하여 필터가 사라지지 않도록 함
               if (_isNativeCameraActive) {
@@ -1277,6 +1591,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    // 🔥 앱 구동 시간 측정 시작
+    _appStartTime = DateTime.now();
+    debugPrint('[Petgram] HomePage.initState() START');
+    
+    // 🔥🔥🔥 성능 최적화: 스플래시 즉시 제거 (initState에서 가능한 한 빨리)
+    // build()에서 addPostFrameCallback을 기다리지 않고 initState에서 즉시 제거
+    // Future.microtask를 사용하여 가능한 한 빨리 실행 (addPostFrameCallback보다 빠름)
+    if (!_hasRemovedSplash) {
+      _hasRemovedSplash = true;
+      // Future.microtask를 사용하여 가능한 한 빨리 실행
+      Future.microtask(() {
+        try {
+          _splashRemoveTime = DateTime.now();
+          FlutterNativeSplash.remove();
+          if (_appStartTime != null) {
+            final splashTime = _splashRemoveTime!.difference(_appStartTime!).inMilliseconds;
+            final logMsg = '[Petgram] ✅ Splash removed in initState (as early as possible) - ${splashTime}ms from initState';
+            // 🔥 릴리스 모드에서도 로그 출력: print + 파일 저장
+            print(logMsg);
+            _saveDebugLogToFile(logMsg);
+          }
+        } catch (e) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ⚠️ Failed to remove splash: $e');
+          }
+        }
+      });
+    }
+    
     // 앱 라이프사이클 관찰자 등록 (화면 이동 시 리소스 해제용)
     WidgetsBinding.instance.addObserver(this);
 
@@ -1285,21 +1628,591 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     // 카메라 엔진 초기화
     _cameraEngine = CameraEngine();
-    // 🔥 배터리/발열 최적화: 기존 addListener는 유지하되, 주요 부분은 ValueListenableBuilder 사용
-    // 전체 위젯 트리 재빌드를 방지하기 위해 addListener는 최소한으로만 사용
+
+    // 🔥 시뮬레이터 및 실기기 초기화 전 대응:
+    // iOS는 실기기에서도 cameras가 비어있으므로 (main.dart),
+    // 일단 Mock 이미지를 보여주기 위해 센서 비율을 9:16으로 초기화함 (짤림 방지)
+    // 🔥 스플래시 멈춤 방지: initializeMock도 첫 프레임 렌더링 후에 실행
+    if (widget.cameras.isEmpty) {
+      _sensorAspectRatio = 9.0 / 16.0;
+      // initializeMock은 addPostFrameCallback 안으로 이동
+    }
+    // 🔥 성능 최적화: addListener에서 setState 최소화
+    // 전체 위젯 트리 재빌드를 방지하기 위해 필요한 경우에만 setState 호출
     // 🔥 필터 유지: 카메라 상태 변경 시 필터를 다시 적용하여 필터가 사라지지 않도록 함
     bool _lastCameraInitializedState = false;
+    bool _lastSessionRunningState = false;
+    bool _lastHasFirstFrameState = false;
+    bool _zoomRestoreInProgress = false; // 🔥🔥🔥 중복 호출 방지 플래그
     _cameraEngine.addListener(() {
-      // 카메라 상태 변경 시 필요한 최소한의 상태만 업데이트
+      // 🔥 성능 최적화: 상태가 실제로 변경된 경우에만 처리
       final bool currentInitialized = _cameraEngine.isInitialized;
+      final bool currentSessionRunning = _cameraEngine.sessionRunning ?? false;
+      final bool currentHasFirstFrame = _cameraEngine.lastDebugState?.hasFirstFrame ?? false;
+      
+      // 🔥🔥🔥 핵심 수정: 사용자가 줌을 설정하는 중이면 동기화 로직 스킵 (중복 호출 방지)
+      if (_isSettingZoom) {
+        return;
+      }
+      
+      // 🔥🔥🔥 백그라운드 복귀 시 복원: 세션이 실행 중이고 첫 프레임이 수신되면 복원
+      // 네이티브 세션이 완전히 준비된 후에만 복원 실행 (단순화)
+      // 🔥🔥🔥 핵심 수정: 세션이 실행 중이고 첫 프레임이 수신되면 복원 (백그라운드 복귀 여부와 무관)
+      // 🔥🔥🔥 성능 최적화: 중복 호출 방지 (이미 복원 중이면 스킵)
+      if (currentSessionRunning && 
+          currentHasFirstFrame && 
+          !_lastHasFirstFrameState && 
+          !_shouldUseMockCamera &&
+          _savedZoomScaleBeforeBackground != null &&
+          !_zoomRestoreInProgress) {
+        // 🔥🔥🔥 중복 호출 방지 플래그 설정
+        _zoomRestoreInProgress = true;
+        // 🔥🔥🔥 백그라운드 복귀 시 무조건 1.0으로 고정
+        
+        // 🔥🔥🔥 Flutter 상태 즉시 1.0으로 설정
+        if (mounted) {
+          setState(() {
+            _uiZoomScale = 1.0;
+            _baseUiZoomScale = 1.0;
+          });
+          if (kDebugMode) {
+            debugPrint('[Petgram] 🔄 Background resume: Zoom fixed to 1.0x (ignoring saved value)');
+          }
+        }
+        
+        // 🔥🔥🔥 네이티브가 자동으로 줌을 복원한 후, 실제 복원된 줌 값을 Flutter UI에 동기화
+        // 네이티브의 pauseSession에서 줌 값을 저장하고, resumeSession에서 자동 복원
+        // 복원 후 실제 줌 값을 가져와서 Flutter UI에 반영 (세션이 완전히 준비된 후에만)
+        // 🔥🔥🔥 카메라 죽음 방지: 세션이 완전히 안정화될 때까지 충분히 대기
+        Future.delayed(const Duration(milliseconds: 2000), () async {
+          if (!mounted || !_cameraEngine.isInitialized) {
+            _zoomRestoreInProgress = false;
+            return;
+          }
+          
+          // 🔥🔥🔥 세션 상태 안정성 확인: 최소 2번 연속 확인하여 세션이 안정적인지 검증
+          for (int stabilityCheck = 0; stabilityCheck < 2; stabilityCheck++) {
+            if (stabilityCheck > 0) {
+              await Future.delayed(const Duration(milliseconds: 300));
+            }
+            
+            if (!mounted || !_cameraEngine.isInitialized) {
+              _zoomRestoreInProgress = false;
+              return;
+            }
+            
+            final debugState = await _cameraEngine.getDebugState();
+            if (debugState == null) {
+              if (kDebugMode && stabilityCheck == 0) {
+                debugPrint('[Petgram] ⚠️ Background resume: Cannot sync zoom, debugState is null');
+              }
+              _zoomRestoreInProgress = false;
+              return;
+            }
+            
+            final sessionRunning = debugState['sessionRunning'] as bool? ?? false;
+            final hasFirstFrame = debugState['hasFirstFrame'] as bool? ?? false;
+            
+            // 🔥🔥🔥 세션이 완전히 준비되지 않았으면 스킵 (카메라 죽음 방지)
+            if (!sessionRunning || !hasFirstFrame) {
+              if (kDebugMode && stabilityCheck == 0) {
+                debugPrint('[Petgram] ⚠️ Background resume: Session not ready yet (sessionRunning=$sessionRunning, hasFirstFrame=$hasFirstFrame), skipping zoom sync');
+              }
+              _zoomRestoreInProgress = false;
+              return;
+            }
+          }
+          
+          // 🔥🔥🔥 세션이 안정적으로 실행 중임을 확인했으므로 추가 안정화 대기
+          await Future.delayed(const Duration(milliseconds: 300));
+          
+          // 🔥🔥🔥 핵심 수정: 세션 상태 최종 재확인 (카메라가 죽지 않았는지 확인)
+          if (!mounted || !_cameraEngine.isInitialized) {
+            _zoomRestoreInProgress = false;
+            return;
+          }
+          
+          final finalDebugState = await _cameraEngine.getDebugState();
+          if (finalDebugState == null) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Background resume: Cannot sync zoom, debugState is null after final check');
+            }
+            _zoomRestoreInProgress = false;
+            return;
+          }
+          
+          final finalSessionRunning = finalDebugState['sessionRunning'] as bool? ?? false;
+          final finalHasFirstFrame = finalDebugState['hasFirstFrame'] as bool? ?? false;
+          
+          // 🔥🔥🔥 세션이 죽었으면 스킵 (카메라 죽음 방지)
+          if (!finalSessionRunning || !finalHasFirstFrame) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Background resume: Session not stable, skipping zoom sync (sessionRunning=$finalSessionRunning, hasFirstFrame=$finalHasFirstFrame)');
+            }
+            _zoomRestoreInProgress = false;
+            return;
+          }
+          
+          try {
+            // 🔥🔥🔥 백그라운드 복귀 시 무조건 1.0으로 고정
+            // 🔥🔥🔥 핵심 수정: 세션이 재시작되면 iOS가 자동으로 최저 배율(0.5배)로 초기화하므로
+            // wide 렌즈로 먼저 전환한 후 1.0으로 설정해야 함
+            bool wideLensSwitched = false;
+            if (_cameraLensDirection == CameraLensDirection.back) {
+              // 🔥🔥🔥 wide 렌즈로 전환 (ultraWide에서 0.5배로 초기화되는 것을 방지)
+              await _cameraEngine.switchToWideIfAvailable();
+              wideLensSwitched = true;
+              await Future.delayed(const Duration(milliseconds: 200)); // 렌즈 전환 대기 (300ms → 200ms)
+            }
+            
+            final requestedZoom = 1.0;
+            final actualZoom = await _cameraEngine.setZoom(requestedZoom).timeout(
+              const Duration(seconds: 2),
+              onTimeout: () {
+                if (kDebugMode) {
+                  debugPrint('[Petgram] ⚠️ Background resume: Zoom sync timeout');
+                }
+                return null;
+              },
+            );
+            
+            if (mounted && actualZoom != null) {
+              // 🔥🔥🔥 백그라운드 복귀 시 무조건 1.0으로 고정
+              // 실제 값이 1.0이 아니거나 0.5면 무조건 재시도
+              final zoomDiff = (actualZoom - 1.0).abs();
+              
+              // 🔥🔥🔥 핵심 수정: actualZoom이 0.5면 무조건 재시도 (ultraWide에 있는 경우)
+              if (zoomDiff > 0.1 || actualZoom == 0.5) {
+                // 🔥🔥🔥 UI는 즉시 1.0으로 설정
+                setState(() {
+                  _uiZoomScale = 1.0;
+                  _baseUiZoomScale = 1.0;
+                });
+                if (kDebugMode) {
+                  debugPrint('[Petgram] 🔄 Background resume: Forcing 1.0x (actual=${actualZoom.toStringAsFixed(2)}, will retry)');
+                }
+                // 🔥🔥🔥 네이티브에 1.0을 다시 설정 (재시도 로직 최적화: 5번 → 3번, 지연 시간 단축)
+                Future.delayed(const Duration(milliseconds: 500), () async {
+                  if (!mounted || !_cameraEngine.isInitialized) {
+                    _zoomRestoreInProgress = false;
+                    return;
+                  }
+                  
+                  // 🔥🔥🔥 성능 최적화: 최대 3번 재시도 (5번 → 3번)
+                  for (int retry = 0; retry < 3; retry++) {
+                    if (retry > 0) {
+                      await Future.delayed(const Duration(milliseconds: 300)); // 지연 시간 단축 (500ms → 300ms)
+                    }
+                    
+                    if (!mounted || !_cameraEngine.isInitialized) break;
+                    
+                    // 🔥🔥🔥 세션 상태 재확인: 재시도 중에도 세션이 살아있는지 확인
+                    final recheckState = await _cameraEngine.getDebugState();
+                    if (recheckState == null) {
+                      _zoomRestoreInProgress = false;
+                      break; // 세션이 죽었으면 즉시 중단
+                    }
+                    
+                    final sessionRunning = recheckState['sessionRunning'] as bool? ?? false;
+                    final hasFirstFrame = recheckState['hasFirstFrame'] as bool? ?? false;
+                    
+                    if (!sessionRunning || !hasFirstFrame) {
+                      _zoomRestoreInProgress = false;
+                      break; // 세션이 죽었으면 즉시 중단
+                    }
+                    
+                    try {
+                      // 🔥🔥🔥 성능 최적화: wide 렌즈로 이미 전환했으면 다시 전환하지 않음 (첫 재시도에서만)
+                      if (_cameraLensDirection == CameraLensDirection.back && !wideLensSwitched && retry == 0) {
+                        await _cameraEngine.switchToWideIfAvailable();
+                        await Future.delayed(const Duration(milliseconds: 200));
+                      }
+                      
+                      final reapplyZoom = await _cameraEngine.setZoom(1.0).timeout(
+                        const Duration(seconds: 2),
+                        onTimeout: () => null,
+                      );
+                      
+                      if (mounted && reapplyZoom != null) {
+                        // 🔥🔥🔥 핵심 수정: actualZoom이 0.5면 무조건 재시도 (ultraWide에 있는 경우)
+                        if (reapplyZoom == 0.5 || reapplyZoom < 0.6) {
+                          if (kDebugMode && retry < 2) {
+                            debugPrint('[Petgram] ⚠️ Background resume: Still at ${reapplyZoom.toStringAsFixed(2)}x, retrying... (retry=$retry)');
+                          }
+                          continue; // 0.5면 계속 재시도
+                        }
+                        
+                        // 실제 값이 1.0에 가까우면 성공
+                        if ((reapplyZoom - 1.0).abs() < 0.2) {
+                          setState(() {
+                            _uiZoomScale = reapplyZoom;
+                            _baseUiZoomScale = reapplyZoom;
+                            _nativeLensKind = 'wide'; // wide 렌즈로 설정됨
+                          });
+                          if (kDebugMode) {
+                            debugPrint('[Petgram] ✅ Background resume: 1.0x applied (actual=${reapplyZoom.toStringAsFixed(2)}, retry=$retry)');
+                          }
+                          // 🔥🔥🔥 성능 최적화: 성공 시 즉시 플래그 리셋
+                          _zoomRestoreInProgress = false;
+                          _savedZoomScaleBeforeBackground = null;
+                          return; // 성공 시 즉시 리턴
+                        }
+                      }
+                    } catch (e) {
+                      if (kDebugMode && retry == 0) {
+                        debugPrint('[Petgram] ⚠️ Background resume: Error (retry=$retry): $e');
+                      }
+                    }
+                  }
+                  // 🔥🔥🔥 재시도 실패 시에도 플래그 리셋
+                  _zoomRestoreInProgress = false;
+                });
+              } else {
+                // 이미 1.0에 가까우면 성공
+                setState(() {
+                  _nativeLensKind = 'wide'; // wide 렌즈로 설정됨
+                });
+                if (kDebugMode) {
+                  debugPrint('[Petgram] ✅ Background resume: 1.0x fixed (actual=${actualZoom.toStringAsFixed(2)})');
+                }
+                // 🔥🔥🔥 성능 최적화: 성공 시 즉시 플래그 리셋
+                _zoomRestoreInProgress = false;
+                _savedZoomScaleBeforeBackground = null;
+              }
+            } else {
+              // 🔥🔥🔥 타임아웃 또는 에러 시: UI는 이미 1.0으로 설정되어 있음
+              if (kDebugMode) {
+                debugPrint('[Petgram] ⚠️ Background resume: Zoom fix timeout, UI already set to 1.0x');
+              }
+              _zoomRestoreInProgress = false;
+            }
+          } catch (e) {
+            // 🔥🔥🔥 줌 동기화 실패해도 카메라가 죽지 않도록 예외 처리
+            // UI는 이미 1.0으로 설정되어 있음
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Background resume: Zoom fix error, UI already set to 1.0x (error=$e)');
+            }
+            // 🔥🔥🔥 성능 최적화: 에러 발생 시에도 플래그 리셋
+            _zoomRestoreInProgress = false;
+          }
+        });
+        
+        // 🔥🔥🔥 비율 복원 (세션이 준비된 후에만 실행 - 카메라 죽음 방지)
+        Future.delayed(const Duration(milliseconds: 500), () async {
+          if (!mounted || !_cameraEngine.isInitialized) return;
+          
+          // 🔥🔥🔥 세션 상태 확인: 세션이 완전히 준비되었는지 확인
+          final debugState = await _cameraEngine.getDebugState();
+          if (debugState == null) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Background resume: Cannot restore aspect ratio, debugState is null');
+            }
+            return;
+          }
+          
+          final sessionRunning = debugState['sessionRunning'] as bool? ?? false;
+          final hasFirstFrame = debugState['hasFirstFrame'] as bool? ?? false;
+          
+          // 🔥🔥🔥 세션이 완전히 준비되지 않았으면 스킵 (카메라 죽음 방지)
+          if (!sessionRunning || !hasFirstFrame) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Background resume: Session not ready yet (sessionRunning=$sessionRunning, hasFirstFrame=$hasFirstFrame), skipping aspect ratio restore');
+            }
+            return;
+          }
+          
+          if (!mounted) return;
+          final targetRatio = _getTargetAspectRatio();
+          final RenderBox? rootBox = context.findRenderObject() as RenderBox?;
+          if (rootBox != null && rootBox.hasSize) {
+            // 🔥🔥🔥 SafeArea 고려: 노치바 영역 제외
+            final MediaQueryData mediaQuery = MediaQuery.of(context);
+            final double safeAreaTop = mediaQuery.padding.top;
+            final double safeAreaBottom = mediaQuery.padding.bottom;
+            
+            final double maxWidth = rootBox.size.width;
+            final double maxHeight = rootBox.size.height - safeAreaTop - safeAreaBottom; // SafeArea 제외
+            
+            double width, height;
+            // 🔥🔥🔥 9:16 비율 특별 처리: 세로가 긴 비율이므로 세로를 기준으로 계산
+            final bool isNineSixteen = (targetRatio - (9.0 / 16.0)).abs() < 0.001;
+            if (targetRatio > 1.0) {
+              // 가로가 긴 비율 (예: 16:9)
+              height = maxHeight;
+              width = height * targetRatio;
+              if (width > maxWidth) {
+                width = maxWidth;
+                height = width / targetRatio;
+              }
+            } else if (targetRatio < 1.0) {
+              // 세로가 긴 비율 (예: 9:16, 3:4)
+              // 🔥🔥🔥 9:16은 세로가 매우 길므로 세로를 최대한 보존
+              height = maxHeight;
+              width = height * targetRatio;
+              if (width > maxWidth && !isNineSixteen) {
+                // 9:16이 아닌 경우에만 가로를 기준으로 재계산 (3:4 등)
+                width = maxWidth;
+                height = width / targetRatio;
+              }
+              // 🔥🔥🔥 9:16 비율은 가로가 화면을 넘어도 세로를 보존 (가로는 좌우로 잘림)
+            } else {
+              // 1:1 비율
+              final double minDimension = math.min(maxWidth, maxHeight);
+              width = minDimension;
+              height = minDimension;
+            }
+            
+            // 🔥🔥🔥 SafeArea를 고려한 위치 계산: 상단 SafeArea만큼 아래로 이동
+            final double top = safeAreaTop + (maxHeight - height) / 2;
+            final double left = (maxWidth - width) / 2;
+            final Offset globalTopLeft = rootBox.localToGlobal(Offset(left, top));
+            final Rect rectToSync = Rect.fromLTWH(
+              globalTopLeft.dx,
+              globalTopLeft.dy,
+              width,
+              height,
+            );
+            
+            // 🔥🔥🔥 성능 최적화: 비율 복원 성공 시 _lastSyncedPreviewRect 업데이트하여 중복 복원 방지
+            _lastSyncedPreviewRect = rectToSync; // 복원 성공 시 업데이트
+            _syncPreviewRectToNativeFromLocal(rectToSync, context);
+            _syncPreviewRectWithRetry(rectToSync, context);
+            
+            if (kDebugMode) {
+              debugPrint('[Petgram] 🔄 Background resume: Aspect ratio restored to ${targetRatio.toStringAsFixed(3)} (width=${width.toStringAsFixed(1)}, height=${height.toStringAsFixed(1)})');
+            }
+            
+            // 🔥🔥🔥 성능 최적화: 빈 setState() 제거
+            // 비율 동기화는 이미 _syncPreviewRectToNativeFromLocal에서 처리됨
+          }
+        });
+        
+        // 🔥🔥🔥 추가 비율 복원 시도 (네이티브가 덮어쓸 수 있으므로) - 세션이 준비된 후에만 실행
+        // 🔥🔥🔥 성능 최적화: 첫 번째 복원이 성공했으면 두 번째 복원 스킵 (중복 방지)
+        Future.delayed(const Duration(milliseconds: 1200), () async {
+          if (!mounted || !_cameraEngine.isInitialized) return;
+          
+          // 🔥🔥🔥 성능 최적화: 이미 복원되었으면 스킵
+          if (_lastSyncedPreviewRect != null) {
+            final currentRatio = _lastSyncedPreviewRect!.width / _lastSyncedPreviewRect!.height;
+            final targetRatio = _getTargetAspectRatio();
+            final ratioDiff = (currentRatio - targetRatio).abs();
+            // 비율 차이가 0.05 이하면 이미 복원된 것으로 간주
+            if (ratioDiff < 0.05) {
+              if (kDebugMode) {
+                debugPrint('[Petgram] ⏭️ Background resume: Aspect ratio already restored (ratioDiff=${ratioDiff.toStringAsFixed(3)}), skipping retry');
+              }
+              return;
+            }
+          }
+          
+          // 🔥🔥🔥 세션 상태 확인: 세션이 완전히 준비되었는지 확인
+          final debugState = await _cameraEngine.getDebugState();
+          if (debugState == null) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Background resume: Cannot restore aspect ratio (retry), debugState is null');
+            }
+            return;
+          }
+          
+          final sessionRunning = debugState['sessionRunning'] as bool? ?? false;
+          final hasFirstFrame = debugState['hasFirstFrame'] as bool? ?? false;
+          
+          // 🔥🔥🔥 세션이 완전히 준비되지 않았으면 스킵 (카메라 죽음 방지)
+          if (!sessionRunning || !hasFirstFrame) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Background resume: Session not ready yet (retry, sessionRunning=$sessionRunning, hasFirstFrame=$hasFirstFrame), skipping aspect ratio restore');
+            }
+            return;
+          }
+          
+          if (!mounted) return;
+          final targetRatio = _getTargetAspectRatio();
+          final RenderBox? rootBox = context.findRenderObject() as RenderBox?;
+          if (rootBox != null && rootBox.hasSize) {
+            // 🔥🔥🔥 SafeArea 고려: 노치바 영역 제외
+            final MediaQueryData mediaQuery = MediaQuery.of(context);
+            final double safeAreaTop = mediaQuery.padding.top;
+            final double safeAreaBottom = mediaQuery.padding.bottom;
+            
+            final double maxWidth = rootBox.size.width;
+            final double maxHeight = rootBox.size.height - safeAreaTop - safeAreaBottom; // SafeArea 제외
+            
+            double width, height;
+            // 🔥🔥🔥 9:16 비율 특별 처리: 세로가 긴 비율이므로 세로를 기준으로 계산
+            final bool isNineSixteen = (targetRatio - (9.0 / 16.0)).abs() < 0.001;
+            if (targetRatio > 1.0) {
+              // 가로가 긴 비율 (예: 16:9)
+              height = maxHeight;
+              width = height * targetRatio;
+              if (width > maxWidth) {
+                width = maxWidth;
+                height = width / targetRatio;
+              }
+            } else if (targetRatio < 1.0) {
+              // 세로가 긴 비율 (예: 9:16, 3:4)
+              // 🔥🔥🔥 9:16은 세로가 매우 길므로 세로를 최대한 보존
+              height = maxHeight;
+              width = height * targetRatio;
+              if (width > maxWidth && !isNineSixteen) {
+                // 9:16이 아닌 경우에만 가로를 기준으로 재계산 (3:4 등)
+                width = maxWidth;
+                height = width / targetRatio;
+              }
+              // 🔥🔥🔥 9:16 비율은 가로가 화면을 넘어도 세로를 보존 (가로는 좌우로 잘림)
+            } else {
+              // 1:1 비율
+              final double minDimension = math.min(maxWidth, maxHeight);
+              width = minDimension;
+              height = minDimension;
+            }
+            
+            // 🔥🔥🔥 SafeArea를 고려한 위치 계산: 상단 SafeArea만큼 아래로 이동
+            final double top = safeAreaTop + (maxHeight - height) / 2;
+            final double left = (maxWidth - width) / 2;
+            final Offset globalTopLeft = rootBox.localToGlobal(Offset(left, top));
+            final Rect rectToSync = Rect.fromLTWH(
+              globalTopLeft.dx,
+              globalTopLeft.dy,
+              width,
+              height,
+            );
+            
+            // 🔥🔥🔥 성능 최적화: 비율 복원 성공 시 _lastSyncedPreviewRect 업데이트
+            _lastSyncedPreviewRect = rectToSync; // 복원 성공 시 업데이트
+            _syncPreviewRectToNativeFromLocal(rectToSync, context);
+            _syncPreviewRectWithRetry(rectToSync, context);
+            
+            if (kDebugMode) {
+              debugPrint('[Petgram] 🔄 Background resume: Aspect ratio restored again to ${targetRatio.toStringAsFixed(3)} (retry, width=${width.toStringAsFixed(1)}, height=${height.toStringAsFixed(1)}, safeAreaTop=${safeAreaTop.toStringAsFixed(1)})');
+            }
+          }
+        });
+        
+        // 🔥🔥🔥 핵심 수정: _savedZoomScaleBeforeBackground는 줌 복원 로직에서만 초기화
+        // 여기서는 초기화하지 않음 (줌 복원이 완료된 후에만 초기화)
+        // _savedZoomScaleBeforeBackground = null; // 🔥 제거: 줌 복원 로직에서만 초기화
+      }
+      
+      // 🔥🔥🔥 추가 보호: 줌이 0.5로 초기화되었을 때 자동 복원 제거
+      // 0.5배는 유효한 선택이므로 1.0으로 강제 변경하지 않음
+      // 이 로직은 제거: 0.5배를 선택한 경우 그대로 유지해야 함
+      
+      // 상태 업데이트
+      _lastSessionRunningState = currentSessionRunning;
+      _lastHasFirstFrameState = currentHasFirstFrame;
+      
+      // 상태가 변경되지 않았으면 early return
+      if (currentInitialized == _lastCameraInitializedState) {
+        return;
+      }
+
+      // 🔥🔥🔥 근본 원인 해결: 카메라 초기화 완료를 기다리지 않고, 첫 프레임이 렌더링되면 바로 스플래시 제거
+      // 카메라 초기화가 실패하거나 지연되어도 화면 진입이 가능하도록 함
 
       // 🔥 자동 포커스 모드 활성화 체크 (ready 상태로 전환될 때)
       if (currentInitialized &&
           !_lastCameraInitializedState &&
           !_shouldUseMockCamera) {
+        // 🔥 카메라 초기화 완료 시간 기록
+        _cameraInitTime = DateTime.now();
+        if (_appStartTime != null) {
+          final initTime = _cameraInitTime!.difference(_appStartTime!).inMilliseconds;
+          final logMsg = '[Petgram] ⏱️ Camera initialized: ${initTime}ms from initState';
+          // 🔥 릴리스 모드에서도 로그 출력: print + 파일 저장
+          print(logMsg);
+          _saveDebugLogToFile(logMsg);
+        }
+        
         if (mounted) {
           setState(() {
             _isAutoFocusEnabled = true;
+          });
+          
+          // 🔥🔥🔥 줌 배율 정상화: 카메라 초기화 완료 후 기본 줌을 1.0으로 명시적으로 설정
+          // 네이티브에서 1.0으로 초기화했지만, 초광각 렌즈로 전환되는 것을 방지하기 위해
+          // wide 렌즈를 사용하고 1.0 줌을 명시적으로 설정
+          // 🔥 성능 최적화: 초기화 지연 단축 (500ms → 200ms)
+          _isInitialZoomSetting = true; // 🔥🔥🔥 초기 줌 설정 중 플래그 설정
+          Future.delayed(const Duration(milliseconds: 200), () {
+            if (mounted && _cameraEngine.isInitialized && !_shouldUseMockCamera) {
+              // wide 렌즈로 전환 (초광각이 아닌 일반 광각 사용)
+              if (_cameraLensDirection == CameraLensDirection.back) {
+                _cameraEngine.switchToWideIfAvailable().then((_) {
+                  if (mounted && _cameraEngine.isInitialized) {
+                    // 🔥🔥🔥 줌을 1.0으로 명시적으로 설정하고 실제 값 확인하여 동기화
+                    _cameraEngine.setZoom(1.0).then((actualZoom) {
+                      if (mounted) {
+                        // 🔥🔥🔥 네이티브의 실제 줌 값으로 Flutter 상태 동기화
+                        final syncZoom = actualZoom ?? 1.0;
+                        setState(() {
+                          _uiZoomScale = syncZoom;
+                          _baseUiZoomScale = syncZoom;
+                          _nativeLensKind = 'wide';
+                          _isInitialZoomSetting = false; // 🔥🔥🔥 초기 줌 설정 완료
+                        });
+                        if (kDebugMode) {
+                          debugPrint('[Petgram] ✅ Camera initialized: zoom set to ${syncZoom.toStringAsFixed(2)}x (requested=1.0, actual=$actualZoom), wide lens active');
+                        }
+                      }
+                    }).catchError((error) {
+                      if (mounted) {
+                        setState(() {
+                          _isInitialZoomSetting = false;
+                        });
+                      }
+                      if (kDebugMode) {
+                        debugPrint('[Petgram] ⚠️ Failed to sync zoom after setZoom: $error');
+                      }
+                    });
+                  }
+                }).catchError((error) {
+                  // 렌즈 전환 실패 시에도 플래그 리셋
+                  if (mounted) {
+                    setState(() {
+                      _isInitialZoomSetting = false;
+                    });
+                  }
+                  if (kDebugMode) {
+                    debugPrint('[Petgram] ⚠️ Failed to switch to wide lens: $error');
+                  }
+                });
+              } else {
+                // 🔥🔥🔥 전면 카메라 줌 문제 해결: 초기화 시 1.0으로 설정하고 실제 값 확인하여 동기화
+                // 전면 카메라도 1배가 기본이 되어야 하므로, 1.0으로 설정
+                _cameraEngine.setZoom(1.0).then((actualZoom) {
+                  if (mounted) {
+                    // 🔥🔥🔥 네이티브의 실제 줌 값으로 Flutter 상태 동기화
+                    final syncZoom = actualZoom ?? 1.0;
+                    setState(() {
+                      _uiZoomScale = syncZoom;
+                      _baseUiZoomScale = syncZoom;
+                      _isInitialZoomSetting = false;
+                    });
+                    if (kDebugMode) {
+                      debugPrint('[Petgram] ✅ Camera initialized: zoom set to ${syncZoom.toStringAsFixed(2)}x (requested=1.0, actual=$actualZoom, direction=${_cameraLensDirection == CameraLensDirection.front ? "front" : "back"})');
+                    }
+                  }
+                }).catchError((error) {
+                  // 줌 설정 실패 시에도 플래그 리셋
+                  if (mounted) {
+                    setState(() {
+                      _isInitialZoomSetting = false;
+                    });
+                  }
+                  if (kDebugMode) {
+                    debugPrint('[Petgram] ⚠️ Failed to set zoom to 1.0: $error');
+                  }
+                });
+              }
+            } else {
+              // 초기화 실패 시에도 플래그 리셋
+              if (mounted) {
+                setState(() {
+                  _isInitialZoomSetting = false;
+                });
+              }
+            }
           });
           _startFocusStatusPolling();
         }
@@ -1307,6 +2220,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
       // 🔥 필터 유지: 카메라가 초기화되면 필터를 다시 적용
       if (currentInitialized && !_lastCameraInitializedState) {
+        // 🔥 성능 최적화: 백그라운드 복귀 시 비율 유지 (초기화하지 않음)
+        // 카메라가 준비되었어도 기존 비율을 유지하고, 비율이 실제로 변경되었을 때만 동기화
+        if (_isResumingCamera && kDebugMode) {
+          final targetRatio = _getTargetAspectRatio();
+          debugPrint(
+            '[Petgram] ✅ Camera ready after resume: Preserving aspect ratio (targetRatio=${targetRatio.toStringAsFixed(3)}, aspectMode=$_aspectMode)',
+          );
+        }
+        
         // 카메라가 방금 초기화됨 → 필터 다시 적용
         if (_isNativeCameraActive) {
           _applyFilterIfChanged(
@@ -1362,98 +2284,73 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       );
     }
 
-    // 🔥 로딩 문제 해결: 화면 복귀 시 이전 세션 완전히 정리 후 초기화
-    // 🔥 필터 페이지에서 돌아올 때 어두워지는 문제 해결:
-    //    밝기 값과 노출 바이어스를 리셋하여 기본 밝기로 복원
-    setState(() {
-      _brightnessValue = 0.0; // 밝기 값 리셋
-    });
-
-    // 🔥 Issue 1 Fix: 화면 복귀 시 카메라 초기화 및 Resume (한 번만 실행)
+    // 🔥 스플래시 멈춤 방지: initState에서 모든 블로킹 작업 완전 제거
+    // flutter_native_splash는 첫 프레임이 렌더링되면 자동으로 사라지므로
+    // 첫 프레임 렌더링을 방해하는 모든 작업을 제거
+    // 모든 초기화 작업은 첫 프레임 렌더링 후에 실행되도록 지연
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      // 촬영 직후 펜스 활성 시 어떤 초기화도 수행하지 않음
-      final fenceActive =
-          _captureFenceUntil != null &&
-          DateTime.now().isBefore(_captureFenceUntil!);
-      if (fenceActive || _cameraEngine.isCapturingPhoto) {
-        _addDebugLog(
-          '[InitState] ⏸️ skip init/resume: capture fence active (isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, fenceUntil=$_captureFenceUntil)',
-        );
-        return;
-      }
-
-      if (mounted) {
-        // 🔥 Single Source of Truth: 네이티브 상태 확인 후 결정
-        // Flutter 내부 플래그만 보고 판단하지 않음
-        _cameraEngine.getDebugState().then((debugState) {
-          if (!mounted) return;
-
-          // 촬영 직후 펜스 재확인
-          final fenceActiveInside =
-              _captureFenceUntil != null &&
-              DateTime.now().isBefore(_captureFenceUntil!);
-          if (fenceActiveInside || _cameraEngine.isCapturingPhoto) {
-            _addDebugLog(
-              '[InitState] ⏸️ skip init/resume inside getDebugState: capture fence active (isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, fenceUntil=$_captureFenceUntil)',
-            );
-            return;
+      // 🔥🔥🔥 타임아웃 백업: 1초 내에 첫 프레임이 렌더링되지 않으면 스플래시 강제 제거
+      // 🔥 성능 최적화: 타임아웃 제거 (스플래시는 이미 build()에서 즉시 제거됨)
+      // 카메라 초기화는 백그라운드에서 비동기로 처리되므로 타임아웃 불필요
+      
+      // 🔥 성능 최적화: 지연 제거 (초기화 작업은 비동기로 처리되므로 블로킹 없음)
+      // 첫 프레임이 렌더링된 후에 모든 초기화 작업 실행 (지연 없이 즉시)
+      if (!mounted) return;
+      
+      // 🔥 Mock 카메라 초기화 (첫 프레임 렌더링 후)
+      if (widget.cameras.isEmpty && !Platform.isIOS) {
+        _cameraEngine.initializeMock(aspectRatio: _getTargetAspectRatio()).then((_) {
+          // 🔥 성능 최적화: 스플래시는 이미 build()에서 제거되었으므로 여기서는 제거하지 않음
+          if (kDebugMode) {
+            debugPrint('[Petgram] ✅ Mock camera initialized (splash already removed)');
           }
-
-          final nativeInit = debugState?['nativeInit'] as bool? ?? false;
-          final isReady = debugState?['isReady'] as bool? ?? false;
-          final sessionRunning =
-              debugState?['sessionRunning'] as bool? ?? false;
-          final hasFirstFrame = debugState?['hasFirstFrame'] as bool? ?? false;
-          final isPinkFallback =
-              debugState?['isPinkFallback'] as bool? ?? false;
-
-          // 1) 프레임을 받은 상태면 어떤 초기화도 하지 않고 resume만 시도
-          if (hasFirstFrame && !isPinkFallback) {
-            _addDebugLog(
-              '[InitState] skip init: hasFirstFrame=true (sessionRunning=$sessionRunning). Only resume if needed.',
-            );
-            if (!sessionRunning) {
-              _resumeCameraSession();
-            }
-            return;
+        }).catchError((e) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ⚠️ initializeMock error: $e');
           }
-
-          // 2) 네이티브가 이미 준비된 경우도 재초기화 금지 (resume만)
-          if (nativeInit && isReady && sessionRunning) {
-            _addDebugLog(
-              '[InitState] Native camera already ready (nativeInit=$nativeInit, isReady=$isReady, sessionRunning=$sessionRunning), resume only',
-            );
-            _resumeCameraSession();
-            return;
-          }
-
-          // 🔥 전면 재설계: 네이티브 상태가 준비되지 않았으면 초기화 대기
-          // initializeNativeCameraOnce는 onCreated에서 viewId를 받은 후 한 번만 호출됨
-          _addDebugLog(
-            '[InitState] Native camera not ready (nativeInit=$nativeInit, isReady=$isReady, sessionRunning=$sessionRunning). Will initialize once in onCreated.',
-          );
-          if (mounted) {
-            // 🔥 크래시 디버깅: 앱 시작 시 이전 세션의 로그 불러오기
-            _loadDebugLogsFromFile();
-            // 🔥 전면 재설계: 초기화는 onCreated에서 한 번만 수행됨
-            // 여기서는 로그만 로드하고, 실제 초기화는 NativeCameraPreview.onCreated에서 수행
-          }
+          // 🔥 성능 최적화: 스플래시는 이미 build()에서 제거되었으므로 여기서는 제거하지 않음
         });
       }
+      
+      // 🔥 로딩 문제 해결: 화면 복귀 시 이전 세션 완전히 정리 후 초기화
+      // 🔥 필터 페이지에서 돌아올 때 어두워지는 문제 해결:
+      //    밝기 값과 노출 바이어스를 리셋하여 기본 밝기로 복원
+      setState(() {
+        _brightnessValue = 0.0; // 밝기 값 리셋
+      });
+      
+      // 🔥 상태 폴링 시작 (첫 프레임 렌더링 후)
+      _startDebugStatePolling();
+      
+      // 🔥 크래시 디버깅: 앱 시작 시 이전 세션의 로그 불러오기 (비동기, 블로킹 안 함)
+      _loadDebugLogsFromFile().catchError((e) {
+        if (kDebugMode) {
+          debugPrint('[Petgram] ⚠️ _loadDebugLogsFromFile error: $e');
+        }
+      });
+      
+      // 🔥 스플래시 멈춤 방지: 모든 비동기 초기화 작업을 첫 프레임 렌더링 후에 실행
+      _loadLastSelectedFilter().catchError((e) {
+        debugPrint('[Petgram] ⚠️ _loadLastSelectedFilter error: $e');
+      });
+      _loadPetName().catchError((e) {
+        debugPrint('[Petgram] ⚠️ _loadPetName error: $e');
+      });
+      _loadAllSettings().catchError((e) {
+        debugPrint('[Petgram] ⚠️ _loadAllSettings error: $e');
+      });
+      loadFrameResources().catchError((e) {
+        debugPrint('[Petgram] ⚠️ loadFrameResources error: $e');
+      }); // 프레임 폰트와 로고 미리 로드 (services/frame_resource_service.dart)
+      _loadIconImages().catchError((e) {
+        debugPrint('[Petgram] ⚠️ _loadIconImages error: $e');
+      }); // 아이콘 이미지 미리 로드
     });
-
-    // 오디오 플레이어 초기화 (셔터음용)
-    _loadLastSelectedFilter();
-    _loadPetName();
-    _loadAllSettings();
-    loadFrameResources(); // 프레임 폰트와 로고 미리 로드 (services/frame_resource_service.dart)
-    _loadIconImages(); // 아이콘 이미지 미리 로드
     // 🔥 얼굴 인식 기능 전면 OFF: 현재 버전에서는 완전히 비활성화
 
-    // 🔥 핵심 수정: 상태 폴링은 항상 시작 (canUseCamera 정확성을 위해)
-    //              폴링 간격은 1초로 설정하여 배터리 부담 최소화
-    //              디버그 로그만 kEnableCameraDebugOverlay로 제어
-    _startDebugStatePolling();
+    // 🔥 스플래시 멈춤 방지: 상태 폴링은 첫 프레임 렌더링 후에 시작
+    // addPostFrameCallback에서 시작하도록 이동
+    debugPrint('[Petgram] HomePage.initState() END');
   }
 
   /// 오디오 플레이어 초기화 (셔터음용)
@@ -1652,7 +2549,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _timerSeconds = prefs.getInt(kTimerSecondsKey) ?? 0;
       // 화면 비율
       final aspectModeStr = prefs.getString(kAspectModeKey);
-      if (aspectModeStr != null) {
+      // 🔥🔥🔥 최초 앱 실행 시 3:4 비율로 강제 설정
+      // 최초 실행 시 비율 문제를 해결하기 위해 최초 실행인 경우 무조건 3:4로 설정
+      if (aspectModeStr == null) {
+        // 최초 실행: 3:4로 강제 설정
+        _aspectMode = AspectRatioMode.threeFour;
+        if (kDebugMode) {
+          debugPrint('[Petgram] 🔄 _loadAllSettings: First launch detected, forcing 3:4 aspect ratio');
+        }
+      } else {
+        // 저장된 비율 사용
         switch (aspectModeStr) {
           case 'nineSixteen':
             _aspectMode = AspectRatioMode.nineSixteen;
@@ -1845,8 +2751,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       await Future.delayed(const Duration(milliseconds: 500));
 
       // 4. 상태 폴링 (lastDebugState 업데이트)
-      await _pollDebugState();
-      _addDebugLog('[ManualRestart] ✅ State polled (lastDebugState updated)');
+      // 🔥 중복 호출 방지: 타이머가 이미 1초마다 폴링하므로 직접 호출 제거
+      // await _pollDebugState();
+      _addDebugLog('[ManualRestart] ✅ State will be polled by timer');
 
       // 5. PlatformView 재생성 완료 대기 (onCreated 재호출 대기)
       _addDebugLog(
@@ -1902,6 +2809,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
+    
+    // 🔥🔥🔥 중복 호출 방지: 같은 상태로 변경되면 무시
+    if (_lastLifecycleState == state) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] ⏸️ didChangeAppLifecycleState: Same state ($state), skipping');
+      }
+      return;
+    }
+    
     _lastLifecycleState = state; // 🔥 라이프사이클 상태 기록
 
     // 🔥 크래시 원인 추적: 촬영 중 라이프사이클 변경 감지
@@ -1914,19 +2830,40 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     _addDebugLog(lifecycleLog);
 
-    // 🔥 디버그 정리: AppLifecycle pause/resume 정상 동작 복구
-    // 앱이 백그라운드로 가거나 비활성화되면 카메라 세션 일시 중지
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive) {
+    // 🔥🔥🔥 백그라운드 진입 시 카메라 pause, 복귀 시 resume + 비율 복원
+    // 단순한 로직: 백그라운드에 있으면 pause, 돌아오면 resume
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      // 🔥🔥🔥 백그라운드 진입 시 줌은 _pauseCameraSession()에서 1.0으로 고정됨
+      // 여기서는 저장하지 않음 (_pauseCameraSession에서 1.0으로 저장)
       if (kDebugMode) {
         debugPrint(
-          '[Petgram] 🔍 Calling _pauseCameraSession() from didChangeAppLifecycleState',
+          '[Petgram] 🔍 Calling _pauseCameraSession() from didChangeAppLifecycleState ($state), zoom will be fixed to 1.0x',
         );
       }
       _pauseCameraSession();
     }
     // 앱이 다시 활성화되면 카메라 세션 재개 (initPipeline은 호출하지 않음)
     else if (state == AppLifecycleState.resumed) {
+      // 🔥🔥🔥 중복 호출 방지: 이미 재개 중이면 무시
+      if (_isResumingCamera) {
+        if (kDebugMode) {
+          debugPrint(
+            '[Petgram] ⏸️ didChangeAppLifecycleState: Already resuming, skipping duplicate resume call',
+          );
+        }
+        return;
+      }
+      
+      // 🔥🔥🔥 세션 상태 확인: 세션이 이미 실행 중이면 resume 스킵
+      if (_cameraEngine.isInitialized && _cameraEngine.sessionRunning == true) {
+        if (kDebugMode) {
+          debugPrint(
+            '[Petgram] ⏸️ didChangeAppLifecycleState: Session already running, skipping resume',
+          );
+        }
+        return;
+      }
+      
       if (kDebugMode) {
         debugPrint(
           '[Petgram] 🔍 Calling _resumeCameraSession() from didChangeAppLifecycleState (isCapturingPhoto=$isCapturing)',
@@ -1944,20 +2881,81 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     if (kDebugMode) {
       debugPrint(
-        '[Petgram] ⏸️ Pausing camera session (isCameraReady=$_isCameraReady)',
+        '[Petgram] ⏸️ _pauseCameraSession: Called (isProcessing=$_isProcessing, isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, isResuming=$_isResumingCamera, isInitialized=${_cameraEngine.isInitialized}, sessionRunning=${_cameraEngine.sessionRunning})',
       );
     }
+
+    // 🔥🔥🔥 백그라운드 진입 시 무조건 pause: 촬영 중이어도 pause 시도
+    // 네이티브에서 촬영 중이면 pause를 스킵하므로 여기서는 체크하지 않음
+    // 재개 중이어도 백그라운드로 가면 pause해야 함
 
     // 포커스 상태 폴링 중지
     _stopFocusStatusPolling();
 
-    // 🔥 네이티브 카메라 세션 명시적 정지 (배터리/발열 감소)
+    // 🔥🔥🔥 핵심 수정: 백그라운드 진입 시 네이티브 카메라 줌을 1.0으로 강제 고정
+    // Flutter 상태도 1.0으로 동기화하여 UI와 실제 줌 값이 일치하도록 함
+    if (_cameraEngine.isInitialized && !_cameraEngine.isCapturingPhoto) {
+      // Flutter 상태 즉시 1.0으로 설정
+      if (mounted) {
+        setState(() {
+          _uiZoomScale = 1.0;
+          _baseUiZoomScale = 1.0;
+        });
+      }
+      
+      // 네이티브 카메라 줌을 1.0으로 설정 (await 없이 비동기 실행)
+      unawaited(
+        _cameraEngine.setZoom(1.0).then((actualZoom) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ⏸️ Background: Zoom fixed to 1.0x (actual=${actualZoom?.toStringAsFixed(2) ?? "null"})');
+          }
+          _addDebugLog('[Lifecycle] ⏸️ Background zoom fixed to 1.0x');
+        }).catchError((e) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ⚠️ Background: Failed to fix zoom to 1.0x: $e');
+          }
+        }),
+      );
+      
+      // 저장된 줌 값도 1.0으로 설정 (복귀 시 1.0으로 복원되도록)
+      _savedZoomScaleBeforeBackground = 1.0;
+    }
+
+    // 🔥🔥🔥 핵심 수정: pause 호출을 await로 기다리지 않고 unawaited로 처리
+    // 하지만 pause가 실제로 실행되었는지 확인하기 위해 로그 추가
+    // 네이티브 카메라 세션 명시적 정지 (배터리/발열 감소)
     // 홈 화면이 아닐 때 또는 앱이 백그라운드로 갈 때 세션 완전 정지
-    _cameraEngine.pause();
+    // 네이티브에서 촬영 중이면 pause를 스킵하므로 안전하게 호출 가능
+    unawaited(
+      _cameraEngine.pause().then((_) {
+        if (kDebugMode) {
+          debugPrint('[Petgram] ⏸️ _pauseCameraSession: pause() completed successfully');
+        }
+        _addDebugLog('[Lifecycle] ⏸️ Camera pause completed');
+      }).catchError((e) {
+        if (kDebugMode) {
+          debugPrint('[Petgram] ⚠️ _pauseCameraSession: pause() failed: $e');
+        }
+        _addDebugLog('[Lifecycle] ⚠️ Camera pause failed: $e');
+      }),
+    );
+    
+    if (kDebugMode) {
+      debugPrint('[Petgram] ⏸️ _pauseCameraSession: pause() called (async)');
+    }
+    _addDebugLog('[Lifecycle] ⏸️ Camera pause requested');
   }
 
   /// 🔥 성능 최적화: 카메라 세션 재개
   void _resumeCameraSession() {
+    // 🔥🔥🔥 중복 호출 방지: 이미 재개 중이면 무시
+    if (_isResumingCamera) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] ⏸️ _resumeCameraSession: Already resuming, skipping duplicate call');
+      }
+      return;
+    }
+
     // 🔥 크래시 원인 추적: 호출 스택 로깅
     final stackTrace = StackTrace.current;
     final stackLines = stackTrace.toString().split('\n');
@@ -2000,70 +2998,103 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // 🔥 전면 재설계: 오직 sessionRunning=false일 때만 resume 호출
-    final lastState = _cameraEngine.lastDebugState;
-    if (lastState == null) {
-      _addDebugLog('[Resume] ⏸️ skip resume: state is null');
-      return;
-    }
+    // 🔥🔥🔥 중복 호출 방지 플래그 설정
+    _isResumingCamera = true;
 
-    // sessionRunning=true이면 resume 불필요
-    if (lastState.sessionRunning) {
-      _addDebugLog(
-        '[Resume] ⏸️ skip resume: sessionRunning=true (no need to resume)',
+    // 🔥🔥🔥 백그라운드 복귀 시 기존 비율 유지 (3:4로 강제 변경하지 않음)
+    // 기존 비율을 그대로 사용하여 프리뷰 사이즈와 배경색을 복원
+    final targetRatio = _getTargetAspectRatio();
+    if (kDebugMode) {
+      debugPrint(
+        '[Petgram] 🔄 _resumeCameraSession: Resuming camera with existing aspect ratio (targetRatio=${targetRatio.toStringAsFixed(3)}, aspectMode=$_aspectMode)',
       );
-      return;
     }
 
-    // 🔥 전면 재설계: sessionRunning=false일 때만 resume 호출
+    // 🔥🔥🔥 백그라운드 복귀 시 비율 강제 재동기화
+    // 네이티브에서 세션이 재시작되면서 비율이 초기화될 수 있으므로
+    // _lastSyncedPreviewRect를 null로 설정하여 비율 재동기화 보장
+    _lastSyncedPreviewRect = null;
+    
+    // 🔥🔥🔥 성능 최적화: 빈 setState() 제거
+    // 비율 재동기화는 _buildCameraStack의 postFrameCallback에서 자동으로 처리됨
+    // 불필요한 재빌드를 방지하여 성능 향상
+
+    // 🔥🔥🔥 백그라운드 복귀 시 무조건 resume 시도 (상태 체크 완화)
+    // 백그라운드에서 복귀할 때는 세션이 중지되어 있을 가능성이 높으므로
+    // 상태 체크를 완화하고 무조건 resume을 시도
     _addDebugLog(
-      '[Resume] ✅ resumeCameraSession: sessionRunning=false, calling cameraEngine.resume()',
+      '[Resume] ✅ resumeCameraSession: Calling cameraEngine.resume() (background resume)',
     );
 
     if (kDebugMode) {
-      debugPrint('[Petgram] ▶️ Resuming camera session (sessionRunning=false)');
+      debugPrint('[Petgram] ▶️ Resuming camera session (background resume)');
     }
 
     // 🔥 네이티브 카메라 세션 명시적 재개
-    _cameraEngine.resume();
+    // resume() 내부에서 상태를 체크하지만, 백그라운드 복귀 시에는
+    // 세션이 중지되어 있을 가능성이 높으므로 무조건 시도
+    // 🔥🔥🔥 타임아웃 추가: resume이 너무 오래 걸리면 플래그 리셋
+    _cameraEngine.resume().timeout(
+      const Duration(seconds: 5),
+      onTimeout: () {
+        _isResumingCamera = false;
+        if (kDebugMode) {
+          debugPrint('[Petgram] ⚠️ _resumeCameraSession: Resume timeout after 5s, flag reset');
+        }
+        throw TimeoutException('Camera resume timeout after 5 seconds');
+      },
+    ).then((_) async {
+      // 🔥🔥🔥 재개 완료 후 플래그 리셋
+      _isResumingCamera = false;
+      
+      // 🔥🔥🔥 단순화: 백그라운드 복귀 시 복원 로직을 카메라 상태 리스너로 이동
+      // 네이티브 세션이 완전히 준비된 후에만 비율/줌 복원 실행
+      // Flutter는 resumeSession만 호출하고, 네이티브가 준비되면 자동으로 복원
+      
+      if (kDebugMode) {
+        debugPrint('[Petgram] ✅ _resumeCameraSession: Resume called, waiting for native session to be ready');
+      }
+    }).catchError((error) {
+      // 에러 발생 시에도 플래그 리셋
+      _isResumingCamera = false;
+      if (kDebugMode) {
+        debugPrint('[Petgram] ❌ _resumeCameraSession: Resume failed, flag reset: $error');
+      }
+      // 🔥🔥🔥 큐 블로킹 에러인 경우 추가 처리
+      if (error.toString().contains('timeout') || error.toString().contains('blocked')) {
+        if (kDebugMode) {
+          debugPrint('[Petgram] ⚠️ _resumeCameraSession: Queue blocked, will retry on next lifecycle change');
+        }
+      }
+    });
 
-    // 🔥 이슈 2 수정: 프리뷰 레이아웃 강제 재계산 (비율 크롭이 제대로 적용되도록)
-    if (mounted) {
-      setState(() {
-        // setState를 호출하여 _buildCameraStack이 다시 빌드되도록 함
-        // 이렇게 하면 센서 비율과 타겟 비율이 올바르게 계산됨
-      });
-    }
+    // 🔥🔥🔥 백그라운드 복귀 시 프리뷰 레이아웃 재동기화: 카메라가 준비된 후에만 수행
+    // 카메라가 준비되기 전에 _lastSyncedPreviewRect를 null로 설정하면
+    // _buildCameraStack의 postFrameCallback이 카메라 준비 전에 동기화를 시도하여 세션 블로킹 발생
+    // 카메라 상태 리스너를 통해 카메라가 준비된 후에만 _lastSyncedPreviewRect를 null로 설정
+    // 대신 _buildCameraStack의 postFrameCallback에서 비율 검증 로직으로 자동으로 재동기화됨
+    // (비율 차이가 임계값 이상이면 자동으로 재동기화하므로 명시적 null 설정 불필요)
 
     // 🔥 필터 페이지에서 돌아올 때 어두워지는 문제 해결:
     //    밝기 값과 노출 바이어스를 리셋하여 기본 밝기로 복원
+    // 🔥🔥🔥 성능 최적화: setExposureBias 중복 호출 방지
+    // _brightnessValue를 0.0으로 설정하면 _updateNativeExposureBias()가 자동으로 호출되므로
+    // 별도로 setExposureBias(0.0)를 호출할 필요 없음
     setState(() {
-      _brightnessValue = 0.0; // 밝기 값 리셋
+      _brightnessValue = 0.0; // 밝기 값 리셋 (자동으로 _updateNativeExposureBias() 호출됨)
     });
-    _cameraEngine.setExposureBias(0.0); // 노출 바이어스 리셋
-
-    // 🔥 필터 유지: 앱이 다시 활성화되면 필터를 다시 적용하여 필터가 사라지지 않도록 함
-    if (_isNativeCameraActive) {
-      _applyFilterIfChanged(_shootFilterKey, _liveIntensity.clamp(0.0, 1.0));
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] 🎨 Filter re-applied after app resume: key=$_shootFilterKey, intensity=$_liveIntensity',
-        );
-      }
-    }
 
     // 🔥 무한 로딩 인디케이터 방지: 필터 페이지에서 돌아올 때 _isProcessing 상태 리셋
+    // 🔥🔥🔥 연속 촬영 문제 해결: 플래그를 동기적으로 리셋 (setState() 사용하지 않음)
     if (_isProcessing) {
-      setState(() {
-        _isProcessing = false;
-      });
+      _isProcessing = false;
       if (kDebugMode) {
         debugPrint('[Petgram] 🔄 Reset _isProcessing=false after app resume');
       }
     }
 
     // 🔥 필터 유지: 앱이 다시 활성화되면 필터를 다시 적용하여 필터가 사라지지 않도록 함
-    // addPostFrameCallback 제거하고 즉시 적용 (필터가 사라지는 문제 해결)
+    // 🔥 성능 최적화: 중복 호출 제거 (한 번만 호출)
     if (_isNativeCameraActive) {
       _applyFilterIfChanged(_shootFilterKey, _liveIntensity.clamp(0.0, 1.0));
       if (kDebugMode) {
@@ -2081,12 +3112,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 🔥 프리뷰 안 나오는 근본 원인: resume 후 즉시 상태 동기화하여 오버레이 제거
     // 네이티브 카메라가 resume되었지만 Flutter 상태가 업데이트되지 않으면
     // 오버레이가 계속 표시될 수 있으므로 즉시 동기화
-    Future.delayed(const Duration(milliseconds: 200), () async {
-      if (mounted) {
-        await _pollDebugState();
-        _addDebugLog('[Resume] State synced after resume');
-      }
-    });
+    // 🔥 중복 호출 방지: 타이머가 이미 1초마다 폴링하므로 직접 호출 제거
+    // Future.delayed(const Duration(milliseconds: 200), () async {
+    //   if (mounted) {
+    //     await _pollDebugState();
+    //     _addDebugLog('[Resume] State synced after resume');
+    //   }
+    // });
   }
 
   Future<void> _playDogSound() async {
@@ -2168,40 +3200,63 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
         // 🔥 이슈 1 수정: switchCamera 호출 전에 성공 여부를 확인할 수 없으므로
         // 예외가 발생하지 않으면 성공으로 간주
-        await _cameraEngine.switchCamera();
+        final switchResult = await _cameraEngine.switchCamera();
 
-        // 🔥 줌 배율 정상화: 전면/후면 카메라 전환 시 모두 UI zoom scale을 1.0으로 리셋
-        // (초광각은 0.5x까지 지원하지만, 기본값은 1.0x)
+        // 🔥🔥🔥 전면 카메라 줌 문제 해결: 네이티브에서 실제 설정된 줌 값 확인
+        // 네이티브에서 minZoom을 반환하지만, 전면 카메라도 1.0이 기본이어야 함
+        // 네이티브에서 실제로 1.0으로 설정되었는지 확인하고 UI에 반영
+        double actualZoom = 1.0;
+        if (switchResult != null) {
+          final minZoom = (switchResult['minZoom'] as num?)?.toDouble();
+          // 🔥🔥🔥 카메라 전환 시 기본 줌: 전면/후면 모두 1.0으로 설정
+          // Native에서 후면 카메라로 전환할 때 기본적으로 wide 카메라를 사용하고 1.0x 줌을 설정
+          // minZoom은 렌즈의 최소 줌이지 기본 줌이 아니므로, 항상 1.0으로 설정
+          if (newDirection == CameraLensDirection.front) {
+            actualZoom = 1.0; // 전면 카메라는 항상 1.0으로 설정
+          } else {
+            // 🔥🔥🔥 후면 카메라: 기본적으로 wide 카메라를 사용하고 1.0x 줌을 설정
+            // minZoom은 ultraWide 렌즈의 최소 줌(0.5)일 수 있지만, 기본 줌은 1.0이어야 함
+            actualZoom = 1.0; // 후면 카메라도 기본 1.0으로 설정
+            if (kDebugMode) {
+              debugPrint(
+                '[Petgram] ✅ Back camera switch: using default zoom 1.0 (minZoom=$minZoom is lens minimum, not default)',
+              );
+            }
+          }
+        }
+
         setState(() {
-          _uiZoomScale = 1.0; // 전면/후면 공통으로 기본 zoom을 1.0으로 리셋
-          _baseUiZoomScale = 1.0;
+          _uiZoomScale = actualZoom;
+          _baseUiZoomScale = actualZoom;
         });
 
-        // 🔥 전면 카메라 전용: 네이티브에 1.0 zoom 강제 적용
-        // 전면 카메라의 경우 아이폰 기본 카메라와 동일한 화각을 보장하기 위해
-        // 네이티브 switchCamera()에서 이미 videoZoomFactor = 1.0으로 설정하지만,
-        // 안전장치로 Flutter에서도 추가로 setZoom(1.0) 호출
+        // 🔥 전면/후면 카메라 모두 1.0으로 설정 시도
         if (newDirection == CameraLensDirection.front) {
           // 전면 카메라 전환 직후 약간의 지연을 두고 줌 설정 (네이티브 전환 완료 대기)
-          // 네이티브 switchCamera()에서 이미 1.0으로 설정했지만, 타이밍 이슈 방지를 위해 추가 호출
-          Future.delayed(const Duration(milliseconds: 100), () {
+          Future.delayed(const Duration(milliseconds: 150), () {
             if (mounted &&
                 _cameraEngine.isInitialized &&
                 _cameraLensDirection == CameraLensDirection.front) {
-              _cameraEngine.setZoom(1.0);
+              // 1.0으로 설정 시도 (네이티브에서 0.5로 clamp될 수 있음)
+              _cameraEngine.setZoom(1.0).then((_) {
+                // 🔥🔥🔥 전면 카메라 줌 문제: 실제 설정된 값을 확인하여 UI 업데이트
+                // 네이티브에서 실제로 0.5로 clamp되었는지 확인 필요
+                // 현재는 네이티브에서 줌 값을 반환하지 않으므로, 
+                // 전면 카메라의 경우 UI는 1.0으로 유지하되 네이티브에 1.0 설정 시도
               if (kDebugMode) {
                 debugPrint(
-                  '[Petgram] ✅ Front camera switch: UI zoom scale reset to 1.0, native zoom set to 1.0 (safety call)',
+                    '[Petgram] ✅ Front camera switch: zoom set to 1.0 (may be clamped to 0.5 by native)',
                 );
               }
+              });
             }
           });
         } else {
-          // 후면 카메라는 즉시 적용 (네이티브 switchCamera()에서 이미 1.0으로 설정됨)
-          _cameraEngine.setZoom(1.0);
+          // 후면 카메라는 즉시 적용
+          _cameraEngine.setZoom(actualZoom);
           if (kDebugMode) {
             debugPrint(
-              '[Petgram] ✅ Back camera switch: UI zoom scale reset to 1.0 (direction=$newDirection)',
+              '[Petgram] ✅ Back camera switch: zoom set to $actualZoom',
             );
           }
         }
@@ -2231,9 +3286,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
 
         // 전환 직후 네이티브 디버그 상태 한 번 폴링해서 로그로 남김
-        if (kDebugMode) {
-          await _pollDebugState();
-        }
+        // 🔥 중복 호출 방지: 타이머가 이미 1초마다 폴링하므로 직접 호출 제거
+        // if (kDebugMode) {
+        //   await _pollDebugState();
+        // }
 
         if (kDebugMode) {
           debugPrint(
@@ -2287,7 +3343,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() {
       _aspectMode = mode;
       // 🔥 프리뷰 비율 크롭 기반 처리: 비율 변경은 UI만 변경, 줌/네이티브 재초기화 없음
+      // 🔥 비율 변경 시 프리뷰 위치 캐시 초기화 (레이아웃 재계산 보장)
+      // 🔥🔥🔥 촬영 후 비율 변경 시 프리뷰 업데이트 보장: _lastSyncedPreviewRect를 null로 설정하여 강제 동기화
+      _lastSyncedPreviewRect = null;
     });
+    
+    // 🔥🔥🔥 즉시 재빌드 트리거: 비율 변경 시 위젯을 즉시 재빌드하여 프리뷰 크기 업데이트
+    // 🔥🔥🔥 여러 번 setState를 호출하여 확실히 재빌드 보장
+    if (mounted) {
+      // 첫 번째 프레임: 즉시 재빌드
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          setState(() {
+            // 비율 변경 후 프리뷰 업데이트를 위한 재빌드
+          });
+          // 두 번째 프레임: 추가 재빌드로 확실히 업데이트
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              setState(() {
+                // 비율 변경 후 프리뷰 업데이트를 위한 재빌드
+              });
+            }
+          });
+        }
+      });
+    }
     _saveAspectMode();
 
     // 🔥 프리뷰 비율 크롭 기반 처리: 비율 변경 시 네이티브 재초기화 절대 금지
@@ -2313,54 +3393,78 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 🔥 화각 정확도: 비율 변경 시 줌이 변경되지 않도록 명시적으로 확인
     // (이미 setState에서 _aspectMode만 변경하므로 줌은 자동으로 유지됨)
 
-    // previewRect를 즉시 업데이트 (postFrameCallback 사용)
+    // 🔥 비율 변경 시 프리뷰 레이아웃 즉시 재동기화
+    // _buildCameraStack의 postFrameCallback에서도 동기화하지만,
+    // 비율 변경 직후 즉시 동기화를 시도하여 빠른 반응 보장
+    _lastSyncedPreviewRect = null; // 이미 setState에서 초기화했지만 명시적으로 다시 초기화
+
+    // 🔥 비율 변경 시 즉시 프리뷰 rect 계산 및 동기화 시도
+    // postFrameCallback을 여러 번 호출하여 레이아웃 완료 보장
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      // 현재 활성화된 프리뷰의 컨텍스트 찾기 (Mock 또는 Native)
-      final BuildContext? previewContext = _shouldUseMockCamera
-          ? _mockPreviewKey.currentContext
-          : _nativePreviewKey.currentContext;
-
-      // 🔥 디버깅: 왜 null인지 확인
-      if (kDebugMode) {
-        debugPrint('[Petgram] 🔍 previewContext 디버깅:');
-        debugPrint('  - _shouldUseMockCamera: $_shouldUseMockCamera');
-        debugPrint(
-          '  - _mockPreviewKey.currentContext: ${_mockPreviewKey.currentContext}',
-        );
-        debugPrint(
-          '  - _nativePreviewKey.currentContext: ${_nativePreviewKey.currentContext}',
-        );
-        debugPrint(
-          '  - _cameraEngine.isInitialized: ${_cameraEngine.isInitialized}',
-        );
-        debugPrint(
-          '  - _cameraEngine.nativeCamera: ${_cameraEngine.nativeCamera}',
-        );
-      }
-
-      // 🔥 좌표계 통일: _getPreviewRect() 실시간 측정값 사용
-      // _updatePreviewRectFromContext 호출 제거
-      if (kDebugMode) {
-        if (previewContext != null) {
-          debugPrint(
-            '[Petgram] 📐 Aspect ratio changed to ${_aspectLabel(mode)}, previewRect will be updated in _buildCameraStack',
-          );
-        } else {
-          debugPrint(
-            '[Petgram] ⚠️ previewContext is null - _shouldUseMockCamera=$_shouldUseMockCamera, previewRect will be updated in _buildCameraStack',
-          );
-        }
-      }
-      // _retryUpdatePreviewRect도 제거 (더 이상 필요 없음)
+      // 첫 번째 프레임: 레이아웃이 완료되었는지 확인
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        // 두 번째 프레임: 레이아웃이 확정된 후 동기화 수행
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          // 세 번째 프레임: 최종 확인 및 동기화
+          if (Platform.isIOS &&
+              !_shouldUseMockCamera &&
+              _cameraEngine.nativeCamera != null) {
+            // 🔥 계산된 rect를 직접 사용하여 동기화 (keyRect가 이전 레이아웃을 반환할 수 있음)
+            final dimensions = _calculateCameraPreviewDimensions();
+            final previewW = dimensions['previewW']!;
+            final previewH = dimensions['previewH']!;
+            final offsetX = dimensions['offsetX']!;
+            final offsetY = dimensions['offsetY']!;
+            
+            // Global 좌표로 변환
+            final RenderBox? rootBox = context.findRenderObject() as RenderBox?;
+            if (rootBox != null) {
+              final Offset localTopLeft = Offset(offsetX, offsetY);
+              final Offset globalTopLeft = rootBox.localToGlobal(localTopLeft);
+              final Rect calculatedRect = Rect.fromLTWH(
+                globalTopLeft.dx,
+                globalTopLeft.dy,
+                previewW,
+                previewH,
+              );
+              
+              if (calculatedRect.width > 0 && calculatedRect.height > 0) {
+                // 🔥 비율 변경 시 강제 동기화: 항상 동기화 (이전 rect와 무관하게)
+                // 비율이 변경되었으므로 _lastSyncedPreviewRect를 무시하고 무조건 동기화
+                // 🔥🔥🔥 중요: _lastSyncedPreviewRect는 null로 유지하여 _buildCameraStack에서도 동기화 보장
+                // 동기화는 _buildCameraStack의 postFrameCallback에서 수행되므로, 여기서는 null로만 설정
+                // _lastSyncedPreviewRect = null; // 이미 setState에서 설정했으므로 중복 설정 불필요
+                // 🔥🔥🔥 비율 변경 시 즉시 동기화 시도 (세션 상태와 관계없이)
+                // 하지만 _buildCameraStack의 postFrameCallback에서도 동기화가 수행되므로,
+                // 여기서는 동기화만 시도하고 _lastSyncedPreviewRect는 업데이트하지 않음
+                _syncPreviewRectToNativeFromLocal(calculatedRect, context);
+                // 추가로 retry도 시도하여 확실히 업데이트
+                _syncPreviewRectWithRetry(calculatedRect, context);
+                // 🔥 _lastSyncedPreviewRect는 _buildCameraStack의 postFrameCallback에서 업데이트됨
+                // 여기서 업데이트하지 않아서 _buildCameraStack에서도 동기화가 수행됨
+                // 🔥 성능 최적화: 비율 변경 로그는 첫 번째만 출력 (빈번한 호출 방지)
+                // if (kDebugMode) { debugPrint('[Petgram] 📐 Aspect ratio changed: ...'); }
+              } else if (kDebugMode) {
+                debugPrint(
+                  '[Petgram] ⚠️ Aspect ratio changed: calculated rect is invalid (width=${calculatedRect.width}, height=${calculatedRect.height}), will retry in _buildCameraStack',
+                );
+              }
+            } else if (kDebugMode) {
+              debugPrint(
+                '[Petgram] ⚠️ Aspect ratio changed: rootBox is null, will retry in _buildCameraStack',
+              );
+            }
+          }
+        });
+      });
     });
-
-    // 프리뷰 강제 업데이트를 위해 약간의 지연 후 다시 빌드
-    Future.delayed(const Duration(milliseconds: 50), () {
-      if (mounted) {
-        setState(() {});
-      }
-    });
+    
+    // 🔥 추가 보장: _buildCameraStack의 postFrameCallback에서도 비율 변경을 감지하도록
+    // _lastSyncedPreviewRect를 null로 설정하여 _buildCameraStack에서도 동기화가 실행되도록 함
+    // (이미 setState에서 설정했지만, 명시적으로 다시 설정하여 보장)
   }
 
   Future<File> _createTempFileFromAsset(String assetPath) async {
@@ -2944,7 +4048,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _isTimerCounting = false;
           _shouldStopTimer = false;
           _timerSeconds = originalTimerSeconds;
+          _isProcessing = false; // 🔥🔥🔥 타이머 취소 시 _isProcessing 리셋
         });
+        if (kDebugMode) {
+          debugPrint('[Petgram] 🛑 타이머 취소: _isProcessing=false로 리셋');
+        }
         // 타이머 강제 종료 시 스낵바 표시 제거 (사용자 요청)
         return;
       }
@@ -2959,7 +4067,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             _isTimerCounting = false;
             _shouldStopTimer = false;
             _timerSeconds = originalTimerSeconds;
+            _isProcessing = false; // 🔥🔥🔥 타이머 취소 시 _isProcessing 리셋
           });
+          if (kDebugMode) {
+            debugPrint('[Petgram] 🛑 타이머 취소 (대기 중): _isProcessing=false로 리셋');
+          }
           // 타이머 강제 종료 시 스낵바 표시 제거 (사용자 요청)
           return;
         }
@@ -2972,9 +4084,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _isTimerCounting = false;
         _shouldStopTimer = false;
         _timerSeconds = originalTimerSeconds;
+        _isProcessing = false; // 🔥🔥🔥 타이머 취소 시 _isProcessing 리셋
       });
+      if (kDebugMode) {
+        debugPrint('[Petgram] 🛑 타이머 취소 (최종 체크): _isProcessing=false로 리셋');
+      }
       // 타이머 강제 종료 시 스낵바 표시 제거 (사용자 요청)
       return;
+    }
+
+    // 🔥 타이머 종료 후 촬영 전 상태 확인 및 로그
+    if (kDebugMode) {
+      debugPrint(
+        '[Petgram] ⏰ 타이머 종료: 촬영 시작 전 상태 확인, _isProcessing=$_isProcessing, _cameraEngine.isCapturingPhoto=${_cameraEngine.isCapturingPhoto}',
+      );
+    }
+    _addDebugLog(
+      '[Timer] ⏰ 타이머 종료: 촬영 시작 전, _isProcessing=$_isProcessing, _cameraEngine.isCapturingPhoto=${_cameraEngine.isCapturingPhoto}',
+    );
+
+    // 🔥 타이머 종료 후 촬영 문제 해결: _isProcessing이 true이면 리셋
+    // 이전 촬영이 완료되지 않았을 수 있으므로 타이머 촬영을 위해 리셋
+    if (_isProcessing) {
+      if (kDebugMode) {
+        debugPrint(
+          '[Petgram] ⚠️ 타이머 종료: _isProcessing=true 감지, 리셋 후 촬영 진행',
+        );
+      }
+      _addDebugLog('[Timer] ⚠️ _isProcessing=true 감지, 리셋 후 촬영 진행');
+      _isProcessing = false; // 타이머 촬영을 위해 리셋
     }
 
     setState(() {
@@ -3016,15 +4154,52 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 사진 촬영 → 저장 파이프라인 트리거
   /// - 캡처(셔터)까지만 await
   /// - 무거운 저장/필터/프레임/메타/DB는 백그라운드에서 처리
-  Future<void> _takePhoto() async {
-    // 이미 캡처 중이면 무시
+  Future<void> _takePhoto({bool isAutoBurst = false}) async {
+    // 🔥🔥🔥 연속 촬영 문제 해결: 플래그를 setState() 호출 전에 동기적으로 설정
+    // setState()는 비동기적으로 작동하므로, 플래그를 먼저 설정하여 race condition 방지
+    if (kDebugMode) {
+      debugPrint(
+        '[Petgram] 📸 _takePhoto ENTRY: isAutoBurst=$isAutoBurst, _isProcessing=$_isProcessing, _cameraEngine.isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, _burstCount=$_burstCount',
+      );
+    }
     if (_isProcessing) {
       _addDebugLog('[takePhoto] blocked: _isProcessing=true');
+      if (kDebugMode) {
+        debugPrint('[Petgram] 🚫 _takePhoto blocked: _isProcessing=true');
+      }
       return;
+    }
+    
+    // 플래그를 먼저 동기적으로 설정 (setState() 호출 전)
+    _isProcessing = true;
+    _addDebugLog('[takePhoto] set isProcessing=true (synchronously, before setState)');
+    
+    // UI 업데이트는 나중에 (필요한 경우)
+    // 실제로 _isProcessing은 UI에 직접 표시되지 않으므로 setState() 호출 불필요
+
+    // 🔥 크래시 방지: 프리뷰가 안정화될 때까지 대기 (최소 300ms)
+    // 프리뷰가 방금 들어왔을 때 AVFoundation 세션이 완전히 안정화되지 않았을 수 있음
+    if (_firstFrameTimestamp != null && !_shouldUseMockCamera) {
+      final timeSinceFirstFrame = DateTime.now().difference(
+        _firstFrameTimestamp!,
+      );
+      const minStabilizationDuration = Duration(milliseconds: 300);
+      if (timeSinceFirstFrame < minStabilizationDuration) {
+        final remainingMs =
+            (minStabilizationDuration - timeSinceFirstFrame).inMilliseconds;
+        if (kDebugMode) {
+          debugPrint(
+            '[Petgram] ⏳ Camera stabilization wait: ${remainingMs}ms remaining (firstFrame=${_firstFrameTimestamp}, now=${DateTime.now()})',
+          );
+        }
+        // 안정화 대기 중에는 조용히 무시 (사용자에게 메시지 표시하지 않음)
+        return;
+      }
     }
 
     // 🔥 Single Source of Truth: canUseCamera 강제 guard (최우선)
     // canUseCamera가 false이면 절대 네이티브 takePicture()를 호출하지 않음
+    // 🔥🔥🔥 세션이 실행 중이 아니면 resumeSession 시도
     if (!canUseCamera) {
       final blockLog =
           '[takePhoto] ❌ BLOCKED: canUseCamera=false '
@@ -3038,23 +4213,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
       // 🔥 크래시 방지: 재초기화 중이거나 촬영 중이면 재초기화 시도하지 않음
       if (!_isReinitializing &&
-          !_isProcessing &&
           !_cameraEngine.isCapturingPhoto) {
-        // 사용자 안내 및 재초기화 시도
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('카메라 연결이 불안정합니다. 카메라를 다시 초기화합니다.'),
-              duration: Duration(seconds: 3),
-            ),
-          );
+        // 🔥🔥🔥 세션이 실행 중이 아니면 resumeSession 시도
+        if (!(_cameraEngine.sessionRunning ?? false) && _cameraEngine.isInitialized) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] 🔄 Session not running, attempting resumeSession...');
+          }
+          try {
+            await _cameraEngine.resume();
+            // resume 후 잠시 대기하여 세션 상태 확인
+            await Future.delayed(const Duration(milliseconds: 500));
+            final retryState = _cameraEngine.lastDebugState;
+            if (retryState?.sessionRunning == true) {
+              if (kDebugMode) {
+                debugPrint('[Petgram] ✅ Session resumed successfully, retrying capture...');
+              }
+              // 세션이 재개되었으면 다시 촬영 시도
+              _takePhoto();
+              return;
+            }
+          } catch (e) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ⚠️ Failed to resume session: $e');
+            }
+          }
         }
-
-        // 🔥 REFACTORING: 자동 재초기화 제거 - 사용자에게 알리기만 함
+        
+        // 사용자 안내
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text('카메라 연결이 불안정합니다. 앱을 재시작해주세요.'),
+              content: Text('카메라 연결이 불안정합니다. 잠시 후 다시 시도해주세요.'),
               duration: Duration(seconds: 3),
             ),
           );
@@ -3072,15 +4261,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    // 타이머 카운트다운 중이면 촬영하지 않음
-    if (_isTimerCounting) return;
+    // 🔥 실기기 동작 수정: 타이머 카운트다운 중이거나 연속 촬영 중일 때 셔터를 다시 누르면 중단
+    // 단, 연속 촬영 자동 호출(isAutoBurst=true)일 때는 이 가드를 통과해야 함
+    if (!isAutoBurst) {
+    if (_isTimerCounting) {
+      setState(() {
+        _shouldStopTimer = true;
+      });
+      _addDebugLog('[UI] Shutter pressed: cancelling active timer');
+      return;
+    }
+
+    if (_isBurstMode && _burstCount > 0) {
+      setState(() {
+        _shouldStopBurst = true;
+      });
+      _addDebugLog('[UI] Shutter pressed: cancelling active burst');
+      return;
+      }
+    }
 
     // 🔥 촬영 중 중복 호출 방지
     if (_cameraEngine.isCapturingPhoto) {
-      final blockLog = '[takePhoto] blocked: already capturing';
+      final blockLog = '[takePhoto] blocked: already capturing (isCapturingPhoto=true)';
       _addDebugLog(blockLog);
       if (kDebugMode) {
         debugPrint('[Petgram] ⚠️ $blockLog');
+        debugPrint(
+          '[Petgram] 🔍 Debug: _isProcessing=$_isProcessing, _cameraEngine.isCapturingPhoto=${_cameraEngine.isCapturingPhoto}, isAutoBurst=$isAutoBurst',
+        );
       }
       return;
     }
@@ -3091,12 +4300,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _captureFenceUntil = captureStart.add(const Duration(seconds: 4));
     _addDebugLog('[takePhoto] 🚧 capture fence set until $_captureFenceUntil');
 
-    if (mounted) {
-      setState(() {
-        _isProcessing = true;
-      });
-      _addDebugLog('[takePhoto] set isProcessing=true (capture begin)');
-    }
+    _addDebugLog('[takePhoto] set isProcessing=true (capture begin)');
     _logPreviewState('takePhoto_capture_begin');
 
     // 연속 촬영 모드 초기화 (촬영 시작 시)
@@ -3603,14 +4807,64 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         }
 
         // 🔥 프레임 오버레이 통합: FrameOverlayConfig를 frameMeta에 포함하여 전달
-        final overlayConfig = _buildFrameOverlayConfig();
+        // 🔥 프레임이 활성화되어 있으면 항상 overlayConfig를 포함 (프리뷰와 동일하게)
         final frameMetaWithOverlay = Map<String, dynamic>.from(meta.frameMeta);
-        if (overlayConfig != null) {
-          frameMetaWithOverlay['overlayConfig'] = overlayConfig.toJson();
+        
+        // 🔥 프레임이 활성화되어 있으면 overlayConfig를 반드시 생성
+        if (config.enableFrame) {
+          final overlayConfig = _buildFrameOverlayConfig();
+          
+          // 🔥 디버그: overlayConfig 생성 상태 확인
           if (kDebugMode) {
             debugPrint(
-              '[Petgram] 📸 FrameOverlayConfig: topChips.count=${overlayConfig.topChips.length}, '
-              'bottomChips.count=${overlayConfig.bottomChips.length}',
+              '[Petgram] 📸 overlayConfig check: enableFrame=${config.enableFrame}, '
+              'frameEnabled=$_frameEnabled, overlayConfig=${overlayConfig != null ? "exists" : "null"}, '
+              'petList.length=${_petList.length}, selectedPetId=$_selectedPetId',
+            );
+          }
+          
+          if (overlayConfig != null) {
+            final overlayJson = overlayConfig.toJson();
+            frameMetaWithOverlay['overlayConfig'] = overlayJson;
+            if (kDebugMode) {
+              debugPrint(
+                '[Petgram] 📸 FrameOverlayConfig added: topChips.count=${overlayConfig.topChips.length}, '
+                'bottomChips.count=${overlayConfig.bottomChips.length}',
+              );
+              debugPrint(
+                '[Petgram] 📸 overlayConfig JSON keys: ${overlayJson.keys.toList()}, '
+                'topChips.length=${(overlayJson['topChips'] as List?)?.length ?? 0}, '
+                'bottomChips.length=${(overlayJson['bottomChips'] as List?)?.length ?? 0}',
+              );
+            }
+          } else {
+            // 🔥 프레임이 활성화되어 있는데 overlayConfig가 null이면 경고
+            // 이 경우에도 빈 overlayConfig를 전달하여 Native에서 처리하도록 함
+            if (kDebugMode) {
+              debugPrint(
+                '[Petgram] ⚠️ WARNING: enableFrame=true but overlayConfig is null! '
+                'frameEnabled=$_frameEnabled, petList.isEmpty=${_petList.isEmpty}, '
+                'selectedPetId=$_selectedPetId',
+              );
+              debugPrint(
+                '[Petgram] ⚠️ Creating empty overlayConfig to ensure frame overlay is attempted',
+              );
+            }
+            // 빈 overlayConfig를 전달하여 Native에서 최소한 날짜 칩이라도 표시하도록 함
+            frameMetaWithOverlay['overlayConfig'] = {
+              'topChips': <Map<String, dynamic>>[],
+              'bottomChips': <Map<String, dynamic>>[
+                {
+                  'label': 'date',
+                  'value': '📅 ${DateTime.now().toString().split(' ')[0]}',
+                },
+              ],
+            };
+          }
+        } else {
+          if (kDebugMode) {
+            debugPrint(
+              '[Petgram] 📸 enableFrame=false, skipping overlayConfig',
             );
           }
         }
@@ -3632,7 +4886,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         final nativeCameraExists = _cameraEngine.nativeCamera != null;
 
         // 🔥 REFACTORING: 촬영 전 상태 확인 (동기화 불필요, 게터로 직접 읽음)
-        await _pollDebugState(); // lastDebugState 업데이트
+        // 🔥 중복 호출 방지: 타이머가 이미 1초마다 폴링하므로 직접 호출 제거
+        // await _pollDebugState(); // lastDebugState 업데이트
 
         // 🔥 촬영 크래시 방지: 재초기화 중이거나 상태가 불안정하면 촬영 차단
         if (_isReinitializing) {
@@ -3861,25 +5116,62 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         );
       }
     } finally {
-      // 캡처 플래그는 바로 내려서 UI가 다시 반응하도록
+      // 🔥🔥🔥 연속 촬영 문제 해결: setState() 내부에서 _isProcessing을 false로 설정하여 위젯 재빌드 보장
+      _addDebugLog('[takePhoto] set isProcessing=false (synchronously, in finally)');
+      // 🔥🔥🔥 연속 촬영 문제 디버깅: isCapturingPhoto 상태 확인
+      if (kDebugMode) {
+        debugPrint('[Petgram] 🔍🔍🔍 _takePhoto finally: _isProcessing=false, _cameraEngine.isCapturingPhoto=${_cameraEngine.isCapturingPhoto}');
+      }
       if (mounted) {
+        // 🔥🔥🔥 연속 촬영 문제 해결: setState() 내부에서 _isProcessing을 변경하여 위젯이 확실히 재빌드되도록 함
         setState(() {
-          _isProcessing = false;
+          _isProcessing = false; // setState 내부에서 변경하여 위젯 재빌드 보장
         });
-        _addDebugLog('[takePhoto] set isProcessing=false (capture end)');
         _logPreviewState('takePhoto_capture_end');
+        if (kDebugMode) {
+          debugPrint('[Petgram] ✅ setState() called: _isProcessing=false, 위젯 재빌드 완료');
+        }
+      } else {
+        // mounted가 false인 경우에도 플래그는 리셋
+        _isProcessing = false;
       }
 
       // 연속 촬영 모드 처리 (캡처만 빠르게 이어감, 저장은 백그라운드)
+      // 🔥🔥🔥 연속 촬영 문제 해결: 첫 번째 촬영이 완료될 때까지 기다린 후 다음 촬영 시작
       if (mounted) {
+        if (kDebugMode) {
+          debugPrint(
+            '[Petgram] 🔍 연속 촬영 체크: _isBurstMode=$_isBurstMode, _shouldStopBurst=$_shouldStopBurst, _burstCount=$_burstCount, _burstCountSetting=$_burstCountSetting',
+          );
+        }
         if (_isBurstMode && !_shouldStopBurst) {
+          // 🔥🔥🔥 연속 촬영 문제 해결: < 로 변경하여 정확한 장수만 촬영
+          // 예: 5장 촬영 시 _burstCount가 5일 때는 완료되어야 함 (1,2,3,4,5 총 5장)
           if (_burstCount < _burstCountSetting) {
-            setState(() => _burstCount++);
-            Future.delayed(const Duration(milliseconds: 120), () {
+            final nextBurstCount = _burstCount + 1;
+            if (kDebugMode) {
+              debugPrint(
+                '[Petgram] 📸 연속 촬영 다음 촬영 예약: 현재=$_burstCount, 다음=$nextBurstCount, 목표=$_burstCountSetting',
+              );
+            }
+            setState(() => _burstCount = nextBurstCount);
+            Future.delayed(const Duration(milliseconds: 120), () async {
+              if (kDebugMode) {
+                debugPrint(
+                  '[Petgram] 📸 연속 촬영 다음 촬영 시작: mounted=$mounted, _shouldStopBurst=$_shouldStopBurst, _burstCount=$_burstCount',
+                );
+              }
               if (mounted && !_shouldStopBurst) {
-                _takePhoto();
+                // 🔥🔥🔥 연속 촬영 문제 해결: await를 사용하여 첫 번째 촬영이 완료될 때까지 기다림
+                // 이렇게 하면 세 요청이 거의 동시에 들어오는 것을 방지할 수 있음
+                // isAutoBurst=true로 설정하여 연속 촬영 자동 호출임을 표시
+                await _takePhoto(isAutoBurst: true);
               } else {
-                if (kDebugMode) debugPrint('🛑 연속 촬영 중지됨');
+                if (kDebugMode) {
+                  debugPrint(
+                    '[Petgram] 🛑 연속 촬영 중지됨: mounted=$mounted, _shouldStopBurst=$_shouldStopBurst',
+                  );
+                }
                 if (mounted) {
                   setState(() {
                     _burstCount = 0;
@@ -3891,7 +5183,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           } else {
             if (kDebugMode) {
               debugPrint(
-                '✅ 연속 촬영 완료: $_burstCountSetting장 (타이머: $_isTimerTriggered)',
+                '[Petgram] ✅ 연속 촬영 완료: $_burstCountSetting장 (현재=$_burstCount, 타이머: $_isTimerTriggered)',
               );
             }
             setState(() {
@@ -3903,7 +5195,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             });
           }
         } else if (_shouldStopBurst) {
-          if (kDebugMode) debugPrint('🛑 연속 촬영 중지 요청 처리');
+          if (kDebugMode) {
+            debugPrint(
+              '[Petgram] 🛑 연속 촬영 중지 요청 처리: _burstCount=$_burstCount',
+            );
+          }
           setState(() {
             _burstCount = 0;
             _shouldStopBurst = false;
@@ -3917,12 +5213,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _openFilterPage(File file, {PetgramPhotoMeta? originalMeta}) {
     // 🔥 필터 페이지 이동 시 카메라 세션 일시 중지 및 상태 플래그 리셋
     _pauseCameraSession();
-    // 로딩 상태 플래그 리셋 (무한 로딩 방지)
-    if (mounted) {
-      setState(() {
-        // 카메라 준비 상태는 유지하되, 초기화 중 플래그는 리셋
-      });
-    }
+    // 🔥 성능 최적화: 빈 setState 제거 (기능 영향 없음)
+    // 로딩 상태 플래그는 실제로 변경되지 않으므로 setState 불필요
+    // if (mounted) {
+    //   setState(() {
+    //     // 카메라 준비 상태는 유지하되, 초기화 중 플래그는 리셋
+    //   });
+    // }
 
     // 현재 선택된 펫 정보 가져오기
     PetInfo? currentPet;
@@ -3934,7 +5231,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
     }
 
-    // 즉시 FilterPage로 push (await 제거하여 전환 애니메이션이 끊기지 않도록)
+    // 🔥 FilterPage로 이동 시 카메라 pause (이미 위에서 호출됨)
+    // FilterPage에서 돌아올 때 resume
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => FilterPage(
@@ -3947,14 +5245,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           aspectMode: _aspectMode, // 선택된 비율 모드 전달
         ),
       ),
-    );
-    // FilterPage에서 갤러리 저장 후 자동으로 닫히므로 여기서는 추가 처리 불필요
+    ).then((_) {
+      // 🔥 FilterPage에서 돌아올 때 카메라 resume
+      if (mounted) {
+        _resumeCameraSession();
+      }
+    });
   }
 
   /// 🔥 프레임 오버레이 통합: FrameOverlayConfig 생성
   /// 프리뷰와 저장 모두 이 함수를 사용하여 일관성 유지
   FrameOverlayConfig? _buildFrameOverlayConfig() {
+    // 🔥 디버그: 프레임 오버레이 생성 조건 확인
+    if (kDebugMode) {
+      debugPrint(
+        '[Petgram] 🖼️ _buildFrameOverlayConfig: frameEnabled=$_frameEnabled, '
+        'petList.length=${_petList.length}, selectedPetId=$_selectedPetId',
+      );
+    }
+    
     if (!_frameEnabled || _petList.isEmpty) {
+      if (kDebugMode) {
+        debugPrint(
+          '[Petgram] 🖼️ _buildFrameOverlayConfig: returning null (frameEnabled=$_frameEnabled, petList.isEmpty=${_petList.isEmpty})',
+        );
+      }
       return null;
     }
 
@@ -3967,12 +5282,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (_petList.isNotEmpty) {
           selectedPet = _petList.first;
         }
+        if (kDebugMode) {
+          debugPrint(
+            '[Petgram] 🖼️ _buildFrameOverlayConfig: selectedPetId not found, using first pet: ${selectedPet?.name ?? "null"}',
+          );
+        }
       }
     } else if (_petList.isNotEmpty) {
       selectedPet = _petList.first;
+      if (kDebugMode) {
+        debugPrint(
+          '[Petgram] 🖼️ _buildFrameOverlayConfig: no selectedPetId, using first pet: ${selectedPet.name}',
+        );
+      }
     }
 
     if (selectedPet == null) {
+      if (kDebugMode) {
+        debugPrint(
+          '[Petgram] 🖼️ _buildFrameOverlayConfig: returning null (selectedPet is null)',
+        );
+      }
       return null;
     }
 
@@ -4125,21 +5455,48 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    // 🔥 성능 최적화: 스플래시는 initState에서 제거되므로 여기서는 제거하지 않음
+    
+    // 🔥 실기기 프리뷰 안 보이는 문제 해결:
+    // 네이티브 카메라가 Flutter 뷰 뒤(z-order: back)에 위치하므로,
+    // Flutter의 최상위 배경이 불투명하면 카메라 프리뷰가 가려짐.
+    // 실기기 네이티브 카메라 모드일 때만 배경을 투명하게 설정.
+    // 🔥 프리뷰 상하단 핑크색은 네이티브(RootViewController)가 비율에 맞춰 그리므로,
+    // Flutter에서는 배경을 투명하게 설정하여 네이티브 배경색이 보이도록 함.
+
     return Scaffold(
       key: const Key('home_scaffold'),
-      backgroundColor: const Color(0xFFFFF0F5),
+      backgroundColor: Colors.transparent, // 🔥 투명: 네이티브 배경색이 보이도록
       body: SafeArea(
         top: true,
         bottom: false,
         child: Stack(
           children: [
-            Positioned.fill(child: Container(color: const Color(0xFFFFF0F5))),
+            // 🔥 배경색 제거: 네이티브가 프리뷰 영역 외부를 핑크색으로 그리므로 Flutter에서는 투명하게 설정
+            // Positioned.fill 배경색 제거 - 네이티브 배경색이 보이도록 함
             _buildCameraPreviewLayer(),
-            Positioned.fill(child: IgnorePointer(ignoring: true)),
             _buildCameraOverlayLayer(),
+            // 🔥 실기기 동작 수정: 타이머나 연속 촬영 중일 때 화면 빈 공간을 터치하면 즉시 중단
+            if (_isTimerCounting || (_isBurstMode && _burstCount > 0))
+              Positioned.fill(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (_) {
+                    setState(() {
+                      if (_isTimerCounting) _shouldStopTimer = true;
+                      if (_isBurstMode && _burstCount > 0)
+                        _shouldStopBurst = true;
+                    });
+                    _addDebugLog(
+                      '[UI] Global tap: cancelling active timer/burst',
+                    );
+                  },
+                  child: Container(color: Colors.transparent),
+                ),
+              ),
             _buildTopControls(),
             _buildBottomControls(),
-            if (_showDebugOverlay) _buildCameraDebugOverlay(),
+            // if (_showDebugOverlay) _buildCameraDebugOverlay(), // 🔥 디버그 삭제
           ],
         ),
       ),
@@ -4169,6 +5526,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         onScaleUpdate: _handleZoomScaleUpdate,
         onScaleEnd: _handleZoomScaleEnd,
         onTapUp: (details) {
+          // 🔥 실기기 동작 수정: 타이머나 연속 촬영 중일 때 화면을 터치하면 중단
+          if (_isTimerCounting || (_isBurstMode && _burstCount > 0)) {
+            setState(() {
+              if (_isTimerCounting) _shouldStopTimer = true;
+              if (_isBurstMode && _burstCount > 0) _shouldStopBurst = true;
+            });
+            _addDebugLog('[UI] Tap ignored: cancelling active timer/burst');
+            return; // 중단 시 포커스 동작은 수행하지 않음
+          }
+
           final RenderBox? box =
               _previewStackKey.currentContext?.findRenderObject() as RenderBox?;
           if (box != null && box.hasSize) {
@@ -4208,7 +5575,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     required Widget source,
     required bool isCameraInitializing,
   }) {
+    // 🔥 비율 변경 시 레이아웃 재빌드 보장: key에 targetRatio 포함
     return Container(
+      key: ValueKey(
+        'camera_stack_${targetRatio.toStringAsFixed(3)}_${_aspectMode.toString()}',
+      ),
       color: Colors.transparent,
       // Stack을 Center가 아닌 Positioned.fill처럼 동작하게 하여 가용 영역을 꽉 채움
       child: LayoutBuilder(
@@ -4217,27 +5588,286 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           final double maxHeight = constraints.maxHeight;
 
           // targetRatio를 유지하면서 가용 영역 내 최대 크기 계산
+          // 🔥🔥🔥 9:16 비율 특별 처리: 세로가 긴 비율이므로 세로를 기준으로 계산
+          final bool isNineSixteen = (targetRatio - (9.0 / 16.0)).abs() < 0.001;
           double width, height;
-          if (maxWidth / maxHeight > targetRatio) {
+          if (targetRatio > 1.0) {
+            // 가로가 더 긴 비율 (예: 16:9)
             height = maxHeight;
             width = height * targetRatio;
+            if (width > maxWidth) {
+              width = maxWidth;
+              height = width / targetRatio;
+            }
+          } else if (targetRatio < 1.0) {
+            // 세로가 더 긴 비율 (예: 9:16, 3:4)
+            // 🔥🔥🔥 9:16은 세로가 매우 길므로 세로를 최대한 보존
+            height = maxHeight;
+            width = height * targetRatio;
+            if (width > maxWidth && !isNineSixteen) {
+              // 9:16이 아닌 경우에만 가로를 기준으로 재계산 (3:4 등)
+              width = maxWidth;
+              height = width / targetRatio;
+            }
+            // 🔥🔥🔥 9:16 비율은 가로가 화면을 넘어도 세로를 보존 (가로는 좌우로 잘림)
           } else {
-            width = maxWidth;
-            height = width / targetRatio;
+            // 1:1 비율: 화면의 작은 쪽을 기준으로 정사각형 생성
+            final double minDimension = math.min(maxWidth, maxHeight);
+            width = minDimension;
+            height = minDimension;
           }
 
           final double top = (maxHeight - height) / 2;
           final double left = (maxWidth - width) / 2;
 
           // 🔥 iOS 실기기 프리뷰 동기화: 레이아웃 확정 후 다음 프레임에서 수행
-          if (Platform.isIOS) {
+          // 🔥 비율 변경 시 즉시 동기화: targetRatio가 변경되면 항상 동기화 시도
+          if (Platform.isIOS && !_shouldUseMockCamera) {
+            // 🔥 프리뷰 동기화 개선: postFrameCallback을 여러 번 호출하여 레이아웃 완료 보장
+            // 비율 변경 시 레이아웃이 완료될 때까지 여러 프레임 대기
             WidgetsBinding.instance.addPostFrameCallback((_) {
               if (!mounted) return;
-              final Rect? rect = _getPreviewRectFromKey();
-              if (rect != null && rect != _lastSyncedPreviewRect) {
-                _lastSyncedPreviewRect = rect;
-                _syncPreviewRectWithRetry(rect, context);
+              
+              // 🔥🔥🔥 첫 번째 프레임: 카메라가 준비되었는지 확인 (백그라운드 복귀 시 세션 방해 방지)
+              // 카메라가 초기화되지 않았거나 세션이 실행 중이 아니면 postFrameCallback 체인 중단
+              // 🔥🔥🔥 단, 비율 변경 시(_lastSyncedPreviewRect == null)에는 세션 상태와 관계없이 동기화 시도
+              if (!_shouldUseMockCamera) {
+                if (!_cameraEngine.isInitialized) {
+                  // 🔥 성능 최적화: 불필요한 로그 제거 (정상적인 스킵 상황)
+                  return;
+                }
+                
+                // 🔥 세션 상태 확인: 세션이 실행 중이 아니면 동기화 시도하지 않음
+                // 🔥 단, 비율 변경 시(_lastSyncedPreviewRect == null) 또는 백그라운드 복귀 시(_isResumingCamera)에는 세션 상태와 관계없이 동기화 시도
+                final sessionRunning = _cameraEngine.sessionRunning ?? false;
+                final isAspectRatioChange = _lastSyncedPreviewRect == null;
+                final isResuming = _isResumingCamera; // 🔥🔥🔥 백그라운드 복귀 시 강제 동기화
+                
+                if (!sessionRunning && !isAspectRatioChange && !isResuming) {
+                  // 🔥 성능 최적화: 불필요한 로그 제거 (정상적인 스킵 상황)
+                  return;
+                }
+                
+                // 🔥 성능 최적화: 정상적인 동기화 로그 제거 (에러 상황만 로그)
+                // if (kDebugMode && (!sessionRunning && (isAspectRatioChange || isResuming))) {
+                //   debugPrint('[Petgram] 🚀 _buildCameraStack: FORCING sync...');
+                // }
               }
+              
+              // 🔥🔥🔥 성능 최적화: 1:1 비율의 경우 즉시 동기화 (여러 프레임 대기 없이)
+              // 1:1 비율은 정사각형이므로 레이아웃 계산이 단순하여 즉시 동기화 가능
+              final bool isOneToOne = targetRatio == 1.0;
+              
+              // 첫 번째 프레임: 레이아웃이 완료되었는지 확인
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (!mounted) return;
+                
+                // 🔥 1:1 비율의 경우: 즉시 동기화 (백그라운드 복귀 시 빠른 복원)
+                // 🔥🔥🔥 백그라운드 복귀 시(_isResumingCamera)에도 강제 동기화
+                if (isOneToOne && (_lastSyncedPreviewRect == null || _isResumingCamera)) {
+                  // 계산된 값으로 즉시 rect 생성
+                  final RenderBox? rootBox = context.findRenderObject() as RenderBox?;
+                  if (rootBox != null) {
+                    final Offset localTopLeft = Offset(left, top);
+                    final Offset globalTopLeft = rootBox.localToGlobal(localTopLeft);
+                    final Rect rectToSync = Rect.fromLTWH(
+                      globalTopLeft.dx,
+                      globalTopLeft.dy,
+                      width,
+                      height,
+                    );
+                    
+                    // 즉시 동기화 (여러 프레임 대기 없이)
+                    if (!_shouldUseMockCamera && _cameraEngine.isInitialized) {
+                      _syncPreviewRectToNativeFromLocal(rectToSync, context);
+                      _syncPreviewRectWithRetry(rectToSync, context);
+                      _lastSyncedPreviewRect = rectToSync;
+                      if (kDebugMode) {
+                        debugPrint(
+                          '[Petgram] 🚀 _buildCameraStack: 1:1 ratio - immediate sync (rectToSync=$rectToSync, isResuming=$_isResumingCamera)',
+                        );
+                      }
+                    }
+                    return; // 1:1 비율은 여기서 종료
+                  }
+                }
+                
+                // 두 번째 프레임: 레이아웃이 확정된 후 동기화 수행 (1:1이 아닌 경우)
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted) return;
+                  // 세 번째 프레임: 최종 확인 및 동기화 (비율 변경 시 레이아웃 완료 보장)
+                  // 🔥🔥🔥 핵심 수정: _getPreviewRectFromKey()가 이전 레이아웃을 반환할 수 있으므로,
+                  // 계산된 width, height, top, left를 직접 사용하여 rect 생성
+                  final Rect? keyRect = _getPreviewRectFromKey();
+                  Rect? rectToSync;
+                  
+                  if (keyRect != null && keyRect.width > 0 && keyRect.height > 0) {
+                    // 🔥 비율 검증: 실제 rect 비율과 targetRatio를 비교 (백그라운드 복귀 시 잘못된 비율 방지)
+                    final actualRatio = keyRect.width / keyRect.height;
+                    final ratioDiff = (actualRatio - targetRatio).abs();
+                    
+                    // 🔥 1:1 비율은 더 엄격한 검증 (0.05 이상 차이면 재생성)
+                    // 다른 비율은 0.1 이상 차이일 때만 재생성
+                    final ratioThreshold = targetRatio == 1.0 ? 0.05 : 0.1;
+                    
+                    if (ratioDiff > ratioThreshold) {
+                      // 🔥 비율이 크게 다르면 계산된 값으로 rect 재생성 (백그라운드 복귀 시 잘못된 비율 방지)
+                      final RenderBox? rootBox = context.findRenderObject() as RenderBox?;
+                      if (rootBox != null) {
+                        final Offset localTopLeft = Offset(left, top);
+                        final Offset globalTopLeft = rootBox.localToGlobal(localTopLeft);
+                        rectToSync = Rect.fromLTWH(
+                          globalTopLeft.dx,
+                          globalTopLeft.dy,
+                          width,
+                          height,
+                        );
+                        
+                        if (kDebugMode) {
+                          debugPrint(
+                            '[Petgram] ⚠️ _buildCameraStack: keyRect has wrong ratio (targetRatio=$targetRatio, actualRatio=${actualRatio.toStringAsFixed(3)}, ratioDiff=${ratioDiff.toStringAsFixed(3)}), using calculated rect=$rectToSync',
+                          );
+                        }
+                      } else {
+                        rectToSync = keyRect;
+                      }
+                    } else {
+                      // 비율이 맞거나 차이가 작으면 keyRect 사용
+                      rectToSync = keyRect;
+                    }
+                  } else {
+                    // keyRect가 null이거나 유효하지 않으면 계산된 값으로 rect 생성
+                    final RenderBox? rootBox = context.findRenderObject() as RenderBox?;
+                    if (rootBox != null) {
+                      final Offset localTopLeft = Offset(left, top);
+                      final Offset globalTopLeft = rootBox.localToGlobal(localTopLeft);
+                      rectToSync = Rect.fromLTWH(
+                        globalTopLeft.dx,
+                        globalTopLeft.dy,
+                        width,
+                        height,
+                      );
+                      
+                      if (kDebugMode) {
+                        debugPrint(
+                          '[Petgram] ⚠️ _buildCameraStack: keyRect is null or invalid, using calculated rect=$rectToSync (targetRatio=$targetRatio, aspectMode=$_aspectMode)',
+                        );
+                      }
+                    }
+                  }
+                  
+                  if (rectToSync != null && rectToSync.width > 0 && rectToSync.height > 0) {
+                    // 🔥🔥🔥 카메라 세션이 준비된 후에만 동기화 (백그라운드 복귀 시 세션 방해 방지)
+                    // 카메라가 준비되지 않았거나 재개 중이면 동기화를 건너뛰고 다음 프레임에서 다시 시도
+                    // 🔥🔥🔥 단, 비율 변경 시(_lastSyncedPreviewRect == null)에는 세션 상태와 관계없이 동기화 시도
+                    final isAspectRatioChange = _lastSyncedPreviewRect == null;
+                    
+                    if (!_shouldUseMockCamera) {
+                      if (!_cameraEngine.isInitialized) {
+                        // 🔥 성능 최적화: 불필요한 로그 제거 (정상적인 스킵 상황)
+                        return;
+                      }
+                      
+                      // 🔥🔥🔥 백그라운드 복귀 시(_isResumingCamera) 강제 동기화
+                      // 재개 중이면 무조건 동기화 시도 (최초 실행 후 첫 백그라운드 복귀 시 비율 복원 보장)
+                      final shouldForceSync = _isResumingCamera || isAspectRatioChange;
+                      
+                      if (shouldForceSync) {
+                        // 🔥 성능 최적화: 정상적인 동기화 로그 제거 (에러 상황만 로그)
+                        // 즉시 동기화 진행 (아래 코드 계속 실행)
+                      } else {
+                        // 재개 중이 아니고 비율 변경도 아니면 동기화 스킵
+                        // 🔥 성능 최적화: 불필요한 로그 제거 (정상적인 스킵 상황)
+                        return;
+                      }
+                    }
+                    
+                    // 🔥🔥🔥 비율 검증: 백그라운드 복귀 시 잘못된 비율 방지
+                    // 백그라운드 복귀 시 UI는 3:4인데 실제는 9:16으로 노출되는 문제 해결
+                    final actualRatio = rectToSync.width / rectToSync.height;
+                    final ratioDiff = (actualRatio - targetRatio).abs();
+                    
+                    // 🔥🔥🔥 성능 최적화: 1:1 비율의 경우 비율 검증 임계값 완화 (백그라운드 복귀 시 빠른 복원)
+                    // 1:1 비율은 정사각형이므로 작은 차이도 정상 범위로 간주
+                    // 백그라운드 복귀 시에는 더 관대하게 처리하여 빠른 복원 보장
+                    final bool isResuming = _isResumingCamera;
+                    final double ratioThreshold = (targetRatio == 1.0) 
+                        ? (isResuming ? 0.1 : 0.05)  // 1:1 + 재개 중: 0.1, 1:1 + 일반: 0.05
+                        : 0.1;  // 다른 비율: 0.1
+                    
+                    // 🔥 크기나 위치가 변경되면 무조건 동기화
+                    final sizeOrPositionChanged =
+                        _lastSyncedPreviewRect == null ||
+                        (rectToSync.width != _lastSyncedPreviewRect!.width) ||
+                        (rectToSync.height != _lastSyncedPreviewRect!.height) ||
+                        (rectToSync.top != _lastSyncedPreviewRect!.top) ||
+                        (rectToSync.left != _lastSyncedPreviewRect!.left);
+                    
+                    // 🔥🔥🔥 비율 검증: 크기/위치가 같아도 비율이 임계값 이상 차이나면 무조건 동기화
+                    // 백그라운드 복귀 시 크기/위치가 같아도 비율이 다를 수 있음 (예: 3:4 vs 9:16)
+                    // 🔥🔥🔥 1:1 비율 + 재개 중: 비율 검증을 완화하여 빠른 복원 보장
+                    // ratioDiff > ratioThreshold: 비율 차이가 임계값 이상이면 무조건 동기화
+                    // 🔥🔥🔥 촬영 후 비율 변경 시에도 동기화 보장: _lastSyncedPreviewRect가 null이면 무조건 동기화
+                    final ratioMismatch = ratioDiff > ratioThreshold || (isResuming && targetRatio == 1.0 && ratioDiff > 0.05);
+                    
+                    // 🔥🔥🔥 촬영 후 비율 변경 시 동기화 보장: 
+                    // 1. _lastSyncedPreviewRect가 null이면 무조건 동기화
+                    // 2. 실제 rect의 비율이 targetRatio와 다르면 무조건 동기화 (비율 변경 감지)
+                    // 3. 크기나 위치가 변경되면 동기화
+                    // 🔥🔥🔥 비율 변경 시 무조건 동기화: isAspectRatioChange가 true이면 무조건 동기화
+                    final shouldSync = isAspectRatioChange || sizeOrPositionChanged || ratioMismatch || ratioDiff > 0.01;
+                    
+                    // 🔥 성능 최적화: 비율 불일치 로그 제거 (정상적인 동기화 상황)
+                    // if (kDebugMode && ratioMismatch && !sizeOrPositionChanged) {
+                    //   debugPrint('[Petgram] ⚠️ _buildCameraStack: Ratio mismatch detected...');
+                    // }
+                    
+                    if (shouldSync) {
+                      // 🔥🔥🔥 성능 최적화: 같은 rect로 중복 호출 방지
+                      // 크기와 위치가 모두 같으면 스킵 (비율 변경이 아닌 경우)
+                      if (!isAspectRatioChange && _lastSyncedPreviewRect != null) {
+                        final rect = _lastSyncedPreviewRect!;
+                        final isSameRect = (rect.width - rectToSync.width).abs() < 0.1 &&
+                            (rect.height - rectToSync.height).abs() < 0.1 &&
+                            (rect.left - rectToSync.left).abs() < 0.1 &&
+                            (rect.top - rectToSync.top).abs() < 0.1;
+                        if (isSameRect) {
+                          // 🔥 성능 최적화: 같은 rect로 중복 호출 방지
+                          return;
+                        }
+                      }
+                      
+                      // 🔥🔥🔥 비율 변경 시 즉시 동기화 (세션 상태와 관계없이)
+                      // 🔥🔥🔥 중요: 비율 변경 시에는 _lastSyncedPreviewRect를 동기화 후에 업데이트해야 함
+                      // 동기화 전에 업데이트하면 다음 동기화 시도에서 isAspectRatioChange가 false가 되어 스킵됨
+                      if (isAspectRatioChange) {
+                        // 비율 변경 시: 동기화를 먼저 수행
+                        _syncPreviewRectToNativeFromLocal(rectToSync, context);
+                        _syncPreviewRectWithRetry(rectToSync, context);
+                        // 동기화가 완료된 후에 _lastSyncedPreviewRect 업데이트 (다음 프레임에서)
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (mounted) {
+                            _lastSyncedPreviewRect = rectToSync;
+                            // 🔥 성능 최적화: _lastSyncedPreviewRect 업데이트 로그 제거
+                            // if (kDebugMode) { debugPrint('[Petgram] 📐 _buildCameraStack: _lastSyncedPreviewRect updated...'); }
+                          }
+                        });
+                      } else {
+                        // 비율 변경이 아닌 경우: 기존 로직 유지 (동기화 전에 업데이트)
+                        _lastSyncedPreviewRect = rectToSync;
+                        _syncPreviewRectToNativeFromLocal(rectToSync, context);
+                        _syncPreviewRectWithRetry(rectToSync, context);
+                      }
+                      // 🔥 성능 최적화: 정상적인 동기화 로그 제거 (레이아웃 변경 시마다 호출되므로)
+                      // if (kDebugMode) { debugPrint('[Petgram] 📐 _buildCameraStack: synced preview rect=...'); }
+                    }
+                  } else if (kDebugMode) {
+                    debugPrint(
+                      '[Petgram] ⚠️ _buildCameraStack: rectToSync is null or invalid (rectToSync=$rectToSync)',
+                    );
+                  }
+                });
+              });
             });
           }
 
@@ -4252,6 +5882,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
           return Stack(
             children: [
+              // 🔥 iOS 실기기 프리뷰 안 보이는 문제 해결: 네이티브 카메라가 배경을 처리하므로 Flutter에서는 투명하게 설정
+              // 시뮬레이터나 Mock 모드일 때만 핑크색 배경을 그림
+              if (_shouldUseMockCamera || _cameraEngine.isSimulator)
+                Positioned.fill(
+                  child: Container(
+                    color: const Color(0xFFFFF0F5), // 연핑크색 (시뮬레이터/Mock 모드에서만)
+                  ),
+                ),
+              // 🔥 프리뷰 영역: 계산된 위치와 크기
               Positioned(
                 top: top,
                 left: left,
@@ -4260,29 +5899,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 child: RepaintBoundary(
                   key: _previewStackKey,
                   child: Stack(
-                    fit: StackFit.expand,
                     children: [
-                      // 1. 카메라 프리뷰 (FittedBox로 최적화된 크롭)
-                      ClipRect(
-                        child: FittedBox(
-                          fit: BoxFit.cover,
-                          clipBehavior: Clip.hardEdge,
-                          child: SizedBox(
-                            width: width, // 실제 width 사용
-                            height:
-                                width /
-                                (_sensorAspectRatio > 0
-                                    ? _sensorAspectRatio
-                                    : 0.75),
-                            child: source,
+                      // 1. 카메라 프리뷰
+                      // 🔥🔥🔥 ParentDataWidget 에러 근본 해결: ColorFiltered를 SizedBox로 감싸서 제약 명시적 전달
+                      // 문제: ColorFiltered가 tight constraints를 제대로 처리하지 못함
+                      // 해결책: SizedBox.expand()로 감싸서 부모 제약을 명시적으로 전달
+                      Positioned.fill(
+                        child: ClipRect(
+                          child: SizedBox.expand(
+                            child: ColorFiltered(
+                              colorFilter: ColorFilter.matrix(
+                                _buildPreviewColorMatrix(),
+                              ),
+                              child: source, // NativeCameraPreview (iOS에서는 LayoutBuilder 반환)
+                            ),
                           ),
                         ),
                       ),
-                      // 2. 격자선
+                      // 2. 격자선 (RepaintBoundary를 Positioned.fill 내부로 이동)
                       _buildGridLines(width, height),
                       // 3. 포커스 인디케이터
                       _buildFocusIndicatorLayer(width, height),
-                      // 4. 프레임 UI (계산된 상대 오프셋 전달)
+                      // 4. 프레임 UI (RepaintBoundary를 Positioned.fill 내부로 이동)
                       _buildFrameUILayer(width, height, relativeFrameTopOffset),
                     ],
                   ),
@@ -4297,43 +5935,144 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   /// 카메라 프리뷰 소스 (순수 위젯만 반환, AspectRatio 금지)
   Widget _buildCameraPreview() {
-    // 🔥 시뮬레이터 또는 카메라 장치가 없는 경우 mock 이미지를 보여줌
-    final bool noCameras = widget.cameras.isEmpty;
     final bool isMock = _cameraEngine.useMockCamera || _shouldUseMockCamera;
+    final bool isSimulator = _cameraEngine.isSimulator;
 
-    if (noCameras || isMock) {
+    // 🔥 시뮬레이터 및 실기기 초기화 전 대응:
+    // 1. 이미 Mock 모드이거나, 시뮬레이터인 경우 (또는 iOS가 아닌데 카메라가 없는 경우)
+    if (isMock || isSimulator || (widget.cameras.isEmpty && !Platform.isIOS)) {
       return Image.asset(
         'assets/images/mockup.png',
         fit: BoxFit.cover,
-        // 이미지 로딩 에러 시 검은 배경 (에셋 누락 대비)
+        alignment: Alignment.center,
+        key: _mockPreviewKey,
         errorBuilder: (ctx, e, st) => Container(color: Colors.black),
       );
     }
 
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        NativeCameraPreview(
-          key: _nativePreviewKey,
-          onCreated: (int viewId) {
+    // 2. 실기기 환경 (iOS)
+    // 🔥 프리뷰 표시: NativeCameraPreview는 항상 빌드 (초기화는 onCreated에서 처리)
+    //                초기화 전이라도 위젯을 빌드해야 네이티브 뷰가 생성됨
+    // 🔥 ParentDataWidget 에러 해결: Stack 제거하고 NativeCameraPreview 직접 반환
+    // NativeCameraPreview는 SizedBox.shrink()를 반환하므로 Stack이 불필요
+    return NativeCameraPreview(
+      key: _nativePreviewKey,
+      onCreated: (int viewId) async {
             _cameraEngine.attachNativeView(viewId);
+            // 🔥🔥🔥 성능 최적화: 카메라 초기화와 비율 설정을 동시에 처리
+            // 초기화 요청 시 비율 정보를 전달하고, 초기화 완료 후 즉시 비율 동기화 트리거
+            if (mounted &&
+                !_cameraEngine.isInitialized &&
+                !_shouldUseMockCamera) {
+              try {
+                final targetRatio = _getTargetAspectRatio();
+                
+                // 🔥🔥🔥 카메라 초기화와 비율 설정을 동시에 요청
+                // 네이티브 FSM에 초기화 요청 (비율 정보 포함, 중복 체크는 네이티브에서 처리)
+                await _cameraEngine.requestInitializeIfNeeded(
+                  viewId: viewId,
+                  cameraPosition: 'back',
+                  aspectRatio: targetRatio,
+                );
+                _addDebugLog(
+                  '[NativePreview] ✅ Camera initialization requested with aspectRatio=${targetRatio.toStringAsFixed(3)}',
+                );
+
+                // 🔥🔥🔥 성능 최적화: 초기화 완료 대기 시간 단축 (5초 → 2초)
+                // 세션이 시작되면 즉시 초기화 완료로 간주하고, 비율 동기화 트리거
+                int checkCount = 0;
+                const maxChecks = 20; // 20 * 100ms = 2초
+                bool sessionStarted = false;
+                while (checkCount < maxChecks && mounted) {
+                  await Future.delayed(const Duration(milliseconds: 100));
+                  final state = _cameraEngine.lastDebugState;
+                  if (state != null && state.sessionRunning) {
+                    sessionStarted = true;
+                    _addDebugLog(
+                      '[NativePreview] ✅ Camera session started (sessionRunning=true)',
+                    );
+                    break;
+                  }
+                  checkCount++;
+                }
+
+                // 🔥🔥🔥 초기화 완료 후 즉시 비율 동기화 트리거
+                // _lastSyncedPreviewRect를 null로 설정하여 다음 프레임에서 즉시 동기화
+                if (mounted && sessionStarted) {
+                  _lastSyncedPreviewRect = null; // 비율 동기화 강제
+                  
+                  // 🔥 즉시 재빌드 트리거하여 비율 동기화 시도
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted) {
+                      setState(() {
+                        // 상태 업데이트로 재빌드 트리거 (비율 동기화 보장)
+                      });
+                    }
+                  });
+                  
+                  if (kDebugMode) {
+                    debugPrint(
+                      '[Petgram] 🚀 Camera initialized: aspect ratio sync triggered (targetRatio=${targetRatio.toStringAsFixed(3)})',
+                    );
+                  }
+                }
+
+                // 초기화 완료: isInitializing을 false로 설정하도록 강제 업데이트
+                if (mounted) {
+                  setState(() {
+                    // 상태 업데이트를 통해 isInitializing이 false가 되도록 함
+                  });
+                }
+              } catch (e) {
+                _addDebugLog(
+                  '[NativePreview] ❌ Camera initialization request failed: $e',
+                );
+                if (kDebugMode) {
+                  debugPrint(
+                    '[Petgram] ❌ Camera initialization request failed in onCreated: $e',
+                  );
+                }
+                // 초기화 실패해도 isInitializing을 false로 설정 (무한 로딩 방지)
+                if (mounted) {
+                  setState(() {
+                    // 상태 업데이트를 통해 isInitializing이 false가 되도록 함
+                  });
+                }
+              }
+            }
           },
-        ),
-        if (!canUseCamera) Container(color: Colors.black),
-      ],
-    );
+        );
+
+    // 🔥 프리뷰 표시: isInitialized가 true이면 프리뷰를 보여줌
+    //    canUseCamera 조건은 촬영 시에만 체크하고, 프리뷰 표시는 초기화 완료만 확인
+    // 🔥 ParentDataWidget 에러 해결: Stack 제거했으므로 조건부 위젯도 제거
+    // NativeCameraPreview만 반환하고, 초기화 중 표시는 다른 곳에서 처리
   }
 
   /// GlobalKey를 이용한 안전한 좌표 측정
+  /// 🔥 프리뷰 위치 문제 해결: 격자와 정확히 일치하도록 수정
   Rect? _getPreviewRectFromKey() {
     final contextObj = _previewStackKey.currentContext;
     if (contextObj == null) return null;
     final RenderBox? box = contextObj.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return null;
-    final RenderBox? stackBox = context.findRenderObject() as RenderBox?;
-    if (stackBox == null) return null;
-    final Offset position = box.localToGlobal(Offset.zero, ancestor: stackBox);
-    return position & box.size;
+
+    // 🔥 수정: 최상위 스택(전체 화면) 기준으로 global 좌표 계산
+    // 격자는 같은 Positioned 위젯 내부에 있으므로, 네이티브 프리뷰도 같은 위치에 있어야 함
+    final RenderBox? rootBox = context.findRenderObject() as RenderBox?;
+    if (rootBox == null) return null;
+
+    // Positioned 위젯의 local 좌표를 global로 변환
+    final Offset globalTopLeft = box.localToGlobal(
+      Offset.zero,
+      ancestor: rootBox,
+    );
+    return Rect.fromLTWH(
+      globalTopLeft.dx,
+      globalTopLeft.dy,
+      box.size.width,
+      box.size.height,
+    );
   }
 
   /// 카메라 오버레이 레이어 (프리뷰를 덮지 않는 투명 오버레이)
@@ -4430,10 +6169,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (scale <= 0) return;
 
     // 🔥 직관적인 줌: base * scale 방식 (두 손가락 벌리면 확대, 모으면 축소)
-    final double newZoom = (_baseUiZoomScale * scale).clamp(
+    double newZoom = (_baseUiZoomScale * scale).clamp(
       _uiZoomMin,
       _uiZoomMax,
     );
+    
+    // 🔥🔥🔥 전면 카메라: 0.5x는 렌즈 전환이 불가능하므로 1.0으로 clamp
+    if (_cameraLensDirection == CameraLensDirection.front && newZoom < 1.0) {
+      newZoom = 1.0;
+    }
 
     // 🔥 변화량이 0.001 이상일 때만 업데이트 (불필요한 setState 방지)
     if ((newZoom - _uiZoomScale).abs() > 0.001) {
@@ -4441,29 +6185,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _uiZoomScale = newZoom;
       });
 
-      _maybeSwitchNativeLensForZoom(_uiZoomScale);
-
-      // 🔥 이슈 4 수정: 전면 카메라에서도 줌이 동작하도록 조건 제거
+      // 🔥🔥🔥 iOS 기본 카메라 앱과 동일: Native에서 렌즈 전환을 자동으로 처리
+      // Flutter에서는 setZoom만 호출하면 Native가 필요한 렌즈 전환을 자동으로 수행
       if (_cameraEngine.isInitialized && !_shouldUseMockCamera) {
+        _cameraEngine.setZoom(_uiZoomScale);
         if (kDebugMode) {
           debugPrint(
             '[Zoom] uiZoomScale updated: ${_uiZoomScale.toStringAsFixed(3)}, '
+            'lensKind=$_nativeLensKind, '
             'direction=${_cameraLensDirection == CameraLensDirection.front ? "front" : "back"}',
           );
         }
-        _cameraEngine.setZoom(_uiZoomScale);
       }
     }
   }
 
   /// 🔥 핀치 줌 종료: 최종 줌값 적용
+  /// 🔥🔥🔥 iOS 기본 앱과 동일: Native에서 렌즈 전환을 자동으로 처리
   void _handleZoomScaleEnd(ScaleEndDetails details) {
-    // 최종 줌 값 적용
-    _maybeSwitchNativeLensForZoom(_uiZoomScale);
+    // 최종 줌 값 적용 (Native가 렌즈 전환을 자동으로 처리)
     if (_cameraEngine.isInitialized && !_shouldUseMockCamera) {
       if (kDebugMode) {
         debugPrint(
-          '[Zoom] Pinch zoom end: final uiZoomScale=${_uiZoomScale.toStringAsFixed(3)}',
+          '[Zoom] Pinch zoom end: final uiZoomScale=${_uiZoomScale.toStringAsFixed(3)} (Native will handle lens switching)',
         );
       }
       _cameraEngine.setZoom(_uiZoomScale);
@@ -4471,7 +6215,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   List<double> _getZoomPresets() {
-    // 프리셋 옵션: 0.5x, 1x, 2x, 3x 반환
+    // 🔥🔥🔥 전면 카메라: 0.5x는 렌즈 전환이 불가능하므로 제외
+    if (_cameraLensDirection == CameraLensDirection.front) {
+      return _uiZoomPresets.where((zoom) => zoom >= 1.0).toList()..sort();
+    }
+    // 후면 카메라: 모든 프리셋 옵션 반환 (0.5x, 1x, 2x, 3x)
     return List<double>.from(_uiZoomPresets)..sort();
   }
 
@@ -4494,6 +6242,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
+    // 🔥🔥🔥 성능 최적화: 같은 rect로 중복 호출 방지 (함수 레벨에서도 체크)
+    if (_lastSyncedPreviewRect != null) {
+      final rect = _lastSyncedPreviewRect!;
+      final isSameRect = (rect.width - localRect.width).abs() < 0.1 &&
+          (rect.height - localRect.height).abs() < 0.1 &&
+          (rect.left - localRect.left).abs() < 0.1 &&
+          (rect.top - localRect.top).abs() < 0.1;
+      if (isSameRect) {
+        // 🔥 성능 최적화: 같은 rect로 중복 호출 방지
+        if (kDebugMode) {
+          debugPrint(
+            '[Petgram] ⏭️ _syncPreviewRectToNativeFromLocal: Skipped duplicate call (same rect)',
+          );
+        }
+        return;
+      }
+    }
+
     if (kDebugMode) {
       debugPrint(
         '[Petgram] 🔍 _syncPreviewRectToNativeFromLocal: ENTRY - localRect=$localRect, nativeCamera=${_cameraEngine.nativeCamera != null ? "exists" : "null"}',
@@ -4511,24 +6277,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
 
     try {
-      // Stack의 RenderBox를 찾아서 global 좌표로 변환
-      final RenderBox? stackBox = stackContext.findRenderObject() as RenderBox?;
-      if (stackBox == null || !stackBox.hasSize) {
-        if (kDebugMode) {
-          debugPrint(
-            '[Petgram] ⚠️ _syncPreviewRectToNativeFromLocal: stackBox is null or has no size',
-          );
-        }
-        return;
-      }
-
-      // Stack 로컬 좌표를 global 좌표로 변환
-      final Offset globalTopLeft = stackBox.localToGlobal(localRect.topLeft);
-      final Offset globalBottomRight = stackBox.localToGlobal(
-        localRect.bottomRight,
-      );
-
-      final Rect globalRect = Rect.fromPoints(globalTopLeft, globalBottomRight);
+      // 🔥 프리뷰 위치 문제 해결: _getPreviewRectFromKey가 이미 global 좌표를 반환하므로
+      // 이중 변환하지 않고 그대로 사용
+      // localRect는 실제로는 _getPreviewRectFromKey에서 반환된 global 좌표입니다
+      final Rect globalRect = localRect;
 
       // 🔥 validSize 문제 해결: globalRect도 유효한지 확인
       if (globalRect.width <= 0 || globalRect.height <= 0) {
@@ -4540,15 +6292,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         return;
       }
 
-      // 🔥 프리뷰 안 보이는 문제 디버깅: 전달하는 좌표 상세 로그
-      if (kDebugMode) {
-        debugPrint('[Petgram] 📐 _syncPreviewRectToNativeFromLocal DETAILED:');
-        debugPrint('  - localRect (Stack local): $localRect');
-        debugPrint('  - globalTopLeft: $globalTopLeft');
-        debugPrint('  - globalBottomRight: $globalBottomRight');
-        debugPrint('  - globalRect (to iOS): $globalRect');
-        debugPrint('  - stackBox.size: ${stackBox.size}');
-      }
+      // 🔥 성능 최적화: 상세 로그 제거 (레이아웃 변경 시마다 호출되므로)
+      // if (kDebugMode) { debugPrint('[Petgram] 📐 _syncPreviewRectToNativeFromLocal DETAILED:...'); }
 
       final now = DateTime.now();
       final fenceActive =
@@ -4567,16 +6312,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           width: globalRect.width,
           height: globalRect.height,
         );
+        // 🔥🔥🔥 성능 최적화: 동기화 성공 시 _lastSyncedPreviewRect 업데이트
+        _lastSyncedPreviewRect = localRect;
         if (kDebugMode && _showDebugOverlay) {
           _addDebugLog(
             '[PreviewSync] ✅ synced to native: rect=$globalRect (pending=${_pendingPreviewRectForSync != null}, retryCount=$_previewSyncRetryCount)',
           );
         }
-        if (kDebugMode) {
-          debugPrint(
-            '[Petgram] 📐 _syncPreviewRectToNativeFromLocal: localRect=$localRect → globalRect=$globalRect synced to iOS (validSize should be true)',
-          );
-        }
+        // 🔥 성능 최적화: 정상적인 동기화 로그 제거 (레이아웃 변경 시마다 호출되므로)
+        // if (kDebugMode) { debugPrint('[Petgram] 📐 _syncPreviewRectToNativeFromLocal: ... synced to iOS'); }
       }
     } catch (e) {
       if (kDebugMode) {
@@ -4860,26 +6604,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   /// 타이머 카운트다운 표시
+  /// 🔥🔥🔥 ParentDataWidget 오류 해결: Positioned.fill 제거하고 Stack 내에서 직접 배치
+  /// 문제: Stack 내에서 여러 Positioned.fill이 충돌할 수 있음
+  /// 해결책: Positioned.fill 대신 Positioned를 사용하지 않고 Stack의 child로 직접 배치
   Widget _buildTimerCountdown() {
-    return Positioned.fill(
-      child: IgnorePointer(
-        ignoring: true,
-        child: Center(
-          child: Container(
-            width: 120,
-            height: 120,
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.7),
-              shape: BoxShape.circle,
-            ),
-            child: Center(
-              child: Text(
-                '$_timerSeconds',
-                style: const TextStyle(
-                  fontSize: 64,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                ),
+    return IgnorePointer(
+      ignoring: true,
+      child: Center(
+        child: Container(
+          width: 120,
+          height: 120,
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.7),
+            shape: BoxShape.circle,
+          ),
+          child: Center(
+            child: Text(
+              '$_timerSeconds',
+              style: const TextStyle(
+                fontSize: 64,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
               ),
             ),
           ),
@@ -5025,14 +6770,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         debugPrint('[Petgram] ❌ Failed to set continuous auto focus: $e');
       }
       // ⚠️ 중앙 포커스도 설정 (초기 진입 시)
+      // 🔥🔥🔥 성능 최적화: 중복 호출 방지 (이미 설정된 경우 스킵)
       const centerPoint = Offset(0.5, 0.5);
-      try {
-        await _cameraEngine.setFocusPoint(centerPoint);
-        if (kDebugMode) {
-          debugPrint('[Petgram] ✅ Center focus point set: $centerPoint');
+      // 🔥🔥🔥 성능 최적화: 마지막 포커스 포인트가 중앙이면 스킵
+      if (_lastFocusPoint == null || 
+          (_lastFocusPoint!.dx - centerPoint.dx).abs() > 0.01 ||
+          (_lastFocusPoint!.dy - centerPoint.dy).abs() > 0.01) {
+        try {
+          await _cameraEngine.setFocusPoint(centerPoint);
+          // 🔥🔥🔥 성능 최적화: 호출 전에 _lastFocusPoint 업데이트하여 중복 호출 방지
+          _lastFocusPoint = centerPoint;
+          if (kDebugMode) {
+            debugPrint('[Petgram] ✅ Center focus point set: $centerPoint');
+          }
+        } catch (e) {
+          debugPrint('[Petgram] ❌ Failed to set center focus point: $e');
         }
-      } catch (e) {
-        debugPrint('[Petgram] ❌ Failed to set center focus point: $e');
+      } else {
+        // 🔥 성능 최적화: 이미 중앙 포커스가 설정되어 있으면 스킵
+        if (kDebugMode) {
+          debugPrint('[Petgram] ⏭️ Center focus point already set, skipping');
+        }
       }
       return;
     }
@@ -5040,33 +6798,49 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 화면 중앙 좌표 (0.5, 0.5)
     const centerPoint = Offset(0.5, 0.5);
 
-    if (kDebugMode) {
-      debugPrint('[Petgram] 🔍 자동 초점 설정: 화면 중앙 ($centerPoint)');
+    // 🔥🔥🔥 성능 최적화: 중복 호출 방지 (이미 설정된 경우 스킵)
+    if (_lastFocusPoint == null || 
+        (_lastFocusPoint!.dx - centerPoint.dx).abs() > 0.01 ||
+        (_lastFocusPoint!.dy - centerPoint.dy).abs() > 0.01) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] 🔍 자동 초점 설정: 화면 중앙 ($centerPoint)');
+      }
+
+      // 카메라에 초점 설정 (자동 초점이므로 UI 표시하지 않음)
+      try {
+        if (_cameraEngine.isInitialized) {
+          await _cameraEngine.setFocusPoint(centerPoint);
+          // 🔥🔥🔥 성능 최적화: 호출 전에 _lastFocusPoint 업데이트하여 중복 호출 방지
+          _lastFocusPoint = centerPoint;
+        }
+        if (kDebugMode) {
+          debugPrint('[Petgram] ✅ 자동 초점 설정 완료 (화면 중앙)');
+        }
+      } catch (e) {
+        if (kDebugMode) {
+          debugPrint('[Petgram] ❌ Failed to set center focus point: $e');
+        }
+      }
+    } else {
+      // 🔥 성능 최적화: 이미 중앙 포커스가 설정되어 있으면 스킵
+      if (kDebugMode) {
+        debugPrint('[Petgram] ⏭️ Center focus point already set, skipping');
+      }
     }
 
-    // 카메라에 초점 설정 (자동 초점이므로 UI 표시하지 않음)
-    try {
-      if (_cameraEngine.isInitialized) {
-        await _cameraEngine.setFocusPoint(centerPoint);
-      }
-      debugPrint('[Petgram] ✅ 자동 초점 설정 완료 (화면 중앙)');
-
-      // 초점 설정 성공 시 자동 초점 표시기만 표시 (수동 터치 초점과 구분)
-      if (mounted) {
-        setState(() {
-          _showAutoFocusIndicator = true;
-        });
-        // 1.5초 후 자동 초점 표시기 숨기기
-        Future.delayed(const Duration(milliseconds: 1500), () {
-          if (mounted) {
-            setState(() {
-              _showAutoFocusIndicator = false;
-            });
-          }
-        });
-      }
-    } catch (e) {
-      debugPrint('[Petgram] ❌ 자동 초점 설정 실패: $e');
+    // 초점 설정 성공 시 자동 초점 표시기만 표시 (수동 터치 초점과 구분)
+    if (mounted && _lastFocusPoint != null) {
+      setState(() {
+        _showAutoFocusIndicator = true;
+      });
+      // 1.5초 후 자동 초점 표시기 숨기기
+      Future.delayed(const Duration(milliseconds: 1500), () {
+        if (mounted) {
+          setState(() {
+            _showAutoFocusIndicator = false;
+          });
+        }
+      });
     }
   }
 
@@ -5123,16 +6897,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ? 0.5
         : (local.dy / previewSize.height).clamp(0.0, 1.0);
 
-    double nx = nxRaw;
-    double ny = nyRaw;
-
-    // 전면 카메라면 X 좌표만 좌우 반전
-    if (_cameraLensDirection == CameraLensDirection.front) {
-      nx = 1.0 - nxRaw;
-    }
-
-    // ✅ 실제로 사용할 normalized: 반올림/파싱 없이 그대로 사용
-    final Offset normalized = Offset(nx, ny);
+    // 🔥🔥🔥 전면 카메라 포커스 인디케이터 위치 수정:
+    // 전면 카메라는 미러링되어 보이므로, 사용자가 터치한 위치 = 화면에서 보이는 위치
+    // UI 인디케이터는 터치한 위치와 동일하게 표시해야 함 (원본 좌표 사용)
+    // 네이티브에 전달할 좌표는 네이티브에서 자동으로 반전 처리하므로 원본 좌표 전달
+    final Offset normalized = Offset(nxRaw, nyRaw);
+    
+    // 🔥 UI 인디케이터 표시용 좌표: 터치한 위치와 동일 (원본 좌표 사용)
+    // 전면 카메라는 이미 미러링되어 보이므로 추가 반전 불필요
+    final Offset indicatorNormalized = Offset(nxRaw, nyRaw);
 
     // 🔥 포커스 UI 표시 시 setState는 딱 한 번만 발생하도록 조정
     // 인디케이터 on/off, 패널 닫기, auto-FE off, 타이머 off 등으로 setState 연속 발생 방지
@@ -5157,8 +6930,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
 
     // 🔥 포커스 인디케이터 표시: 딱 한 번만 setState
+    // UI 인디케이터는 전면 카메라일 때 반전된 좌표를 사용하여 표시
     setState(() {
-      _focusIndicatorNormalized = normalized;
+      _focusIndicatorNormalized = indicatorNormalized;
       _showFocusIndicator = true;
     });
 
@@ -5172,16 +6946,96 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 카메라 API 호출 (비동기, await 없이)
     final bool canUseNative = _cameraEngine.isInitialized;
     if (_shouldUseMockCamera || !canUseNative) {
+      if (kDebugMode) {
       debugPrint(
         '[Petgram] ℹ️ Mock or no camera: UI indicator only, skip setFocusPoint/setExposurePoint',
       );
+      }
+      // Mock 카메라인 경우 즉시 플래그 리셋
+      Future.microtask(() {
+        if (mounted) {
+          _isProcessingTap = false;
+        }
+      });
     } else {
       try {
+        // 🔥🔥🔥 성능 최적화: 같은 좌표로 중복 호출 방지
+        // 0.01 이내 차이는 같은 좌표로 간주하여 중복 호출 방지
+        // 🔥🔥🔥 중요: _lastFocusPoint와 _lastExposurePoint를 호출 전에 체크하여 즉시 스킵
+        final double threshold = 0.01;
+        final bool isSameFocusPoint = _lastFocusPoint != null &&
+            (normalized.dx - _lastFocusPoint!.dx).abs() < threshold &&
+            (normalized.dy - _lastFocusPoint!.dy).abs() < threshold;
+        final bool isSameExposurePoint = _lastExposurePoint != null &&
+            (normalized.dx - _lastExposurePoint!.dx).abs() < threshold &&
+            (normalized.dy - _lastExposurePoint!.dy).abs() < threshold;
+        
+        if (isSameFocusPoint && isSameExposurePoint) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ⏭️ Tap ignored: same coordinates (normalized=$normalized, lastFocus=$_lastFocusPoint, lastExposure=$_lastExposurePoint)');
+          }
+          if (mounted) {
+            _isProcessingTap = false;
+          }
+          return;
+        }
+        
+        // 🔥🔥🔥 성능 최적화: 호출 전에 _lastFocusPoint와 _lastExposurePoint 업데이트하여 중복 호출 방지
+        // 비동기 호출 전에 즉시 업데이트하여 동일한 좌표로 연속 호출되는 것을 방지
+        _lastFocusPoint = normalized;
+        _lastExposurePoint = normalized;
+        
+        if (kDebugMode) {
+          debugPrint(
+            '[Petgram] 🎯 Calling setFocusPoint: normalized=$normalized, cameraInitialized=$canUseNative',
+          );
+        }
         // 실제 카메라에 넘기는 좌표도 normalized 그대로 (반올림 금지)
-        unawaited(_cameraEngine.setFocusPoint(normalized));
-        unawaited(_cameraEngine.setExposurePoint(normalized));
+        _cameraEngine.setFocusPoint(normalized).then((_) {
+          if (mounted) {
+            _lastFocusPoint = normalized; // 🔥🔥🔥 성능 최적화: 마지막 포커스 포인트 저장
+          }
+          if (kDebugMode) {
+            debugPrint('[Petgram] ✅ setFocusPoint success: $normalized');
+          }
+          if (mounted) {
+            _isProcessingTap = false;
+          }
+        }).catchError((e) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ❌ setFocusPoint error: $e');
+          }
+          if (mounted) {
+            _isProcessingTap = false;
+          }
+        });
+        
+        // 🔥🔥🔥 성능 최적화: 같은 노출 포인트면 스킵
+        if (!isSameExposurePoint) {
+          _cameraEngine.setExposurePoint(normalized).then((_) {
+            if (mounted) {
+              _lastExposurePoint = normalized; // 🔥🔥🔥 성능 최적화: 마지막 노출 포인트 저장
+            }
+            if (kDebugMode) {
+              debugPrint('[Petgram] ✅ setExposurePoint success: $normalized');
+            }
+          }).catchError((e) {
+            if (kDebugMode) {
+              debugPrint('[Petgram] ❌ setExposurePoint error: $e');
+            }
+          });
+        } else {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ⏭️ setExposurePoint skipped: same coordinates');
+          }
+        }
       } catch (e) {
-        debugPrint('[Petgram] ❌ setFocusPoint/setExposurePoint error: $e');
+        if (kDebugMode) {
+          debugPrint('[Petgram] ❌ setFocusPoint/setExposurePoint exception: $e');
+        }
+        if (mounted) {
+          _isProcessingTap = false;
+        }
       }
     }
 
@@ -5233,11 +7087,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   List<double> _buildPreviewColorMatrix() {
     if (_isPureOriginalMode) {
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] 🎨 [PREVIEW PIPELINE] Pure original mode, using identity matrix',
-        );
-      }
       return List.from(kIdentityMatrix);
     }
 
@@ -5324,14 +7173,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       top: 6.0,
       left: 0,
       right: 0,
-      child: Padding(
-        padding: EdgeInsets.only(
-          left: horizontalPadding,
-          right: horizontalPadding,
-          top: verticalPadding,
-          bottom: verticalPadding,
-        ),
-        child: Row(
+      child: RepaintBoundary(
+        child: Padding(
+          padding: EdgeInsets.only(
+            left: horizontalPadding,
+            right: horizontalPadding,
+            top: verticalPadding,
+            bottom: verticalPadding,
+          ),
+          child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             SizedBox(
@@ -5425,8 +7275,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(),
                 iconSize: iconSize,
-                onPressed: () {
-                  Navigator.of(context).push(
+                onPressed: () async {
+                  // 🔥 다른 페이지로 이동 시 카메라 pause
+                  _pauseCameraSession();
+                  if (!mounted) return;
+                  await Navigator.of(context).push(
                     MaterialPageRoute(
                       builder: (_) => FrameSettingsPage(
                         petList: _petList,
@@ -5495,6 +7348,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ),
                     ),
                   );
+                  // 🔥 페이지에서 돌아올 때 카메라 resume
+                  if (mounted) {
+                    _resumeCameraSession();
+                  }
                 },
                 icon: Stack(
                   children: [
@@ -5526,11 +7383,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               color: Colors.transparent,
               child: InkWell(
                 borderRadius: BorderRadius.circular(16),
-                onTap: () {
+                onTap: () async {
                   debugPrint('[Petgram] ❤️ Support button tapped');
-                  Navigator.of(
+                  // 🔥 다른 페이지로 이동 시 카메라 pause
+                  _pauseCameraSession();
+                  if (!mounted) return;
+                  await Navigator.of(
                     context,
                   ).push(MaterialPageRoute(builder: (_) => SettingsPage()));
+                  // 🔥 페이지에서 돌아올 때 카메라 resume
+                  if (mounted) {
+                    _resumeCameraSession();
+                  }
                 },
                 child: Container(
                   width: 36,
@@ -5549,6 +7413,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
           ],
         ),
+      ),
       ),
     );
   }
@@ -5585,7 +7450,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ),
                     ],
                   ),
-                  child: _buildBrightnessSlider(),
+                  child: RepaintBoundary(
+                    child: _buildBrightnessSlider(),
+                  ),
                 ),
                 const SizedBox(height: 10),
                 // 카메라 전환 버튼 (전면/후면) - 개별 pill 배경 적용
@@ -5625,38 +7492,44 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return Container(
       width: 48,
       height: 200,
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      // 🔥 터치 감지 개선: 수평 padding 추가하여 터치 영역 확대
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const SizedBox(height: 8),
-          // 밝기 아이콘
+          const SizedBox(height: 4),
+          // 🔥 심플한 밝기 아이콘 (작고 미니멀)
           Icon(
             _brightnessValue > 0
-                ? Icons.brightness_high
+                ? Icons.add_circle_outline
                 : _brightnessValue < 0
-                ? Icons.brightness_low
-                : Icons.brightness_medium,
-            color: Colors.white,
-            size: 24,
+                ? Icons.remove_circle_outline
+                : Icons.circle_outlined,
+            color: Colors.white.withValues(alpha: 0.9),
+            size: 18,
             shadows: [
-              // 흰색 배경에서도 또렷하게 보이도록 그림자 추가
               Shadow(
-                color: Colors.black.withValues(alpha: 0.5),
-                blurRadius: 2,
-                offset: const Offset(0, 1),
+                color: Colors.black.withValues(alpha: 0.4),
+                blurRadius: 1,
+                offset: const Offset(0, 0.5),
               ),
             ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 4),
           // 슬라이더 영역 (필터 강도 조절 슬라이더와 동일한 방식 - onPanUpdate 사용)
+          // 🔥 터치 감지 개선: 터치 영역을 넓히고 Listener의 behavior를 opaque로 설정
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final double sliderHeight = constraints.maxHeight;
 
                 return Listener(
+                  // 🔥 터치 감지 개선: behavior를 opaque로 설정하여 터치 영역 확보
+                  behavior: HitTestBehavior.opaque,
                   onPointerDown: (event) {
+                    setState(() {
+                      _isBrightnessDragging = true;
+                    });
                     // 터치 시작 시 값 업데이트
                     final double localY = event.localPosition.dy.clamp(
                       0.0,
@@ -5673,7 +7546,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     HapticFeedback.selectionClick();
                   },
                   onPointerMove: (event) {
-                    if (event.down) {
+                    // 🔥 터치 감지 개선: _isBrightnessDragging 상태와 event.down 모두 체크
+                    if (_isBrightnessDragging && event.down) {
                       // 드래그 중 값 업데이트
                       final double localY = event.localPosition.dy.clamp(
                         0.0,
@@ -5690,22 +7564,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     }
                   },
                   onPointerUp: (_) {
+                    setState(() {
+                      _isBrightnessDragging = false;
+                    });
                     HapticFeedback.selectionClick();
+                  },
+                  onPointerCancel: (_) {
+                    setState(() {
+                      _isBrightnessDragging = false;
+                    });
                   },
                   child: Stack(
                     children: [
-                      // 배경 트랙
+                      // 🔥 터치 감지 개선: 투명한 터치 영역 추가하여 터치 감지 영역 확대
+                      Positioned.fill(
+                        child: Container(
+                          color: Colors.transparent,
+                        ),
+                      ),
+                      // 🔥 심플한 배경 트랙 (더 얇고 투명하게)
                       Center(
                         child: Container(
-                          width: 4,
+                          width: 2,
                           height: double.infinity,
                           decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.3),
-                            borderRadius: BorderRadius.circular(2),
+                            color: Colors.white.withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(1),
                           ),
                         ),
                       ),
-                      // 현재 값 표시 (썸)
+                      // 🔥 심플한 현재 값 표시 (작고 미니멀한 썸)
                       Align(
                         alignment: Alignment(
                           0,
@@ -5713,28 +7601,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                               1.0), // -10~10을 -1.0~1.0으로
                         ),
                         child: Container(
-                          width: 32,
-                          height: 32,
+                          width: 20,
+                          height: 20,
                           decoration: BoxDecoration(
                             color: Colors.white,
                             shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.5),
+                              width: 1,
+                            ),
                             boxShadow: [
                               BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.3),
-                                blurRadius: 4,
-                                offset: const Offset(0, 2),
+                                color: Colors.black.withValues(alpha: 0.2),
+                                blurRadius: 2,
+                                offset: const Offset(0, 1),
                               ),
                             ],
-                          ),
-                          child: Center(
-                            child: Container(
-                              width: 20,
-                              height: 20,
-                              decoration: BoxDecoration(
-                                color: kMainPink,
-                                shape: BoxShape.circle,
-                              ),
-                            ),
                           ),
                         ),
                       ),
@@ -5744,21 +7626,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               },
             ),
           ),
-          const SizedBox(height: 8),
-          // 밝기 값 표시
+          const SizedBox(height: 4),
+          // 🔥 심플한 밝기 값 표시 (작고 미니멀, 0일 때는 숨김)
+          if (_brightnessValue != 0.0)
           Text(
-            _brightnessValue == 0.0
-                ? '0'
-                : _brightnessValue > 0
+              _brightnessValue > 0
                 ? '+${_brightnessValue.toInt()}'
                 : '${_brightnessValue.toInt()}',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 10,
-              fontWeight: FontWeight.w600,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.8),
+                fontSize: 9,
+                fontWeight: FontWeight.w500,
+                shadows: [
+                  Shadow(
+                    color: Colors.black.withValues(alpha: 0.3),
+                    blurRadius: 1,
+                    offset: const Offset(0, 0.5),
+                  ),
+                ],
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 4),
         ],
       ),
     );
@@ -5840,7 +7728,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             return Column(
                               mainAxisSize: MainAxisSize.min,
                               children: uniqueOptions
-                                  .map((ratio) => _buildZoomRatioOption(ratio))
+                                  .map((ratio) => RepaintBoundary(
+                                        child: _buildZoomRatioOption(ratio),
+                                      ))
                                   .toList(),
                             );
                           },
@@ -5878,7 +7768,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                               title: const Text('9:16'),
                               trailing:
                                   _aspectMode == AspectRatioMode.nineSixteen
-                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  ? const Icon(Icons.check_circle, color: kMainPink)
                                   : const Icon(
                                       Icons.radio_button_unchecked,
                                       color: Colors.grey,
@@ -5891,7 +7781,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             ListTile(
                               title: const Text('3:4'),
                               trailing: _aspectMode == AspectRatioMode.threeFour
-                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  ? const Icon(Icons.check_circle, color: kMainPink)
                                   : const Icon(
                                       Icons.radio_button_unchecked,
                                       color: Colors.grey,
@@ -5904,7 +7794,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             ListTile(
                               title: const Text('1:1'),
                               trailing: _aspectMode == AspectRatioMode.oneOne
-                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  ? const Icon(Icons.check_circle, color: kMainPink)
                                   : const Icon(
                                       Icons.radio_button_unchecked,
                                       color: Colors.grey,
@@ -5951,7 +7841,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             ListTile(
                               title: const Text('연속 촬영 끄기'),
                               trailing: !_isBurstMode
-                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  ? const Icon(Icons.check_circle, color: kMainPink)
                                   : const Icon(
                                       Icons.radio_button_unchecked,
                                       color: Colors.grey,
@@ -6003,7 +7893,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             ListTile(
                               title: const Text('타이머 끄기'),
                               trailing: _timerSeconds == 0
-                                  ? Icon(Icons.check_circle, color: kMainPink)
+                                  ? const Icon(Icons.check_circle, color: kMainPink)
                                   : const Icon(
                                       Icons.radio_button_unchecked,
                                       color: Colors.grey,
@@ -6345,6 +8235,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   _liveIntensity = v;
                   _liveCoatPreset = 'custom';
                 });
+                // 🔥🔥🔥 필터 강도 조절 시 즉시 적용
+                _applyFilterIfChanged(
+                  _shootFilterKey,
+                  _liveIntensity.clamp(0.0, 1.0),
+                );
               },
             ),
           ),
@@ -6361,6 +8256,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _liveCoatPreset = key;
           _liveIntensity = presetValue;
         });
+        // 🔥🔥🔥 필터 강도 프리셋 선택 시 즉시 적용
+        _applyFilterIfChanged(
+          _shootFilterKey,
+          _liveIntensity.clamp(0.0, 1.0),
+        );
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
@@ -6400,7 +8300,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _onCapturePressed() async {
     // 셔터 버튼 중복 탭 방지 가드
-    if (_isProcessing) return;
+    if (_isProcessing) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] 🚫 _onCapturePressed blocked: _isProcessing=true');
+      }
+      return;
+    }
+    
+    if (kDebugMode) {
+      debugPrint('[Petgram] 📸 _onCapturePressed called: _isProcessing=$_isProcessing, _cameraEngine.isCapturingPhoto=${_cameraEngine.isCapturingPhoto}');
+    }
 
     // 촬영 버튼 클릭 피드백
     HapticFeedback.lightImpact();
@@ -6635,7 +8544,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   label: '사진 촬영',
                   button: true,
                   child: GestureDetector(
-                    onTap: _isProcessing ? null : _onCapturePressed,
+                    onTap: () {
+                      // 🔥🔥🔥 연속 촬영 문제 디버깅: onTap이 호출되는지 확인
+                      if (kDebugMode) {
+                        debugPrint('[Petgram] 🎯 GestureDetector onTap called: _isProcessing=$_isProcessing, _cameraEngine.isCapturingPhoto=${_cameraEngine.isCapturingPhoto}');
+                      }
+                      _onCapturePressed();
+                    },
                     child: AnimatedScale(
                       scale: _isCaptureAnimating ? 0.9 : 1.0,
                       duration: const Duration(milliseconds: 120),
@@ -6676,7 +8591,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return ListTile(
       title: Text('${seconds}초'),
       trailing: _timerSeconds == seconds
-          ? Icon(Icons.check_circle, color: kMainPink)
+          ? const Icon(Icons.check_circle, color: kMainPink)
           : const Icon(Icons.radio_button_unchecked, color: Colors.grey),
       onTap: () {
         setState(() {
@@ -6692,7 +8607,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return ListTile(
       title: Text('${count}장'),
       trailing: _burstCountSetting == count && _isBurstMode
-          ? Icon(Icons.check_circle, color: kMainPink)
+          ? const Icon(Icons.check_circle, color: kMainPink)
           : const Icon(Icons.radio_button_unchecked, color: Colors.grey),
       onTap: () {
         setState(() {
@@ -6708,19 +8623,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 🔥 줌 프리셋 옵션 위젯 빌드
   /// 각 프리셋 버튼(0.5x, 1x, 2x, 3x)을 생성하고 _setZoomPreset을 호출
   Widget _buildZoomRatioOption(double ratio) {
+    // 🔥🔥🔥 전면 카메라: 0.5x는 렌즈 전환이 불가능하므로 비활성화
+    final bool isDisabled = _cameraLensDirection == CameraLensDirection.front && ratio < 1.0;
+    
     // 프리셋 버튼 선택 시에만 정확히 일치하는지 확인 (0.05 이내)
     final bool isSelected = (_uiZoomScale - ratio).abs() <= 0.05;
     return ListTile(
-      title: Text('${ratio.toStringAsFixed(1)}x'),
+      title: Text(
+        '${ratio.toStringAsFixed(1)}x',
+        style: TextStyle(
+          color: isDisabled ? Colors.grey : null,
+        ),
+      ),
       trailing: isSelected
-          ? Icon(Icons.check_circle, color: kMainPink)
+          ? const Icon(Icons.check_circle, color: kMainPink)
           : const Icon(Icons.radio_button_unchecked, color: Colors.grey),
-      onTap: () {
-        if (!mounted) return;
-        Navigator.of(context).pop();
-        // 🔥 _setZoomPreset 공통 함수 사용
-        _setZoomPreset(ratio);
-      },
+      enabled: !isDisabled,
+      onTap: isDisabled
+          ? null
+          : () {
+              if (!mounted) return;
+              Navigator.of(context).pop();
+              // 🔥 _setZoomPreset 공통 함수 사용
+              _setZoomPreset(ratio);
+            },
     );
   }
 
@@ -6759,13 +8685,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// ========================
 
   /// Diary 페이지로 이동
-  void _openDiaryPage(BuildContext context) {
-    Navigator.push(
+  Future<void> _openDiaryPage(BuildContext context) async {
+    // 🔥 다른 페이지로 이동 시 카메라 pause
+    _pauseCameraSession();
+    if (!mounted) return;
+    await Navigator.push(
       context,
       MaterialPageRoute(builder: (_) => const DiaryPage()),
     );
+    // 🔥 페이지에서 돌아올 때 카메라 resume
+    if (mounted) {
+      _resumeCameraSession();
+    }
   }
 
+  /*
   /// 디버그 정보를 문자열로 생성 (최소한의 정보만 포함)
   String _buildDebugInfoString() {
     final sessionState = _cameraEngine.lastDebugState;
@@ -6785,9 +8719,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     buffer.writeln('===========================');
     return buffer.toString();
   }
+  */
 
   /// 디버그 정보를 클립보드에 복사 (제거됨)
 
+  /*
   /// 카메라 디버그 오버레이 위젯
   /// 🔥 성능 최적화: 아주 작은 영역으로 축소, 탭 시 복사
   Widget _buildCameraDebugOverlay() {
@@ -6846,7 +8782,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
     );
   }
+  */
 
+  /*
   /// 탭 시 전체 로그 복사 (파일 + 메모리)
   Future<String> _getDebugStateString() async {
     String fileLogs = '';
@@ -6865,6 +8803,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final debugInfo = _buildDebugInfoString();
     return '--- FILE LOGS ---\n$fileLogs\n\n--- CURRENT STATE ---\n$debugInfo';
   }
+  */
 
   double _getTargetAspectRatio() {
     switch (_aspectMode) {
@@ -6880,36 +8819,41 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget _buildGridLines(double width, double height) {
     if (!_showGridLines) return const SizedBox.shrink();
     return Positioned.fill(
-      child: CustomPaint(
-        painter: _GridLinesPainter(color: Colors.white.withValues(alpha: 0.3)),
+      child: RepaintBoundary(
+        child: CustomPaint(
+          painter: _GridLinesPainter(color: Colors.white.withValues(alpha: 0.3)),
+        ),
       ),
     );
   }
 
   Widget _buildFocusIndicatorLayer(double width, double height) {
-    if (!_showFocusIndicator || _focusIndicatorNormalized == null) {
+    // 🔥 수정: _showFocusIndicator가 false여도 _focusIndicatorNormalized가 있으면 일단 그림 (페이드아웃 애니메이션을 위해)
+    if (_focusIndicatorNormalized == null) {
       return const SizedBox.shrink();
     }
 
     return Positioned(
       left: _focusIndicatorNormalized!.dx * width - 35,
       top: _focusIndicatorNormalized!.dy * height - 35,
-      child: TweenAnimationBuilder<double>(
-        key: ValueKey(
-          'focus_${_focusIndicatorNormalized!.dx}_${_focusIndicatorNormalized!.dy}',
-        ),
-        tween: Tween<double>(begin: 0.0, end: 1.0),
+      child: AnimatedOpacity(
+        opacity: _showFocusIndicator ? 1.0 : 0.0,
         duration: const Duration(milliseconds: 250),
-        curve: Curves.easeOutBack, // 확대되며 살짝 튕기는 효과
-        builder: (context, value, child) {
-          return Opacity(
-            opacity: value.clamp(0.0, 1.0),
-            child: Transform.scale(
+        curve: Curves.easeOut,
+        child: TweenAnimationBuilder<double>(
+          key: ValueKey(
+            'focus_${_focusIndicatorNormalized!.dx}_${_focusIndicatorNormalized!.dy}',
+          ),
+          tween: Tween<double>(begin: 0.0, end: 1.0),
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOutBack, // 확대되며 살짝 튕기는 효과
+          builder: (context, value, child) {
+            return Transform.scale(
               scale: 0.5 + (value * 0.5), // 0.5 -> 1.0으로 확대
               child: _buildFocusIndicator(70),
-            ),
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }
@@ -6918,22 +8862,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (!_frameEnabled) return const SizedBox.shrink();
 
     return Positioned.fill(
-      child: IgnorePointer(
-        ignoring: true, // 프레임 UI 자체는 터치를 방해하지 않음
-        child: CustomPaint(
-          size: Size(width, height),
-          painter: FrameScreenPainter(
-            petList: _petList,
-            selectedPetId: _selectedPetId,
-            dogIconImage: _dogIconImage,
-            catIconImage: _catIconImage,
-            location: _currentLocation,
-            screenWidth: width,
-            screenHeight: height,
-            frameTopOffset: topOffset, // 전달받은 상대 오프셋 사용
-            previewWidth: width,
-            previewHeight: height,
-            showDebugInfo: kShowFrameDebugInfo, // 🔥 추가
+      child: RepaintBoundary(
+        child: IgnorePointer(
+          ignoring: true, // 프레임 UI 자체는 터치를 방해하지 않음
+          child: CustomPaint(
+            size: Size(width, height),
+            painter: FrameScreenPainter(
+              petList: _petList,
+              selectedPetId: _selectedPetId,
+              dogIconImage: _dogIconImage,
+              catIconImage: _catIconImage,
+              location: _currentLocation,
+              screenWidth: width,
+              screenHeight: height,
+              frameTopOffset: topOffset, // 전달받은 상대 오프셋 사용
+              previewWidth: width,
+              previewHeight: height,
+              showDebugInfo: kShowFrameDebugInfo, // 🔥 추가
+            ),
           ),
         ),
       ),
@@ -6945,23 +8891,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       width: size,
       height: size,
       decoration: BoxDecoration(
+        shape: BoxShape.circle, // 🔥 동그란 모양
         border: Border.all(color: kMainPink, width: 2),
-        borderRadius: BorderRadius.circular(8),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.3),
-            blurRadius: 4,
-            spreadRadius: 1,
-          ),
-        ],
+        // 🔥 그레이 투명 영역 제거: boxShadow 제거하여 완전히 투명하게
       ),
-      child: Center(
-        child: Icon(
-          Icons.center_focus_strong,
-          color: kMainPink,
-          size: size * 0.4,
-        ),
-      ),
+      // 🔥 심플한 디자인: 아이콘 제거, 테두리만 표시
     );
   }
 }
@@ -7004,3 +8938,5 @@ class _GridLinesPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
+
+

@@ -254,11 +254,10 @@ class NativeCameraController implements IPetgramCamera {
         'updatePreviewLayout',
         _createArguments({'x': x, 'y': y, 'width': width, 'height': height}),
       );
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] ✅ NativeCameraController.updatePreviewLayout: Method call succeeded - x=$x, y=$y, width=$width, height=$height',
-        );
-      }
+      // 🔥 성능 최적화: updatePreviewLayout은 빈번히 호출되므로 로그 제거
+      // if (kDebugMode) {
+      //   debugPrint('[Petgram] ✅ NativeCameraController.updatePreviewLayout: Method call succeeded - x=$x, y=$y, width=$width, height=$height');
+      // }
     } catch (e) {
       debugPrint(
         '[Petgram] ❌ NativeCameraController.updatePreviewLayout failed: $e',
@@ -288,7 +287,7 @@ class NativeCameraController implements IPetgramCamera {
   }
 
   @override
-  Future<void> switchCamera() async {
+  Future<Map<String, dynamic>?> switchCamera() async {
     try {
       final from = _cameraPosition;
       _cameraPosition = _cameraPosition == 'back' ? 'front' : 'back';
@@ -315,6 +314,19 @@ class NativeCameraController implements IPetgramCamera {
         if (width != null && height != null) {
           _previewSize = Size(width, height);
         }
+        
+        // 🔥🔥🔥 전면 카메라 줌 문제 해결: 실제 설정된 줌 값을 결과에 포함
+        // 네이티브에서 실제 설정된 줌 값을 minZoom으로 전달하므로 이를 활용
+        final actualZoom = (result['minZoom'] as num?)?.toDouble();
+        if (actualZoom != null && kDebugMode) {
+          _emitDebugLog(
+            '[Camera] switchCamera: actualZoom=$actualZoom (from minZoom in result)',
+          );
+        }
+        
+        // 실제 줌 값을 저장하여 나중에 사용할 수 있도록 함
+        // (현재는 로그만 출력하지만, 필요시 getter 추가 가능)
+        
         _notifyListeners();
 
         if (kDebugMode) {
@@ -324,15 +336,20 @@ class NativeCameraController implements IPetgramCamera {
           _emitDebugLog(
             '[Camera] switchCamera success: direction=$_cameraPosition, '
             'sessionRunning=$sessionRunning, devicePosition=$devicePosition, deviceType=$deviceType, '
-            'previewSize=$_previewSize, aspectRatio=$_aspectRatio',
+            'previewSize=$_previewSize, aspectRatio=$_aspectRatio, actualZoom=$actualZoom',
           );
         }
+        
+        // 🔥🔥🔥 전면 카메라 줌 문제 해결: 실제 줌 값을 반환
+        // 타입 캐스팅: Map<dynamic, dynamic>? → Map<String, dynamic>?
+        return Map<String, dynamic>.from(result);
       } else {
         if (kDebugMode) {
           _emitDebugLog(
             '[Camera] switchCamera completed with null result (direction=$_cameraPosition)',
           );
         }
+        return null;
       }
     } catch (e) {
       if (kDebugMode) {
@@ -363,17 +380,69 @@ class NativeCameraController implements IPetgramCamera {
   Future<Map<String, dynamic>?> getFocusStatus() async {
     try {
       // 🔄 리팩토링: iOS에서는 viewId가 필요 없음
-      if ((!_isIOS && _viewId == null) || !_isInitialized) return null;
+      // 🔥 iOS에서는 _isInitialized 체크를 건너뜀 (initializeNativeCamera가 호출되어도 _isInitialized가 설정되지 않을 수 있음)
+      if (!_isIOS) {
+        // Android: viewId와 isInitialized 모두 확인
+        if (_viewId == null || !_isInitialized) {
+          if (kDebugMode) {
+            debugPrint('[Petgram] ⚠️ getFocusStatus: returning null early (Android: _viewId=$_viewId, _isInitialized=$_isInitialized)');
+          }
+          return null;
+        }
+      } else {
+        // iOS: viewId만 확인 (isInitialized는 건너뜀)
+        // 🔥 성능 최적화: 빈번한 호출이므로 로그 제거 (기존 기능 유지)
+        // if (kDebugMode) {
+        //   debugPrint('[Petgram] 🎯 getFocusStatus: iOS mode, skipping _isInitialized check');
+        // }
+      }
+      
+      // 🔥 성능 최적화: 빈번한 호출이므로 로그 제거 (기존 기능 유지)
+      // if (kDebugMode) {
+      //   final args = _createArguments();
+      //   debugPrint('[Petgram] 🎯 getFocusStatus: calling invokeMethod with args=$args');
+      // }
+      
       final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'getFocusStatus',
         _createArguments(),
       );
+      
+      // 🔥 성능 최적화: 빈번한 호출이므로 로그 제거 (기존 기능 유지)
+      // if (kDebugMode) {
+      //   debugPrint('[Petgram] 🎯 getFocusStatus: invokeMethod returned result=$result');
+      // }
       if (result != null) {
+        final isAdjusting = result['isAdjustingFocus'] as bool? ?? false;
+        final focusMode = result['focusMode'] as String? ?? 'unknown';
+        var focusStatus = result['focusStatus'] as String?;
+        
+        // 🔥 focusStatus가 없으면 focusMode로부터 추론
+        if (focusStatus == null || focusStatus == 'unknown') {
+          if (isAdjusting) {
+            focusStatus = 'adjusting';
+          } else if (focusMode == 'continuousAutoFocus') {
+            focusStatus = 'ready';
+          } else if (focusMode == 'locked') {
+            focusStatus = 'locked';
+          } else if (focusMode == 'autoFocus') {
+            focusStatus = 'ready';
+          } else {
+            focusStatus = 'unknown';
+          }
+        }
+        
+        // 🔥 성능 최적화: 빈번한 호출이므로 로그 제거 (기존 기능 유지)
+        // if (kDebugMode) {
+        //   debugPrint(
+        //     '[Petgram] 🎯 getFocusStatus result: isAdjusting=$isAdjusting, focusMode=$focusMode, focusStatus=$focusStatus',
+        //   );
+        // }
+        
         return {
-          'isAdjustingFocus': result['isAdjustingFocus'] as bool? ?? false,
-          'focusMode': result['focusMode'] as String? ?? 'unknown',
-          'focusStatus':
-              result['focusStatus'] as String? ?? 'unknown', // 추가: 세분화된 상태
+          'isAdjustingFocus': isAdjusting,
+          'focusMode': focusMode,
+          'focusStatus': focusStatus,
         };
       }
       return null;
@@ -385,6 +454,8 @@ class NativeCameraController implements IPetgramCamera {
 
   @override
   Future<void> setZoom(double zoom) async {
+    // 🔥🔥🔥 setZoom은 void를 반환하지만, 실제 값은 getActualZoom()으로 확인
+    // 중복 호출 방지를 위해 getActualZoom() 호출은 camera_engine에서 제거
     try {
       // 🔄 리팩토링: iOS에서는 viewId가 필요 없음
       if (!_isIOS && _viewId == null) return;
@@ -393,6 +464,24 @@ class NativeCameraController implements IPetgramCamera {
       debugPrint('[Petgram] ❌ Set zoom error: $e');
     }
   }
+  
+  /// 🔥🔥🔥 setZoom 후 실제 줌 값을 반환하는 메서드 (동기화용, 중복 호출 방지)
+  Future<double?> setZoomAndGetActual(double zoom) async {
+    try {
+      if (!_isIOS && _viewId == null) return null;
+      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>('setZoom', _createArguments({'zoom': zoom}));
+      if (result != null && result['actualZoom'] != null) {
+        return (result['actualZoom'] as num).toDouble();
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('[Petgram] ❌ setZoomAndGetActual error: $e');
+      }
+      return null;
+    }
+  }
+  
 
   @override
   Future<void> setFocusPoint(Offset normalized) async {
@@ -639,9 +728,16 @@ class NativeCameraController implements IPetgramCamera {
           'previewLayerHasSession': false,
         };
       }
+      // 🔥 스플래시 멈춤 방지: timeout 추가하여 블로킹 방지
       final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'getDebugState',
         _createArguments(),
+      ).timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {
+          debugPrint('[Petgram] ⚠️ getDebugState: timeout after 2s');
+          return null;
+        },
       );
       if (result == null) {
         debugPrint(

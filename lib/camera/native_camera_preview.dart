@@ -93,12 +93,10 @@ class _NativeCameraPreviewState extends State<NativeCameraPreview> {
 
   @override
   Widget build(BuildContext context) {
-    // 🔥 디버그 로그: build 호출 확인
-    if (kDebugMode) {
-      debugPrint(
-        '[NativeCameraPreview] 🔍 build called, Platform.isIOS=${Platform.isIOS}, _hasCalledOnCreated=$_hasCalledOnCreated',
-      );
-    }
+    // 🔥 성능 최적화: 빈번한 build 호출 로그 제거 (기능 영향 없음)
+    // if (kDebugMode) {
+    //   debugPrint('[NativeCameraPreview] 🔍 build called...');
+    // }
 
     // 🔥🔥🔥 근본 해결: build에서는 호출하지 않음
     // didChangeDependencies에서만 호출하여 중복 방지
@@ -110,23 +108,13 @@ class _NativeCameraPreviewState extends State<NativeCameraPreview> {
     }
 
     if (Platform.isIOS) {
-      // 🔥 연분홍 오버레이 문제 해결:
-      // 문제: 네이티브 카메라 뷰는 RootViewController의 cameraContainer에 있고,
-      // Flutter 위젯 트리에서는 SizedBox.expand()만 있어서 Flutter가 그 영역을 "비어있는" 것으로 인식
-      //
-      // 핵심 원인: SizedBox.expand()는 레이아웃에서 크기를 차지하지만 시각적으로 투명함
-      // 네이티브 카메라가 렌더링되면 네이티브 뷰가 보이지만, Flutter 레이아웃 시스템은
-      // SizedBox.expand()를 "투명한 빈 위젯"으로 인식하여 배경색이 보임
-      //
-      // 해결책: Container로 감싸서 명시적으로 크기를 차지하도록 함
-      // 하지만 네이티브 뷰가 그 위에 렌더링되므로, Flutter 위젯은 투명해야 함
-      // Container의 color를 transparent로 설정하면 레이아웃은 차지하지만 시각적으로는 투명
-      //
-      // 하지만 실제 문제는 네이티브 뷰의 frame이 Flutter 레이아웃과 동기화되지 않을 수 있음
-      // updatePreviewLayout이 제대로 호출되는지 확인 필요
-      return Container(
-        color: Colors.transparent,
-        child: const SizedBox.expand(),
+      // 🔥🔥🔥 ParentDataWidget 에러 근본 해결: 가장 단순한 위젯 사용
+      // 문제: LayoutBuilder가 ColorFiltered와 SizedBox.expand()의 tight constraints와 충돌
+      // 해결책: IgnorePointer + Container()를 직접 반환하여 부모 제약을 그대로 따르도록 함
+      // SizedBox.expand()가 이미 부모 제약을 명시적으로 전달하므로 여기서는 단순한 위젯만 필요
+      return IgnorePointer(
+        ignoring: true,
+        child: Container(),
       );
     } else {
       // Android는 기존대로 AndroidView 사용
