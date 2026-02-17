@@ -21,26 +21,26 @@ class PetInfo {
   });
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'type': type,
-        'birthDate': birthDate.toIso8601String(),
-        'framePattern': framePattern,
-        'gender': gender,
-        'breed': breed,
-        'locationEnabled': locationEnabled,
-      };
+    'id': id,
+    'name': name,
+    'type': type,
+    'birthDate': birthDate.toIso8601String(),
+    'framePattern': framePattern,
+    'gender': gender,
+    'breed': breed,
+    'locationEnabled': locationEnabled,
+  };
 
   factory PetInfo.fromJson(Map<String, dynamic> json) => PetInfo(
-        id: json['id'] as String,
-        name: json['name'] as String,
-        type: json['type'] as String,
-        birthDate: DateTime.parse(json['birthDate'] as String),
-        framePattern: json['framePattern'] as int? ?? 1,
-        gender: json['gender'] as String?,
-        breed: json['breed'] as String?,
-        locationEnabled: json['locationEnabled'] as bool? ?? false,
-      );
+    id: json['id'] as String,
+    name: json['name'] as String,
+    type: json['type'] as String,
+    birthDate: DateTime.parse(json['birthDate'] as String),
+    framePattern: json['framePattern'] as int? ?? 1,
+    gender: json['gender'] as String?,
+    breed: json['breed'] as String?,
+    locationEnabled: json['locationEnabled'] as bool? ?? false,
+  );
 
   int getAge() {
     final now = DateTime.now();
@@ -52,4 +52,3 @@ class PetInfo {
     return age;
   }
 }
-

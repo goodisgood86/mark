@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -27,7 +26,7 @@ class PetgramExifChannel {
     final tempFile = File(
       '${tempDir.path}/pg_exif_${DateTime.now().microsecondsSinceEpoch}.jpg',
     );
-    
+
     try {
       await tempFile.writeAsBytes(jpegBytes, flush: true);
 
@@ -40,14 +39,13 @@ class PetgramExifChannel {
 
       final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'writeUserComment',
-        {
-          'path': tempFile.path,
-          'comment': comment,
-        },
+        {'path': tempFile.path, 'comment': comment},
       );
 
       if (kDebugMode) {
-        debugPrint('[PetgramExifChannel] 📝 Native writeUserComment result: $result');
+        debugPrint(
+          '[PetgramExifChannel] 📝 Native writeUserComment result: $result',
+        );
         if (result != null) {
           result.forEach((key, value) {
             debugPrint('[PetgramExifChannel]   $key: $value');
@@ -71,7 +69,7 @@ class PetgramExifChannel {
 
       // 3) 수정된 파일 다시 읽어서 반환
       final updatedBytes = await tempFile.readAsBytes();
-      
+
       // 🔥 검증: 업데이트된 바이트가 비어있지 않은지 확인
       if (updatedBytes.isEmpty) {
         if (kDebugMode) {
@@ -81,7 +79,7 @@ class PetgramExifChannel {
         }
         return jpegBytes; // 원본 반환
       }
-      
+
       // 🔥 검증: 업데이트된 바이트 크기가 원본보다 너무 작으면 원본 반환
       if (updatedBytes.length < jpegBytes.length * 0.5) {
         if (kDebugMode) {
@@ -91,21 +89,19 @@ class PetgramExifChannel {
         }
         return jpegBytes; // 원본 반환
       }
-      
+
       // 🔥 EXIF가 실제로 저장되었는지 즉시 검증
       if (kDebugMode) {
         debugPrint(
           '[PetgramExifChannel] 🔍 Verifying EXIF was written: reading from temp file...',
         );
       }
-      
+
       final verifyResult = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'readUserComment',
-        {
-          'path': tempFile.path,
-        },
+        {'path': tempFile.path},
       );
-      
+
       final verifiedComment = verifyResult?['comment'] as String?;
       if (verifiedComment != null && verifiedComment.isNotEmpty) {
         if (kDebugMode) {
@@ -153,9 +149,7 @@ class PetgramExifChannel {
   /// [jpegBytes]: JPEG 바이트
   ///
   /// 반환: EXIF UserComment 문자열 또는 null (읽기 실패 시)
-  static Future<String?> readUserCommentFromBytes(
-    Uint8List jpegBytes,
-  ) async {
+  static Future<String?> readUserCommentFromBytes(Uint8List jpegBytes) async {
     final tempDir = await getTemporaryDirectory();
     final tempFile = File(
       '${tempDir.path}/pg_exif_read_${DateTime.now().microsecondsSinceEpoch}.jpg',
@@ -175,24 +169,28 @@ class PetgramExifChannel {
           '[PetgramExifChannel] 📖 Temp file created: ${tempFile.path}',
         );
         final fileSize = await tempFile.length();
-        debugPrint('[PetgramExifChannel] 📖 Temp file size: ${fileSize ~/ 1024}KB');
+        debugPrint(
+          '[PetgramExifChannel] 📖 Temp file size: ${fileSize ~/ 1024}KB',
+        );
       }
 
       final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'readUserComment',
-        {
-          'path': tempFile.path,
-        },
+        {'path': tempFile.path},
       );
 
       if (kDebugMode) {
-        debugPrint('[PetgramExifChannel] 📖 Native readUserComment result: $result');
+        debugPrint(
+          '[PetgramExifChannel] 📖 Native readUserComment result: $result',
+        );
       }
 
       final comment = result?['comment'] as String?;
       if (comment == null || comment.isEmpty) {
         if (kDebugMode) {
-          debugPrint('[PetgramExifChannel] ⚠️ EXIF UserComment is null or empty');
+          debugPrint(
+            '[PetgramExifChannel] ⚠️ EXIF UserComment is null or empty',
+          );
           if (result != null) {
             debugPrint('[PetgramExifChannel] 📖 Result keys: ${result.keys}');
             result.forEach((key, value) {
@@ -231,4 +229,3 @@ class PetgramExifChannel {
     }
   }
 }
-

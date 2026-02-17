@@ -14,12 +14,12 @@ Future<img.Image?> loadImageWithExifRotation(File imageFile) async {
 
     // 파일 확장자 확인
     final extension = imageFile.path.toLowerCase().split('.').last;
-    
+
     // ⚠️ 정규화된 파일 확인: Dart의 normalizeOrientationToFile()이 생성한 임시 파일은
     //    "pg_normalized_" 접두사를 포함합니다. 이 파일들은 이미 픽셀이 올바른 방향이고
     //    EXIF Orientation=1이므로, orientation을 다시 적용하지 않습니다.
     final isNormalized = imageFile.path.contains('pg_normalized_');
-    
+
     if (kDebugMode) {
       debugPrint(
         '[Petgram] 📷 Loading image: ${imageFile.path}, extension: $extension, '
@@ -83,5 +83,3 @@ Future<img.Image?> loadImageWithExifRotation(File imageFile) async {
     return null;
   }
 }
-
-

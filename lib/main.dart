@@ -5,13 +5,17 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_native_splash/flutter_native_splash.dart';
-import 'pages/home_page.dart';
+import 'services/petgram_supabase_sync_service.dart';
 import 'services/petgram_db.dart';
+import 'widgets/permission_wrapper.dart';
 
 Future<void> main() async {
-  // 🔥🔥🔥 preserve()를 호출하지 않음: iOS가 자동으로 스플래시를 제거하도록 함
-  // HomePage의 build()에서 명시적으로 제거하되, preserve() 없이도 작동하도록 함
   WidgetsFlutterBinding.ensureInitialized();
+  // iOS는 LaunchScreen + flutter_native_splash preserve를 함께 쓰면
+  // "스플래시 -> 빈 화면 -> 스플래시"처럼 보이는 이중 전환이 발생할 수 있어 비활성화한다.
+  if (!Platform.isIOS) {
+    FlutterNativeSplash.preserve(widgetsBinding: WidgetsBinding.instance);
+  }
 
   List<CameraDescription> cameras = const [];
 
@@ -34,24 +38,28 @@ Future<void> main() async {
     }
   }
 
-  // 🔥 스플래시 멈춤 방지: runApp을 먼저 호출하여 첫 프레임이 렌더링되도록 함
-  // DB 초기화는 runApp 이후에 비동기로 처리
+  try {
+    await PetgramSupabaseSyncService.instance
+        .ensureInitializedFromEnvironment();
+  } catch (e) {
+    if (kDebugMode) {
+      debugPrint('[Petgram] Supabase init skipped: $e');
+    }
+  }
+
   runApp(PetgramApp(cameras: cameras));
-  
-  // 🔥 스플래시 제거: HomePage의 첫 build()가 완료되면 자동으로 제거됨
-  // main.dart에서는 제거하지 않고, HomePage에서만 제거하도록 변경
-  
-  // 🔥 DB 초기화는 runApp 이후에 비동기로 처리 (블로킹 방지)
-  // 첫 프레임이 렌더링된 후에 실행되도록 지연
-  Future.delayed(const Duration(milliseconds: 200), () async {
+
+  // DB 초기화는 앱 시작 안정화 이후로 지연한다.
+  // 카메라 첫 진입 경합을 줄이기 위해 시작 직후 heavy debug 점검은 하지 않는다.
+  Future.delayed(const Duration(seconds: 3), () async {
     try {
-      // DB 인스턴스 초기화 (지연 초기화이므로 여기서는 접근만 함)
       await PetgramDatabase.instance.database;
 
-      // 디버그 모드에서만 DB 상태 확인 및 로그 출력
+      // 상세 상태 점검은 더 늦게, 비차단으로 수행
       if (kDebugMode) {
-        debugPrint('[Petgram] 🔍 Database initialized, checking status...');
-        await PetgramDatabase.instance.checkDatabaseStatus();
+        Future.delayed(const Duration(seconds: 10), () {
+          unawaited(PetgramDatabase.instance.checkDatabaseStatus());
+        });
       }
     } catch (e, s) {
       if (kDebugMode) {
@@ -70,19 +78,53 @@ class PetgramApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    const primaryPink = Color(0xFFDE8AA8);
+    const deepRose = Color(0xFF7E4C5F);
+
     return MaterialApp(
       title: 'Petgram',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: primaryPink,
+          primary: primaryPink,
+          secondary: const Color(0xFFF3B5C8),
+          surface: Colors.white,
+        ),
         scaffoldBackgroundColor: const Color(0xFFFFF5F8),
         appBarTheme: const AppBarTheme(
           backgroundColor: Color(0xFFFFF5F8),
           foregroundColor: Colors.black,
           elevation: 0,
         ),
+        iconTheme: const IconThemeData(color: Colors.black87),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            foregroundColor: deepRose,
+            side: const BorderSide(color: Color(0xFFE3A0B7)),
+          ),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            backgroundColor: primaryPink,
+            foregroundColor: Colors.white,
+          ),
+        ),
+        switchTheme: SwitchThemeData(
+          thumbColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.selected)) return primaryPink;
+            return null;
+          }),
+          trackColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.selected)) {
+              return primaryPink.withValues(alpha: 0.4);
+            }
+            return null;
+          }),
+        ),
         useMaterial3: true,
       ),
-      home: HomePage(cameras: cameras),
+      home: PermissionWrapper(cameras: cameras),
     );
   }
 }

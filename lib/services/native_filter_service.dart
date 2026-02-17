@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
@@ -10,7 +9,9 @@ import 'image_pipeline_service.dart';
 /// iOS 네이티브 필터 파이프라인 서비스
 /// CoreImage + Metal 기반 GPU 가속 필터 처리
 class NativeFilterService {
-  static const MethodChannel _channel = MethodChannel('petgram/filter_pipeline');
+  static const MethodChannel _channel = MethodChannel(
+    'petgram/filter_pipeline',
+  );
 
   /// 프리뷰 이미지 렌더링 (네이티브)
   /// - sourcePath: 원본 이미지 파일 경로
@@ -33,18 +34,17 @@ class NativeFilterService {
 
       // FilterConfig를 딕셔너리로 변환
       final configDict = _filterConfigToDict(config);
-      final aspectModeStr = aspectMode != null ? _aspectModeToString(aspectMode) : null;
+      final aspectModeStr = aspectMode != null
+          ? _aspectModeToString(aspectMode)
+          : null;
 
       // 네이티브 호출
-      final result = await _channel.invokeMethod<Uint8List>(
-        'renderPreview',
-        {
-          'sourcePath': sourcePath,
-          'config': configDict,
-          'aspectMode': aspectModeStr,
-          if (maxSize != null) 'maxSize': maxSize, // 최대 해상도 제한
-        },
-      );
+      final result = await _channel.invokeMethod<Uint8List>('renderPreview', {
+        'sourcePath': sourcePath,
+        'config': configDict,
+        'aspectMode': aspectModeStr,
+        if (maxSize != null) 'maxSize': maxSize, // 최대 해상도 제한
+      });
 
       if (result == null) {
         throw Exception('Native filter pipeline returned null');
@@ -88,17 +88,16 @@ class NativeFilterService {
 
       // FilterConfig를 딕셔너리로 변환
       final configDict = _filterConfigToDict(config);
-      final aspectModeStr = aspectMode != null ? _aspectModeToString(aspectMode) : null;
+      final aspectModeStr = aspectMode != null
+          ? _aspectModeToString(aspectMode)
+          : null;
 
       // 네이티브 호출
-      final result = await _channel.invokeMethod<Uint8List>(
-        'renderFullSize',
-        {
-          'sourcePath': sourcePath,
-          'config': configDict,
-          'aspectMode': aspectModeStr,
-        },
-      );
+      final result = await _channel.invokeMethod<Uint8List>('renderFullSize', {
+        'sourcePath': sourcePath,
+        'config': configDict,
+        'aspectMode': aspectModeStr,
+      });
 
       if (result == null) {
         throw Exception('Native filter pipeline returned null');
@@ -158,12 +157,9 @@ class NativeFilterService {
       }
 
       // 네이티브 호출
-      final result = await _channel.invokeMethod<Uint8List>(
-        'createThumbnail',
-        {
-          'sourcePath': sourcePath,
-        },
-      );
+      final result = await _channel.invokeMethod<Uint8List>('createThumbnail', {
+        'sourcePath': sourcePath,
+      });
 
       if (result == null) {
         throw Exception('Native thumbnail creation returned null');
@@ -205,20 +201,22 @@ class NativeFilterService {
       }
 
       // FilterConfig를 딕셔너리로 변환 (선택적)
-      final configDict = baseConfig != null ? _filterConfigToDict(baseConfig) : null;
-      final aspectModeStr = aspectMode != null ? _aspectModeToString(aspectMode) : null;
+      final configDict = baseConfig != null
+          ? _filterConfigToDict(baseConfig)
+          : null;
+      final aspectModeStr = aspectMode != null
+          ? _aspectModeToString(aspectMode)
+          : null;
 
       // 네이티브 호출
-      final result = await _channel.invokeMethod<List<dynamic>>(
-        'generateFilterThumbnails',
-        {
-          'sourcePath': sourcePath,
-          'filterKeys': filterKeys,
-          'thumbnailMaxSize': thumbnailMaxSize,
-          if (configDict != null) 'config': configDict,
-          if (aspectModeStr != null) 'aspectMode': aspectModeStr,
-        },
-      );
+      final result = await _channel
+          .invokeMethod<List<dynamic>>('generateFilterThumbnails', {
+            'sourcePath': sourcePath,
+            'filterKeys': filterKeys,
+            'thumbnailMaxSize': thumbnailMaxSize,
+            if (configDict != null) 'config': configDict,
+            if (aspectModeStr != null) 'aspectMode': aspectModeStr,
+          });
 
       if (result == null) {
         throw Exception('Native filter thumbnail generation returned null');
@@ -273,17 +271,17 @@ class NativeFilterService {
 
       // FilterConfig를 딕셔너리로 변환
       final configDict = _filterConfigToDict(config);
-      final aspectModeStr = aspectMode != null ? _aspectModeToString(aspectMode) : null;
+      final aspectModeStr = aspectMode != null
+          ? _aspectModeToString(aspectMode)
+          : null;
 
       // 네이티브 호출
-      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
-        'applyFilterToImage',
-        {
-          'sourcePath': sourcePath,
-          'config': configDict,
-          if (aspectModeStr != null) 'aspectMode': aspectModeStr,
-        },
-      );
+      final result = await _channel
+          .invokeMethod<Map<dynamic, dynamic>>('applyFilterToImage', {
+            'sourcePath': sourcePath,
+            'config': configDict,
+            if (aspectModeStr != null) 'aspectMode': aspectModeStr,
+          });
 
       if (result == null) {
         throw Exception('Native filter application returned null');
@@ -338,4 +336,3 @@ class FilterResult {
     required this.height,
   });
 }
-

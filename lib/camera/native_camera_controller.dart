@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -20,6 +21,10 @@ class NativeCameraController implements IPetgramCamera {
   int? _viewId; // PlatformView ID (Android에서만 사용)
   final List<VoidCallback> _listeners = [];
   final List<Function(String)> _debugLogListeners = [];
+  Rect? _lastPreviewLayoutRect;
+  Future<void>? _previewLayoutInFlight;
+  DateTime? _lastPreviewLayoutSentAt;
+  static const Duration _previewLayoutMinInterval = Duration(milliseconds: 120);
 
   /// 🔄 리팩토링: iOS에서는 viewId가 필요 없지만, Android 호환성을 위해 유지
   void setViewId(int viewId) {
@@ -229,11 +234,35 @@ class NativeCameraController implements IPetgramCamera {
     required double width,
     required double height,
   }) async {
-    if (kDebugMode) {
-      debugPrint(
-        '[Petgram] 🔍 NativeCameraController.updatePreviewLayout: ENTRY - x=$x, y=$y, width=$width, height=$height, _isIOS=$_isIOS',
-      );
+    final newRect = Rect.fromLTWH(x, y, width, height);
+    final isSameRect = _isRectClose(_lastPreviewLayoutRect, newRect);
+    final now = DateTime.now();
+    final sentAt = _lastPreviewLayoutSentAt;
+    final isTooFrequent =
+        sentAt != null &&
+        now.difference(sentAt) < _previewLayoutMinInterval &&
+        isSameRect;
+
+    if (isTooFrequent) {
+      if (kDebugMode) {
+        debugPrint(
+          '[Petgram] ⏭️ NativeCameraController.updatePreviewLayout: throttled duplicate rect',
+        );
+      }
+      return;
     }
+
+    if (_previewLayoutInFlight != null && isSameRect) {
+      if (kDebugMode) {
+        debugPrint(
+          '[Petgram] ⏸️ NativeCameraController.updatePreviewLayout: coalesced to in-flight call',
+        );
+      }
+      await _previewLayoutInFlight;
+      return;
+    }
+
+    // 고빈도 호출 경로라 상세 ENTRY 로그는 생략한다.
     if (!_isIOS) {
       // Android는 필요 없음
       if (kDebugMode) {
@@ -245,15 +274,20 @@ class NativeCameraController implements IPetgramCamera {
     }
 
     try {
-      if (kDebugMode) {
-        debugPrint(
-          '[Petgram] 📐 NativeCameraController.updatePreviewLayout: Calling _channel.invokeMethod',
-        );
-      }
-      await _channel.invokeMethod(
+      _lastPreviewLayoutRect = newRect;
+      _lastPreviewLayoutSentAt = now;
+      // 고빈도 호출 경로라 상세 invoke 로그는 생략한다.
+      final call = _channel.invokeMethod(
         'updatePreviewLayout',
-        _createArguments({'x': x, 'y': y, 'width': width, 'height': height}),
+        _createArguments({
+          'x': newRect.left,
+          'y': newRect.top,
+          'width': newRect.width,
+          'height': newRect.height,
+        }),
       );
+      _previewLayoutInFlight = call;
+      await call;
       // 🔥 성능 최적화: updatePreviewLayout은 빈번히 호출되므로 로그 제거
       // if (kDebugMode) {
       //   debugPrint('[Petgram] ✅ NativeCameraController.updatePreviewLayout: Method call succeeded - x=$x, y=$y, width=$width, height=$height');
@@ -263,7 +297,24 @@ class NativeCameraController implements IPetgramCamera {
         '[Petgram] ❌ NativeCameraController.updatePreviewLayout failed: $e',
       );
       debugPrint('[Petgram] ❌ Stack trace: ${StackTrace.current}');
+    } finally {
+      _previewLayoutInFlight = null;
     }
+  }
+
+  bool _isRectClose(Rect? a, Rect b) {
+    if (a == null) {
+      return false;
+    }
+    return _isClose(a.left, b.left) &&
+        _isClose(a.top, b.top) &&
+        _isClose(a.width, b.width) &&
+        _isClose(a.height, b.height);
+  }
+
+  bool _isClose(double a, double b) {
+    return (a - b).abs() <= 0.5 ||
+        (a - b).abs() <= math.max(a.abs(), b.abs()) * 0.001;
   }
 
   @override
@@ -314,7 +365,7 @@ class NativeCameraController implements IPetgramCamera {
         if (width != null && height != null) {
           _previewSize = Size(width, height);
         }
-        
+
         // 🔥🔥🔥 전면 카메라 줌 문제 해결: 실제 설정된 줌 값을 결과에 포함
         // 네이티브에서 실제 설정된 줌 값을 minZoom으로 전달하므로 이를 활용
         final actualZoom = (result['minZoom'] as num?)?.toDouble();
@@ -323,10 +374,10 @@ class NativeCameraController implements IPetgramCamera {
             '[Camera] switchCamera: actualZoom=$actualZoom (from minZoom in result)',
           );
         }
-        
+
         // 실제 줌 값을 저장하여 나중에 사용할 수 있도록 함
         // (현재는 로그만 출력하지만, 필요시 getter 추가 가능)
-        
+
         _notifyListeners();
 
         if (kDebugMode) {
@@ -339,7 +390,7 @@ class NativeCameraController implements IPetgramCamera {
             'previewSize=$_previewSize, aspectRatio=$_aspectRatio, actualZoom=$actualZoom',
           );
         }
-        
+
         // 🔥🔥🔥 전면 카메라 줌 문제 해결: 실제 줌 값을 반환
         // 타입 캐스팅: Map<dynamic, dynamic>? → Map<String, dynamic>?
         return Map<String, dynamic>.from(result);
@@ -385,7 +436,9 @@ class NativeCameraController implements IPetgramCamera {
         // Android: viewId와 isInitialized 모두 확인
         if (_viewId == null || !_isInitialized) {
           if (kDebugMode) {
-            debugPrint('[Petgram] ⚠️ getFocusStatus: returning null early (Android: _viewId=$_viewId, _isInitialized=$_isInitialized)');
+            debugPrint(
+              '[Petgram] ⚠️ getFocusStatus: returning null early (Android: _viewId=$_viewId, _isInitialized=$_isInitialized)',
+            );
           }
           return null;
         }
@@ -396,18 +449,18 @@ class NativeCameraController implements IPetgramCamera {
         //   debugPrint('[Petgram] 🎯 getFocusStatus: iOS mode, skipping _isInitialized check');
         // }
       }
-      
+
       // 🔥 성능 최적화: 빈번한 호출이므로 로그 제거 (기존 기능 유지)
       // if (kDebugMode) {
       //   final args = _createArguments();
       //   debugPrint('[Petgram] 🎯 getFocusStatus: calling invokeMethod with args=$args');
       // }
-      
+
       final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'getFocusStatus',
         _createArguments(),
       );
-      
+
       // 🔥 성능 최적화: 빈번한 호출이므로 로그 제거 (기존 기능 유지)
       // if (kDebugMode) {
       //   debugPrint('[Petgram] 🎯 getFocusStatus: invokeMethod returned result=$result');
@@ -416,7 +469,7 @@ class NativeCameraController implements IPetgramCamera {
         final isAdjusting = result['isAdjustingFocus'] as bool? ?? false;
         final focusMode = result['focusMode'] as String? ?? 'unknown';
         var focusStatus = result['focusStatus'] as String?;
-        
+
         // 🔥 focusStatus가 없으면 focusMode로부터 추론
         if (focusStatus == null || focusStatus == 'unknown') {
           if (isAdjusting) {
@@ -431,14 +484,14 @@ class NativeCameraController implements IPetgramCamera {
             focusStatus = 'unknown';
           }
         }
-        
+
         // 🔥 성능 최적화: 빈번한 호출이므로 로그 제거 (기존 기능 유지)
         // if (kDebugMode) {
         //   debugPrint(
         //     '[Petgram] 🎯 getFocusStatus result: isAdjusting=$isAdjusting, focusMode=$focusMode, focusStatus=$focusStatus',
         //   );
         // }
-        
+
         return {
           'isAdjustingFocus': isAdjusting,
           'focusMode': focusMode,
@@ -454,22 +507,27 @@ class NativeCameraController implements IPetgramCamera {
 
   @override
   Future<void> setZoom(double zoom) async {
-    // 🔥🔥🔥 setZoom은 void를 반환하지만, 실제 값은 getActualZoom()으로 확인
-    // 중복 호출 방지를 위해 getActualZoom() 호출은 camera_engine에서 제거
+    // 고빈도(핀치) 호출 경로: 네이티브에서 즉시 반환하는 fast API 사용
     try {
       // 🔄 리팩토링: iOS에서는 viewId가 필요 없음
       if (!_isIOS && _viewId == null) return;
-      await _channel.invokeMethod('setZoom', _createArguments({'zoom': zoom}));
+      await _channel.invokeMethod(
+        'setZoomFast',
+        _createArguments({'zoom': zoom}),
+      );
     } catch (e) {
       debugPrint('[Petgram] ❌ Set zoom error: $e');
     }
   }
-  
+
   /// 🔥🔥🔥 setZoom 후 실제 줌 값을 반환하는 메서드 (동기화용, 중복 호출 방지)
   Future<double?> setZoomAndGetActual(double zoom) async {
     try {
       if (!_isIOS && _viewId == null) return null;
-      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>('setZoom', _createArguments({'zoom': zoom}));
+      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'setZoom',
+        _createArguments({'zoom': zoom}),
+      );
       if (result != null && result['actualZoom'] != null) {
         return (result['actualZoom'] as num).toDouble();
       }
@@ -481,7 +539,6 @@ class NativeCameraController implements IPetgramCamera {
       return null;
     }
   }
-  
 
   @override
   Future<void> setFocusPoint(Offset normalized) async {
@@ -497,6 +554,20 @@ class NativeCameraController implements IPetgramCamera {
       );
     } catch (e) {
       debugPrint('[Petgram] ❌ Set focus point error: $e');
+    }
+  }
+
+  Future<void> setContinuousAutoFocus(bool enabled) async {
+    try {
+      await _channel.invokeMethod(
+        'setContinuousAutoFocus',
+        _createArguments({'enabled': enabled}),
+      );
+      if (kDebugMode) {
+        debugPrint('[Petgram] ✅ setContinuousAutoFocus: enabled=$enabled');
+      }
+    } catch (e) {
+      debugPrint('[Petgram] ❌ setContinuousAutoFocus error: $e');
     }
   }
 
@@ -562,6 +633,9 @@ class NativeCameraController implements IPetgramCamera {
         if (enableFrame != null) 'enableFrame': enableFrame,
         if (frameMeta != null) 'frameMeta': frameMeta,
         if (aspectRatio != null) 'aspectRatio': aspectRatio,
+        // 동일 호출이 네이티브에서 중복 전달되는 케이스를 차단하기 위한 요청 ID
+        'requestId':
+            '${controllerStartTime.microsecondsSinceEpoch}_${math.Random().nextInt(1 << 20)}',
       });
 
       _emitDebugLog(
@@ -729,16 +803,18 @@ class NativeCameraController implements IPetgramCamera {
         };
       }
       // 🔥 스플래시 멈춤 방지: timeout 추가하여 블로킹 방지
-      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
-        'getDebugState',
-        _createArguments(),
-      ).timeout(
-        const Duration(seconds: 2),
-        onTimeout: () {
-          debugPrint('[Petgram] ⚠️ getDebugState: timeout after 2s');
-          return null;
-        },
-      );
+      final result = await _channel
+          .invokeMethod<Map<dynamic, dynamic>>(
+            'getDebugState',
+            _createArguments(),
+          )
+          .timeout(
+            const Duration(seconds: 2),
+            onTimeout: () {
+              debugPrint('[Petgram] ⚠️ getDebugState: timeout after 2s');
+              return null;
+            },
+          );
       if (result == null) {
         debugPrint(
           '[Petgram] ⚠️ getDebugState: result is null${!_isIOS ? " for viewId=$_viewId" : ""}',
@@ -871,9 +947,6 @@ class NativeCameraController implements IPetgramCamera {
     debugPrint(
       '[Petgram] 📷 requestInitializeIfNeeded: viewId=$viewId, position=$cameraPosition, aspect=$aspectRatio',
     );
-    debugPrint(
-      '[Petgram] 📷 About to invokeMethod: initializeIfNeeded, args=$args',
-    );
     _emitDebugLog(
       '[Petgram] 📷 About to invokeMethod: initializeIfNeeded, args=$args',
     );
@@ -886,12 +959,23 @@ class NativeCameraController implements IPetgramCamera {
     _emitDebugLog('[Petgram] 🔥 Args: $args');
 
     try {
-      debugPrint(
-        '[Petgram] 🔥 [TIMING] invokeMethod call started at ${DateTime.now().millisecondsSinceEpoch}',
-      );
+      if (kDebugMode) {
+        debugPrint(
+          '[Petgram] 🔥 [TIMING] invokeMethod call started at ${DateTime.now().millisecondsSinceEpoch}',
+        );
+      }
       _emitDebugLog('[Petgram] 🔥 [TIMING] invokeMethod call started');
 
-      final result = await _channel.invokeMethod('initializeIfNeeded', args);
+      final result = await _channel
+          .invokeMethod('initializeIfNeeded', args)
+          .timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => throw PlatformException(
+              code: 'INIT_CALL_TIMEOUT',
+              message: 'initializeIfNeeded did not return within 4 seconds',
+              details: args,
+            ),
+          );
 
       debugPrint(
         '[Petgram] 🔥 [TIMING] invokeMethod call completed at ${DateTime.now().millisecondsSinceEpoch}',
@@ -1053,6 +1137,7 @@ class NativeCameraController implements IPetgramCamera {
       }
     } catch (e) {
       debugPrint('[Petgram] ❌ resumeSession error: $e');
+      rethrow;
     }
   }
 

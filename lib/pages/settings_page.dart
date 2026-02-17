@@ -4,11 +4,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
 
-import '../models/constants.dart';
+import '../models/petgram_nav_tab.dart';
 import '../services/petgram_db.dart';
 import '../services/petgram_photo_repository.dart';
-import '../models/petgram_nav_tab.dart';
 import '../widgets/petgram_bottom_nav_bar.dart';
+import 'backup_page.dart';
 import 'diary_page.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -42,13 +42,9 @@ class _SettingsPageState extends State<SettingsPage> {
 
   void _listenToPurchaseUpdates() {
     _subscription = _inAppPurchase.purchaseStream.listen(
-      (List<PurchaseDetails> purchaseDetailsList) {
-        _handlePurchaseUpdates(purchaseDetailsList);
-      },
-      onDone: () {
-        _subscription?.cancel();
-      },
-      onError: (error) {
+      _handlePurchaseUpdates,
+      onDone: () => _subscription?.cancel(),
+      onError: (_) {
         setState(() {
           _isLoading = false;
           _errorMessage = '결제 처리 중 오류가 발생했습니다.';
@@ -60,11 +56,9 @@ class _SettingsPageState extends State<SettingsPage> {
   void _handlePurchaseUpdates(List<PurchaseDetails> purchaseDetailsList) {
     for (final purchaseDetails in purchaseDetailsList) {
       if (purchaseDetails.status == PurchaseStatus.pending) {
-        // 결제 대기 중
       } else if (purchaseDetails.status == PurchaseStatus.purchased ||
           purchaseDetails.status == PurchaseStatus.restored) {
-        // 결제 완료
-        _verifyPurchase(purchaseDetails);
+        _verifyPurchase();
       } else if (purchaseDetails.status == PurchaseStatus.error) {
         setState(() {
           _isLoading = false;
@@ -77,11 +71,8 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  void _verifyPurchase(PurchaseDetails purchaseDetails) {
-    setState(() {
-      _isLoading = false;
-    });
-
+  void _verifyPurchase() {
+    setState(() => _isLoading = false);
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text('후원해주셔서 감사합니다! 💕'),
@@ -100,26 +91,20 @@ class _SettingsPageState extends State<SettingsPage> {
       return;
     }
 
-    // 상품 ID 목록 (Google Play Console / App Store Connect에서 설정한 ID)
-    const Set<String> productIds = {'donation_1000.0'};
-
-    final ProductDetailsResponse response = await _inAppPurchase
-        .queryProductDetails(productIds);
+    const productIds = {'donation_1000'};
+    final response = await _inAppPurchase.queryProductDetails(productIds);
 
     if (response.error != null) {
-      debugPrint('인앱 결제 에러: ${response.error}');
       setState(() {
         _errorMessage = '상품 정보를 불러오는 중 오류가 발생했습니다.\n${response.error!.message}';
       });
       return;
     }
 
-    // 찾지 못한 상품 ID 확인
     if (response.notFoundIDs.isNotEmpty) {
-      debugPrint('찾지 못한 상품 ID: ${response.notFoundIDs}');
       setState(() {
         _errorMessage =
-            '상품이 등록되지 않았습니다.\nGoogle Play Console / App Store Connect에서\n상품 ID "donation_1000.0"을 등록해주세요.';
+            '상품이 등록되지 않았습니다.\nGoogle Play Console / App Store Connect에서\n상품 ID "donation_1000"을 등록해주세요.';
       });
       return;
     }
@@ -139,21 +124,15 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _buyProduct(ProductDetails productDetails) async {
     if (_isLoading) return;
-
     setState(() {
       _isLoading = true;
       _errorMessage = null;
     });
 
-    final PurchaseParam purchaseParam = PurchaseParam(
-      productDetails: productDetails,
-    );
-
     try {
-      final bool success = await _inAppPurchase.buyNonConsumable(
-        purchaseParam: purchaseParam,
+      final success = await _inAppPurchase.buyNonConsumable(
+        purchaseParam: PurchaseParam(productDetails: productDetails),
       );
-
       if (!success) {
         setState(() {
           _isLoading = false;
@@ -173,9 +152,19 @@ class _SettingsPageState extends State<SettingsPage> {
     return Scaffold(
       backgroundColor: const Color(0xFFFFF5F8),
       appBar: AppBar(
-        title: const Text('후원하기'),
         backgroundColor: const Color(0xFFFFF5F8),
         elevation: 0,
+        centerTitle: false,
+        titleSpacing: 0,
+        title: const Text(
+          '후원하기',
+          style: TextStyle(
+            color: Color(0xFF7E4C5F),
+            fontWeight: FontWeight.w800,
+            fontSize: 19,
+            letterSpacing: -0.1,
+          ),
+        ),
       ),
       body: SafeArea(
         top: true,
@@ -183,179 +172,32 @@ class _SettingsPageState extends State<SettingsPage> {
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
-            // 후원하기 섹션
-            Container(
-              padding: const EdgeInsets.all(24),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.05),
-                    blurRadius: 10,
-                    offset: const Offset(0, 2),
-                  ),
-                ],
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  // 아이콘
-                  Container(
-                    width: 80,
-                    height: 80,
-                    decoration: BoxDecoration(
-                      color: kMainPink.withValues(alpha: 0.15),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(Icons.coffee, color: kMainPink, size: 48),
-                  ),
-                  const SizedBox(height: 20),
-                  const Text(
-                    '후원하기',
-                    style: TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.black87,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    '이 앱이 마음에 드셨나요?\n개발자를 응원해주세요!',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 15,
-                      color: Colors.grey,
-                      height: 1.5,
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  if (_errorMessage != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 16),
-                      child: Text(
-                        _errorMessage!,
-                        style: TextStyle(fontSize: 12, color: Colors.red[600]),
-                        textAlign: TextAlign.center,
-                      ),
-                    ),
-                  if (_products.isEmpty && !_isLoading && _errorMessage == null)
-                    const Text(
-                      '상품 정보를 불러오는 중...',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    )
-                  else if (_isLoading)
-                    const CircularProgressIndicator(
-                      valueColor: AlwaysStoppedAnimation<Color>(kMainPink),
-                    )
-                  else
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        onPressed: _products.isNotEmpty
-                            ? () => _buyProduct(_products.first)
-                            : null,
-                        icon: const Icon(Icons.coffee, size: 22),
-                        label: const Text(
-                          '천원 후원하기',
-                          style: TextStyle(
-                            fontSize: 17,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: kMainPink,
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 16),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          elevation: 0,
-                        ),
-                      ),
-                    ),
-                  if (_products.isNotEmpty) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      '₩1,000',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.grey[700],
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-
-            // 디버그 모드에서만 DB 상태 확인 섹션 표시
+            _buildDonateCard(),
             if (kDebugMode) ...[
               const SizedBox(height: 20),
-              Container(
-                padding: const EdgeInsets.all(24),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(20),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.05),
-                      blurRadius: 10,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      '데이터베이스 상태 (디버그)',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.black87,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    ElevatedButton.icon(
-                      onPressed: _checkDatabaseStatus,
-                      icon: const Icon(Icons.storage, size: 20),
-                      label: const Text('DB 상태 확인'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blue[600],
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(
-                          vertical: 12,
-                          horizontal: 16,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        elevation: 0,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+              _buildDebugDbCard(),
             ],
           ],
         ),
       ),
       bottomNavigationBar: Container(
-        color: const Color(0xFFFCE4EC), // SafeArea bottom 포함 전체 백그라운드
+        color: const Color(0xFFFCE4EC),
         child: SafeArea(
           top: false,
           bottom: true,
           child: PetgramBottomNavBar(
             currentTab: PetgramNavTab.shot,
-            onShotTap: () {
-              // SettingsPage에서 Shot으로 돌아가기
-              Navigator.of(context).popUntil((route) => route.isFirst);
-            },
+            onShotTap: () => Navigator.of(context).popUntil((r) => r.isFirst),
             onDiaryTap: () {
               Navigator.push(
                 context,
                 MaterialPageRoute(builder: (_) => const DiaryPage()),
+              );
+            },
+            onBackupTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const BackupPage()),
               );
             },
           ),
@@ -364,20 +206,120 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 데이터베이스 상태 확인 (디버그용)
+  Widget _buildDonateCard() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.05),
+            blurRadius: 10,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            width: 80,
+            height: 80,
+            decoration: BoxDecoration(
+              color: const Color(0xFFFFC0CB).withValues(alpha: 0.15),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(Icons.coffee, color: Color(0xFFFFC0CB), size: 48),
+          ),
+          const SizedBox(height: 20),
+          const Text(
+            '후원하기',
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.w700,
+              color: Colors.black87,
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '이 앱이 마음에 드셨나요?\n개발자를 응원해주세요!',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 15, color: Colors.grey, height: 1.5),
+          ),
+          const SizedBox(height: 24),
+          if (_errorMessage != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Text(
+                _errorMessage!,
+                style: TextStyle(fontSize: 12, color: Colors.red[600]),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          if (_products.isEmpty && !_isLoading && _errorMessage == null)
+            const Text(
+              '상품 정보를 불러오는 중...',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            )
+          else if (_isLoading)
+            const CircularProgressIndicator()
+          else
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _products.isNotEmpty
+                    ? () => _buyProduct(_products.first)
+                    : null,
+                icon: const Icon(Icons.coffee, size: 22),
+                label: const Text(
+                  '천원 후원하기',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDebugDbCard() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '데이터베이스 상태 (디버그)',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+              color: Colors.black87,
+            ),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: _checkDatabaseStatus,
+            icon: const Icon(Icons.storage, size: 20),
+            label: const Text('DB 상태 확인'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _checkDatabaseStatus() async {
     try {
-      // DB 상태 확인
       final status = await PetgramDatabase.instance.checkDatabaseStatus();
-
-      // 최근 레코드 조회
       final recentRecords = await PetgramPhotoRepository.instance.listRecent(
         limit: 5,
       );
 
-      // 결과를 다이얼로그로 표시
       if (!mounted) return;
-
       showDialog(
         context: context,
         builder: (context) => AlertDialog(
@@ -397,37 +339,11 @@ class _SettingsPageState extends State<SettingsPage> {
                   status['db_path']?.toString() ?? 'N/A',
                 ),
                 _buildStatusRow('DB 버전', '${status['db_version'] ?? 'N/A'}'),
-                if (status['indexes'] != null) ...[
-                  const SizedBox(height: 8),
-                  const Text(
-                    '인덱스:',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  ...((status['indexes'] as List?) ?? []).map(
-                    (idx) => Text('  • $idx'),
-                  ),
-                ],
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
                 Text(
                   '최근 레코드 (${recentRecords.length}개):',
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
-                const SizedBox(height: 8),
-                if (recentRecords.isEmpty)
-                  const Text(
-                    '저장된 레코드가 없습니다.',
-                    style: TextStyle(color: Colors.grey),
-                  )
-                else
-                  ...recentRecords.map(
-                    (record) => Padding(
-                      padding: const EdgeInsets.only(bottom: 4),
-                      child: Text(
-                        '  • ID: ${record.id}, 파일: ${record.filePath.split('/').last}',
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                    ),
-                  ),
               ],
             ),
           ),
@@ -441,9 +357,9 @@ class _SettingsPageState extends State<SettingsPage> {
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('DB 상태 확인 실패: $e'), backgroundColor: Colors.red),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('DB 상태 확인 실패: $e')));
     }
   }
 
@@ -466,7 +382,3 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 }
-
-/// ========================
-///  프레임 설정 화면
-/// ========================

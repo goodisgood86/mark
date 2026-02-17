@@ -1,6 +1,7 @@
 /// 공통 이미지 파이프라인 테스트
-/// 
+///
 /// 프리뷰와 저장 파이프라인이 1:1 동일한 결과를 보장하는지 검증합니다.
+library;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mark_v2/core/shared_image_pipeline.dart';
 
@@ -9,10 +10,26 @@ void main() {
     group('필터 수식 일치 테스트', () {
       test('펫톤 매트릭스 생성 (40% 강도)', () {
         final petToneMatrix = <double>[
-          1.05, 0, 0, 0, 0,
-          0, 1.05, 0, 0, 0,
-          0, 0, 1.05, 0, 0,
-          0, 0, 0, 1, 0,
+          1.05,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1.05,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1.05,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
         ];
 
         final result = SharedImagePipeline.buildPetToneMatrix(petToneMatrix);
@@ -28,10 +45,26 @@ void main() {
 
       test('필터 매트릭스 생성 (intensity 적용)', () {
         final filterMatrix = <double>[
-          1.1, 0.05, 0, 0, 5,
-          0, 0.95, 0.05, 0, 0,
-          0, 0.05, 0.9, 0, 0,
-          0, 0, 0, 1, 0,
+          1.1,
+          0.05,
+          0,
+          0,
+          5,
+          0,
+          0.95,
+          0.05,
+          0,
+          0,
+          0,
+          0.05,
+          0.9,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
         ];
 
         final result = SharedImagePipeline.buildFilterMatrix(filterMatrix, 0.8);
@@ -97,7 +130,11 @@ void main() {
         // 원본: 2000x3000 (비율: 2/3 = 0.667)
         // 목표: 9/16 = 0.5625
         // 원본 비율(0.667) > 목표 비율(0.5625) → 원본이 더 넓음 → 좌우를 자름
-        final crop = SharedImagePipeline.calculateAspectCrop(2000, 3000, 9.0 / 16.0);
+        final crop = SharedImagePipeline.calculateAspectCrop(
+          2000,
+          3000,
+          9.0 / 16.0,
+        );
 
         // 원본이 더 넓음 → 좌우를 자름
         // cropHeight = 3000
@@ -112,7 +149,11 @@ void main() {
       test('Aspect 크롭 계산 (3:4)', () {
         // 원본: 3000x2000 (3:2)
         // 목표: 3:4
-        final crop = SharedImagePipeline.calculateAspectCrop(3000, 2000, 3.0 / 4.0);
+        final crop = SharedImagePipeline.calculateAspectCrop(
+          3000,
+          2000,
+          3.0 / 4.0,
+        );
 
         // 원본이 더 넓음 → 좌우를 자름
         // cropHeight = 2000
@@ -160,7 +201,11 @@ void main() {
       test('다운샘플링 계산 (1200px 초과)', () {
         // 원본: 3000x2000 (긴 변: 3000)
         // 최대: 1200
-        final result = SharedImagePipeline.calculateDownsample(3000, 2000, 1200);
+        final result = SharedImagePipeline.calculateDownsample(
+          3000,
+          2000,
+          1200,
+        );
 
         // scale = 1200 / 3000 = 0.4
         // width = 3000 * 0.4 = 1200
@@ -183,8 +228,10 @@ void main() {
     group('오버레이 위치 계산 일치 테스트', () {
       test('오버레이 위치 계산 (center)', () {
         final pos = SharedImagePipeline.calculateOverlayPosition(
-          2000, 3000, // 이미지 크기
-          500, 300, // 오버레이 크기
+          2000,
+          3000, // 이미지 크기
+          500,
+          300, // 오버레이 크기
           'center',
         );
 
@@ -196,8 +243,10 @@ void main() {
 
       test('오버레이 위치 계산 (top)', () {
         final pos = SharedImagePipeline.calculateOverlayPosition(
-          2000, 3000,
-          500, 300,
+          2000,
+          3000,
+          500,
+          300,
           'top',
         );
 
@@ -207,8 +256,10 @@ void main() {
 
       test('오버레이 위치 계산 (bottom)', () {
         final pos = SharedImagePipeline.calculateOverlayPosition(
-          2000, 3000,
-          500, 300,
+          2000,
+          3000,
+          500,
+          300,
           'bottom',
         );
 
@@ -230,17 +281,49 @@ void main() {
         );
 
         final petToneMatrix = <double>[
-          1.05, 0, 0, 0, 0,
-          0, 1.05, 0, 0, 0,
-          0, 0, 1.05, 0, 0,
-          0, 0, 0, 1, 0,
+          1.05,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1.05,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1.05,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
         ];
 
         final filterMatrix = <double>[
-          1.03, 0.02, 0.02, 0, 0,
-          0.01, 1.00, 0.00, 0, 0,
-          0.00, 0.02, 0.98, 0, 0,
-          0, 0, 0, 1, 0,
+          1.03,
+          0.02,
+          0.02,
+          0,
+          0,
+          0.01,
+          1.00,
+          0.00,
+          0,
+          0,
+          0.00,
+          0.02,
+          0.98,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
         ];
 
         final result = SharedImagePipeline.buildCompleteColorMatrix(
@@ -256,4 +339,3 @@ void main() {
     });
   });
 }
-

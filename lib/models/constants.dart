@@ -1,5 +1,5 @@
 /// Petgram 앱의 상수 정의
-library constants;
+library;
 
 import 'package:flutter/material.dart';
 
@@ -20,6 +20,12 @@ const String kBurstModeKey = 'petgram_burst_mode';
 const String kBurstCountSettingKey = 'petgram_burst_count_setting';
 const String kTimerSecondsKey = 'petgram_timer_seconds';
 const String kAspectModeKey = 'petgram_aspect_mode';
+const String kAutoBackupEnabledKey = 'petgram_auto_backup_enabled';
+const String kLastAutoBackupAtKey = 'petgram_last_auto_backup_at';
+const String kLastAutoBackupDateKey = 'petgram_last_auto_backup_date';
+const String kLastBackupSignatureKey = 'petgram_last_backup_signature';
+const String kLastAuthProviderKey = 'petgram_last_auth_provider';
+const String kBackupPolicyAcceptedKey = 'petgram_backup_policy_accepted';
 
 // 이미지 처리 해상도 상수
 // 프리뷰는 1200px, 저장은 3000px 정도로 타협하여 성능과 품질을 균형 있게 유지
@@ -28,4 +34,3 @@ const int kSaveMaxDimension =
     3000; // 최종 저장용 최대 해상도 (긴 변 기준) - 고해상도이되 과도한 용량/속도 저하 방지
 const int kSaveMinDimension =
     2000; // 최종 저장용 최소 해상도 (긴 변 기준) - 너무 낮은 해상도로 떨어지는 것만 방지
-

@@ -135,4 +135,3 @@ Map<String, double> calculateAverageRGB(img.Image image) {
     'b': sumB / totalPixels,
   };
 }
-

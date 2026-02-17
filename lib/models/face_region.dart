@@ -10,4 +10,3 @@ class FaceRegion {
     required this.radius,
   });
 }
-

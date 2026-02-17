@@ -121,7 +121,7 @@ class PetgramImageOrientation {
 
       if (kDebugMode) {
         debugPrint(
-          '[PetgramImageOrientation] 📐 Original size: ${originalWidth}x${originalHeight}',
+          '[PetgramImageOrientation] 📐 Original size: ${originalWidth}x$originalHeight',
         );
       }
 
@@ -162,7 +162,7 @@ class PetgramImageOrientation {
 
       if (kDebugMode) {
         debugPrint(
-          '[PetgramImageOrientation] 📐 Fixed size: ${fixedWidth}x${fixedHeight}',
+          '[PetgramImageOrientation] 📐 Fixed size: ${fixedWidth}x$fixedHeight',
         );
         debugPrint(
           '[PetgramImageOrientation] 📐 Ratio: ${fixedWidth / fixedHeight}',
@@ -186,7 +186,7 @@ class PetgramImageOrientation {
         if (kDebugMode && totalPixels > highResThreshold) {
           debugPrint(
             '[PetgramImageOrientation] 📐 High-resolution image detected: '
-            '${fixedWidth}x${fixedHeight} (${totalPixels} pixels), using quality=$quality',
+            '${fixedWidth}x$fixedHeight ($totalPixels pixels), using quality=$quality',
           );
         }
 
@@ -202,7 +202,7 @@ class PetgramImageOrientation {
         if (kDebugMode) {
           debugPrint(
             '[PetgramImageOrientation] ✅ JPEG encoded: ${fixedBytes.length} bytes '
-            '(${fixedWidth}x${fixedHeight}, quality=$quality, orientation=1)',
+            '(${fixedWidth}x$fixedHeight, quality=$quality, orientation=1)',
           );
         }
       } catch (e, stackTrace) {

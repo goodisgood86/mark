@@ -10,7 +10,8 @@ import '../models/petgram_photo_meta.dart';
 class PetgramPhotoRepository {
   PetgramPhotoRepository._internal();
 
-  static final PetgramPhotoRepository instance = PetgramPhotoRepository._internal();
+  static final PetgramPhotoRepository instance =
+      PetgramPhotoRepository._internal();
 
   /// 사진 레코드 저장 또는 업데이트 (upsert)
   ///
@@ -62,11 +63,13 @@ class PetgramPhotoRepository {
           where: 'id = ?',
           whereArgs: [record.id],
         );
-        
+
         if (kDebugMode) {
-          debugPrint('[PetgramDB] ✅ Updated photo record: $filePath (id: ${record.id})');
+          debugPrint(
+            '[PetgramDB] ✅ Updated photo record: $filePath (id: ${record.id})',
+          );
         }
-        
+
         return record.id ?? 0;
       } else {
         // INSERT
@@ -75,11 +78,13 @@ class PetgramPhotoRepository {
           record.toMap(),
           conflictAlgorithm: ConflictAlgorithm.replace,
         );
-        
+
         if (kDebugMode) {
-          debugPrint('[PetgramDB] ✅ Inserted photo record: $filePath (rowId: $rowId)');
+          debugPrint(
+            '[PetgramDB] ✅ Inserted photo record: $filePath (rowId: $rowId)',
+          );
         }
-        
+
         return rowId;
       }
     } catch (e, stackTrace) {
@@ -114,11 +119,11 @@ class PetgramPhotoRepository {
       }
 
       final record = PetgramPhotoRecord.fromMap(rows.first);
-      
+
       if (kDebugMode) {
         debugPrint('[PetgramDB] 📖 Found record for filePath: $filePath');
       }
-      
+
       return record;
     } catch (e, stackTrace) {
       if (kDebugMode) {
@@ -143,49 +148,59 @@ class PetgramPhotoRepository {
       // 파일명에서 PG_ 식별자 추출
       final pgPattern = RegExp(r'PG_(\d+)\.(jpg|jpeg|JPG|JPEG)');
       final match = pgPattern.firstMatch(fileName);
-      
+
       if (match == null) {
         if (kDebugMode) {
-          debugPrint('[PetgramDB] 📖 No PG_ pattern found in fileName: $fileName');
+          debugPrint(
+            '[PetgramDB] 📖 No PG_ pattern found in fileName: $fileName',
+          );
         }
         return null;
       }
 
       final pgIdentifier = match.group(0); // "PG_1234567890.jpg"
       final pgBase = match.group(1); // "1234567890"
-      
+
       if (kDebugMode) {
-        debugPrint('[PetgramDB] 📖 Extracted PG identifier: $pgIdentifier (base: $pgBase) from fileName: $fileName');
+        debugPrint(
+          '[PetgramDB] 📖 Extracted PG identifier: $pgIdentifier (base: $pgBase) from fileName: $fileName',
+        );
       }
 
       final db = await PetgramDatabase.instance.database;
-      
+
       // LIKE 쿼리로 PG_ 식별자가 포함된 레코드 조회
       // 예: "PG_1234567890.jpg" 또는 "PG_1234567890.jpeg" 등
       final rows = await db.query(
         'petgram_photos',
         where: 'file_path LIKE ?',
-        whereArgs: ['PG_$pgBase.%'],
+        whereArgs: ['%PG_$pgBase.%'],
         limit: 1,
       );
 
       if (rows.isEmpty) {
         if (kDebugMode) {
-          debugPrint('[PetgramDB] 📖 No record found for PG pattern: PG_$pgBase.%');
+          debugPrint(
+            '[PetgramDB] 📖 No record found for PG pattern: PG_$pgBase.%',
+          );
         }
         return null;
       }
 
       final record = PetgramPhotoRecord.fromMap(rows.first);
-      
+
       if (kDebugMode) {
-        debugPrint('[PetgramDB] 📖 Found record for PG pattern: PG_$pgBase.% (filePath: ${record.filePath})');
+        debugPrint(
+          '[PetgramDB] 📖 Found record for PG pattern: PG_$pgBase.% (filePath: ${record.filePath})',
+        );
       }
-      
+
       return record;
     } catch (e, stackTrace) {
       if (kDebugMode) {
-        debugPrint('[PetgramDB] ❌ Failed to get photo record by fileName pattern: $e');
+        debugPrint(
+          '[PetgramDB] ❌ Failed to get photo record by fileName pattern: $e',
+        );
         debugPrint('[PetgramDB] ❌ Stack trace: $stackTrace');
       }
       return null;
@@ -206,16 +221,69 @@ class PetgramPhotoRepository {
         limit: limit,
       );
 
-      final records = rows.map((row) => PetgramPhotoRecord.fromMap(row)).toList();
-      
+      final records = rows
+          .map((row) => PetgramPhotoRecord.fromMap(row))
+          .toList();
+
       if (kDebugMode) {
-        debugPrint('[PetgramDB] 📖 List recent records: ${records.length} items');
+        debugPrint(
+          '[PetgramDB] 📖 List recent records: ${records.length} items',
+        );
       }
-      
+
       return records;
     } catch (e, stackTrace) {
       if (kDebugMode) {
         debugPrint('[PetgramDB] ❌ Failed to list recent records: $e');
+        debugPrint('[PetgramDB] ❌ Stack trace: $stackTrace');
+      }
+      return [];
+    }
+  }
+
+  /// 다이어리 표시용 최근 사진 레코드 조회
+  ///
+  /// [limit]: 조회할 최대 개수 (기본값: 200)
+  /// [petgramOnly]: true면 Petgram 촬영/편집본만 조회
+  ///
+  /// 반환: taken_at 최신순(동률 시 created_at 최신순) 정렬 결과
+  Future<List<PetgramPhotoRecord>> listForDiary({
+    int limit = 200,
+    int offset = 0,
+    bool petgramOnly = true,
+  }) async {
+    try {
+      final db = await PetgramDatabase.instance.database;
+      final rows = await db.query(
+        'petgram_photos',
+        where: petgramOnly
+            ? '''
+              (
+                is_petgram_shot = 1
+                OR is_petgram_edited = 1
+                OR exif_tag LIKE 'PETGRAM|%'
+              )
+              '''
+            : null,
+        orderBy: 'taken_at DESC, created_at DESC',
+        limit: limit,
+        offset: offset,
+      );
+
+      final records = rows
+          .map((row) => PetgramPhotoRecord.fromMap(row))
+          .toList();
+
+      if (kDebugMode) {
+        debugPrint(
+          '[PetgramDB] 📖 List diary records: ${records.length} items',
+        );
+      }
+
+      return records;
+    } catch (e, stackTrace) {
+      if (kDebugMode) {
+        debugPrint('[PetgramDB] ❌ Failed to list diary records: $e');
         debugPrint('[PetgramDB] ❌ Stack trace: $stackTrace');
       }
       return [];
@@ -235,11 +303,13 @@ class PetgramPhotoRepository {
         where: 'file_path = ?',
         whereArgs: [filePath],
       );
-      
+
       if (kDebugMode) {
-        debugPrint('[PetgramDB] 🗑️ Deleted $count record(s) for filePath: $filePath');
+        debugPrint(
+          '[PetgramDB] 🗑️ Deleted $count record(s) for filePath: $filePath',
+        );
       }
-      
+
       return count;
     } catch (e, stackTrace) {
       if (kDebugMode) {
@@ -249,5 +319,28 @@ class PetgramPhotoRepository {
       return 0;
     }
   }
-}
 
+  /// 레코드의 file_path를 갱신 (마이그레이션 용도)
+  Future<bool> updateFilePathById({
+    required int id,
+    required String filePath,
+  }) async {
+    try {
+      final db = await PetgramDatabase.instance.database;
+      final now = DateTime.now().toUtc().millisecondsSinceEpoch;
+      final count = await db.update(
+        'petgram_photos',
+        {'file_path': filePath, 'updated_at': now},
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+      return count > 0;
+    } catch (e, stackTrace) {
+      if (kDebugMode) {
+        debugPrint('[PetgramDB] ❌ Failed to update file_path by id: $e');
+        debugPrint('[PetgramDB] ❌ Stack trace: $stackTrace');
+      }
+      return false;
+    }
+  }
+}

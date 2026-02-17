@@ -1,1 +1,1 @@
-enum PetgramNavTab { shot, diary }
+enum PetgramNavTab { shot, diary, backup }

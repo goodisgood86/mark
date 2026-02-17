@@ -1,7 +1,7 @@
 import 'dart:convert';
 
 /// Petgram 사진 메타데이터 모델
-/// 
+///
 /// 촬영/보정하여 저장되는 모든 최종 이미지에 포함되는 메타데이터
 class PetgramPhotoMeta {
   /// 우리 카메라로 촬영한 사진인지 여부
@@ -31,19 +31,21 @@ class PetgramPhotoMeta {
   String get frameMetaJson => jsonEncode(frameMeta);
 
   /// EXIF UserComment 등에 쓸 단일 문자열 포맷
-  /// 
+  ///
   /// 포맷: PETGRAM|v=1|shot={0|1}|edited={0|1}|frame={frameKey}|ts={unix_timestamp}|meta64={base64Url}
-  /// 
+  ///
   /// meta64는 JSON을 UTF-8 → Base64Url로 인코딩한 값 (한글 깨짐 방지)
-  /// 
+  ///
   /// ⚠️ 주의: EXIF 크기 제한을 피하기 위해 iconBase64는 제외됨 (DB에만 저장)
   String toExifTag() {
     final ts = takenAt.millisecondsSinceEpoch ~/ 1000; // Unix timestamp
-    
+
     // 🔥 EXIF 크기 제한을 피하기 위해 iconBase64 제거
     final metaForExif = Map<String, dynamic>.from(frameMeta);
     if (metaForExif.containsKey('overlayConfig')) {
-      final overlayConfig = Map<String, dynamic>.from(metaForExif['overlayConfig'] as Map);
+      final overlayConfig = Map<String, dynamic>.from(
+        metaForExif['overlayConfig'] as Map,
+      );
       // overlayConfig의 각 chip에서 iconBase64 제거
       if (overlayConfig.containsKey('topChips')) {
         final topChips = (overlayConfig['topChips'] as List).map((chip) {
@@ -63,12 +65,12 @@ class PetgramPhotoMeta {
       }
       metaForExif['overlayConfig'] = overlayConfig;
     }
-    
+
     final metaJson = jsonEncode(metaForExif);
-    
+
     // JSON → UTF-8 → Base64Url 인코딩 (한글 깨짐 방지)
     final metaBase64 = base64Url.encode(utf8.encode(metaJson));
-    
+
     return 'PETGRAM'
         '|v=1'
         '|shot=${isPetgramShot ? 1 : 0}'
@@ -79,7 +81,7 @@ class PetgramPhotoMeta {
   }
 
   /// 파일명에 사용할 안전한 문자열 (옵션)
-  /// 
+  ///
   /// 포맷: {unix_timestamp}_{frameKey}
   String toFileNameSuffix() {
     final ts = takenAt.millisecondsSinceEpoch ~/ 1000;
@@ -107,7 +109,9 @@ class PetgramPhotoMeta {
       isPetgramEdited: (map['isPetgramEdited'] as int? ?? 0) == 1,
       frameKey: map['frameKey'] as String? ?? 'none',
       takenAt: DateTime.parse(map['takenAt'] as String),
-      frameMeta: jsonDecode(map['frameMetaJson'] as String? ?? '{}') as Map<String, dynamic>,
+      frameMeta:
+          jsonDecode(map['frameMetaJson'] as String? ?? '{}')
+              as Map<String, dynamic>,
     );
   }
 
@@ -128,4 +132,3 @@ class PetgramPhotoMeta {
     );
   }
 }
-

@@ -12,4 +12,3 @@ double aspectRatioOf(AspectRatioMode mode) {
       return 1.0;
   }
 }
-

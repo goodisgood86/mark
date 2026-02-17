@@ -36,7 +36,7 @@ abstract class IPetgramCamera {
 
   /// 🔥 성능 최적화: 카메라 세션 일시 중지
   Future<void> pauseSession();
-  
+
   /// 🔥 성능 최적화: 카메라 세션 재개
   Future<void> resumeSession();
 
@@ -79,4 +79,3 @@ abstract class IPetgramCamera {
   /// 시뮬레이터 여부 확인
   Future<bool> isSimulator();
 }
-

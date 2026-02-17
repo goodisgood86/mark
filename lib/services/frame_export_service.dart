@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/rendering.dart';
@@ -113,7 +112,7 @@ class FrameExporter {
       // 임시 파일로 저장
       final dir = await getTemporaryDirectory();
       final fileNameSuffix = meta.toFileNameSuffix();
-      final filePath = '${dir.path}/PG_${fileNameSuffix}.jpg';
+      final filePath = '${dir.path}/PG_$fileNameSuffix.jpg';
       final File framedFile = File(filePath);
       await framedFile.writeAsBytes(jpegBytesWithMeta);
 

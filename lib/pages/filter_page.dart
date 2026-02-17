@@ -15,6 +15,7 @@ import '../models/filter_models.dart';
 import '../models/pet_info.dart';
 import '../services/image_pipeline_service.dart';
 import '../services/native_filter_service.dart';
+import '../services/petgram_media_ref_service.dart';
 import '../services/petgram_meta_service.dart';
 import '../models/petgram_photo_meta.dart';
 import '../services/petgram_photo_repository.dart';
@@ -22,6 +23,7 @@ import 'package:exif/exif.dart';
 import '../models/petgram_nav_tab.dart';
 import '../widgets/petgram_bottom_nav_bar.dart';
 import 'diary_page.dart';
+import 'backup_page.dart';
 import '../models/aspect_ratio_mode.dart';
 
 class FilterPage extends StatefulWidget {
@@ -414,7 +416,7 @@ class _FilterPageState extends State<FilterPage> {
           fit: fit,
           filterQuality: FilterQuality.high, // 🔥 고품질 렌더링
           // 🔥 안정적인 key: 이미지 경로만 사용 (필터 변경 시에도 위젯 재생성 방지)
-          key: ValueKey('preview_image_${_currentImagePath}'),
+          key: ValueKey('preview_image_$_currentImagePath'),
           // 🔥 이미지가 변경될 때만 fade 효과 (필터 변경 시에는 즉시 교체)
           frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
             // 동기 로드된 경우 (캐시된 이미지) 또는 프레임이 준비된 경우
@@ -443,7 +445,7 @@ class _FilterPageState extends State<FilterPage> {
           fallbackFile,
           fit: BoxFit.contain,
           filterQuality: FilterQuality.high, // 🔥 고품질 렌더링
-          key: ValueKey('fallback_${_currentImagePath}'),
+          key: ValueKey('fallback_$_currentImagePath'),
         );
       }
     }
@@ -491,8 +493,9 @@ class _FilterPageState extends State<FilterPage> {
         // 🔥🔥🔥 성능 최적화: 로그 출력 빈도 감소 (10프레임마다 1회 또는 scale 변화가 있을 때만)
         if (kDebugMode) {
           // scale이 1.0에서 벗어나거나, 마지막 로그 출력 후 10프레임 이상 경과했을 때만 로그 출력
-          final shouldLog = (details.scale - 1.0).abs() > 0.01 || 
-                           (_pinchZoomLogCounter % 10 == 0);
+          final shouldLog =
+              (details.scale - 1.0).abs() > 0.01 ||
+              (_pinchZoomLogCounter % 10 == 0);
           if (shouldLog) {
             debugPrint(
               '[FilterPage] 🔍 Pinch zoom update: scale=${details.scale.toStringAsFixed(2)}, '
@@ -719,11 +722,14 @@ class _FilterPageState extends State<FilterPage> {
           title: const Text(
             '필터 적용',
             style: TextStyle(
-              fontWeight: FontWeight.w700,
-              color: Colors.black87,
+              color: Color(0xFF7E4C5F),
+              fontWeight: FontWeight.w800,
+              fontSize: 19,
+              letterSpacing: -0.1,
             ),
           ),
-          centerTitle: true,
+          centerTitle: false,
+          titleSpacing: 0,
           iconTheme: const IconThemeData(color: Colors.black87),
           actions: [
             // 상단 우측 로딩 인디케이터 (로딩 중일 때만 표시)
@@ -771,13 +777,23 @@ class _FilterPageState extends State<FilterPage> {
               onDiaryTap: () async {
                 // 🔥 다른 페이지로 이동 시 카메라 pause
                 await _pauseCamera();
-                if (!mounted) return;
+                if (!mounted || !context.mounted) return;
                 await Navigator.push(
                   context,
                   MaterialPageRoute(builder: (_) => const DiaryPage()),
                 );
                 // 🔥 페이지에서 돌아올 때 카메라 resume
-                if (!mounted) return;
+                if (!mounted || !context.mounted) return;
+                await _resumeCamera();
+              },
+              onBackupTap: () async {
+                await _pauseCamera();
+                if (!mounted || !context.mounted) return;
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const BackupPage()),
+                );
+                if (!mounted || !context.mounted) return;
                 await _resumeCamera();
               },
             ),
@@ -795,11 +811,14 @@ class _FilterPageState extends State<FilterPage> {
           title: const Text(
             '필터 적용',
             style: TextStyle(
-              fontWeight: FontWeight.w700,
-              color: Colors.black87,
+              color: Color(0xFF7E4C5F),
+              fontWeight: FontWeight.w800,
+              fontSize: 19,
+              letterSpacing: -0.1,
             ),
           ),
-          centerTitle: true,
+          centerTitle: false,
+          titleSpacing: 0,
           iconTheme: const IconThemeData(color: Colors.black87),
         ),
         backgroundColor: const Color(0xFFFFF5F8),
@@ -872,13 +891,23 @@ class _FilterPageState extends State<FilterPage> {
               onDiaryTap: () async {
                 // 🔥 다른 페이지로 이동 시 카메라 pause
                 await _pauseCamera();
-                if (!mounted) return;
+                if (!mounted || !context.mounted) return;
                 await Navigator.push(
                   context,
                   MaterialPageRoute(builder: (_) => const DiaryPage()),
                 );
                 // 🔥 페이지에서 돌아올 때 카메라 resume
-                if (!mounted) return;
+                if (!mounted || !context.mounted) return;
+                await _resumeCamera();
+              },
+              onBackupTap: () async {
+                await _pauseCamera();
+                if (!mounted || !context.mounted) return;
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const BackupPage()),
+                );
+                if (!mounted || !context.mounted) return;
                 await _resumeCamera();
               },
             ),
@@ -893,9 +922,15 @@ class _FilterPageState extends State<FilterPage> {
         backgroundColor: const Color(0xFFFFF5F8),
         title: const Text(
           '필터 적용',
-          style: TextStyle(fontWeight: FontWeight.w700, color: Colors.black87),
+          style: TextStyle(
+            color: Color(0xFF7E4C5F),
+            fontWeight: FontWeight.w800,
+            fontSize: 19,
+            letterSpacing: -0.1,
+          ),
         ),
-        centerTitle: true,
+        centerTitle: false,
+        titleSpacing: 0,
         iconTheme: const IconThemeData(color: Colors.black87),
         actions: [
           // 상단 우측 로딩 인디케이터 (로딩 중일 때만 표시)
@@ -936,13 +971,23 @@ class _FilterPageState extends State<FilterPage> {
             onDiaryTap: () async {
               // 🔥 다른 페이지로 이동 시 카메라 pause
               await _pauseCamera();
-              if (!mounted) return;
+              if (!mounted || !context.mounted) return;
               final _ = await Navigator.push(
                 context,
                 MaterialPageRoute(builder: (_) => const DiaryPage()),
               );
               // 🔥 페이지에서 돌아올 때 카메라 resume
-              if (!mounted) return;
+              if (!mounted || !context.mounted) return;
+              await _resumeCamera();
+            },
+            onBackupTap: () async {
+              await _pauseCamera();
+              if (!mounted || !context.mounted) return;
+              await Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const BackupPage()),
+              );
+              if (!mounted || !context.mounted) return;
               await _resumeCamera();
             },
           ),
@@ -1639,7 +1684,7 @@ class _FilterPageState extends State<FilterPage> {
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 0),
         itemCount: filters.length,
-        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        separatorBuilder: (context, index) => const SizedBox(width: 8),
         itemBuilder: (context, index) {
           final f = filters[index];
           final bool selected = f.key == _filterKey;
@@ -1655,7 +1700,7 @@ class _FilterPageState extends State<FilterPage> {
               _debouncePreviewUpdate();
             },
             child: AnimatedContainer(
-              key: ValueKey('filter_${f.key}_${selected}'),
+              key: ValueKey('filter_${f.key}_$selected'),
               duration: const Duration(milliseconds: 200),
               curve: Curves.easeOut,
               width: 72,
@@ -2093,6 +2138,28 @@ class _FilterPageState extends State<FilterPage> {
       //    보정 후 저장 시 새로운 파일이 1개 생기므로 새로운 파일명 사용
       final fileName = 'PG_${DateTime.now().millisecondsSinceEpoch}.jpg';
 
+      // 🔥 권한 체크: 갤러리 권한 확인 및 요청 (저장 전)
+      final hasAccess = await Gal.hasAccess();
+      if (!hasAccess) {
+        if (kDebugMode) {
+          debugPrint('[FilterPage] 📷 Requesting gallery permission...');
+        }
+        await Gal.requestAccess();
+        // 요청 후 다시 확인
+        final hasAccessAfterRequest = await Gal.hasAccess();
+        if (!hasAccessAfterRequest) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('갤러리 저장 권한이 필요합니다. 설정에서 권한을 허용해주세요.'),
+                duration: Duration(seconds: 3),
+              ),
+            );
+          }
+          return;
+        }
+      }
+
       // 🔥 갤러리에 저장 (에러 처리 강화)
       try {
         await Gal.putImageBytes(finalImageBytesWithMeta, name: fileName);
@@ -2110,10 +2177,14 @@ class _FilterPageState extends State<FilterPage> {
       //    보정 후 저장 시 새로운 파일이 1개 생기므로 새로운 레코드로 저장
       //    isPetgramEdited=true로 설정하여 보정된 사진임을 표시
       try {
+        final dbFileRef = await PetgramMediaRefService.instance.buildDbFileRef(
+          savedPathOrName: fileName,
+          isGallerySave: true,
+        );
         // 🔥 항상 새 레코드로 저장 (사진 찍을 때와 동일)
         //    타임스탬프 기반 파일명이므로 중복 가능성 없음
         await PetgramPhotoRepository.instance.upsertPhotoRecord(
-          filePath: fileName, // 새로운 파일명 (타임스탬프 기반)
+          filePath: dbFileRef, // 단일 규격 참조 문자열로 저장
           meta: meta, // 🔥 보정된 메타데이터 (isPetgramEdited=true, 프레임 정보 포함)
           exifTag: meta.toExifTag(),
         );

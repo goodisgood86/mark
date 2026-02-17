@@ -1,7 +1,7 @@
 import 'petgram_photo_meta.dart';
 
 /// 촬영 로그 레코드 (로컬 DB 저장용)
-/// 
+///
 /// 향후 다이어리 기능에서 재사용할 수 있도록
 /// 메타데이터와 실제 파일 경로를 함께 보관
 class ShootLog {
@@ -22,11 +22,7 @@ class ShootLog {
 
   /// Map으로 변환 (sqflite/Hive 등에 저장하기 용이)
   Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'filePath': filePath,
-      ...meta.toMap(),
-    };
+    return {'id': id, 'filePath': filePath, ...meta.toMap()};
   }
 
   /// Map에서 생성
@@ -38,4 +34,3 @@ class ShootLog {
     );
   }
 }
-

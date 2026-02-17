@@ -50,8 +50,9 @@ class PetgramPhotoRecord {
 
   /// DB Map에서 PetgramPhotoRecord 생성
   factory PetgramPhotoRecord.fromMap(Map<String, dynamic> map) {
-    final frameMeta = jsonDecode(map['meta_json'] as String) as Map<String, dynamic>;
-    
+    final frameMeta =
+        jsonDecode(map['meta_json'] as String) as Map<String, dynamic>;
+
     final meta = PetgramPhotoMeta(
       isPetgramShot: (map['is_petgram_shot'] as int) == 1,
       isPetgramEdited: (map['is_petgram_edited'] as int) == 1,
@@ -98,4 +99,3 @@ class PetgramPhotoRecord {
     );
   }
 }
-

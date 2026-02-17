@@ -43,30 +43,27 @@ class FramePreviewPainter extends CustomPainter {
 
     // 🔥 공통 파이프라인 모듈 사용: 프리뷰와 저장이 동일한 위치 계산 사용
     // 테두리 제거 - 모든 정보를 칩 형태로 표시
-    final double chipHeight = SharedImagePipeline.calculateChipHeight(size.width);
-    final double chipPadding = SharedImagePipeline.calculateChipPadding(size.width);
-    final double chipSpacing = SharedImagePipeline.calculateChipSpacing(size.width);
-    final double chipCornerRadius = SharedImagePipeline.calculateChipCornerRadius(chipHeight);
-    final double horizontalPadding = SharedImagePipeline.calculateHorizontalPadding(size.width);
+    final double chipHeight = SharedImagePipeline.calculateChipHeight(
+      size.width,
+    );
+    final double chipPadding = SharedImagePipeline.calculateChipPadding(
+      size.width,
+    );
+    final double chipSpacing = SharedImagePipeline.calculateChipSpacing(
+      size.width,
+    );
+    final double chipCornerRadius =
+        SharedImagePipeline.calculateChipCornerRadius(chipHeight);
+    final double horizontalPadding =
+        SharedImagePipeline.calculateHorizontalPadding(size.width);
 
     // 반려동물 정보
     final ui.Image? petIconImage = selectedPet.type == 'dog'
         ? dogIconImage
         : catIconImage;
 
-    // 나이, 젠더, 종 정보
+    // 나이, 종 정보 (간결 표기)
     final age = selectedPet.getAge();
-    String genderText = '';
-    if (selectedPet.gender != null && selectedPet.gender!.isNotEmpty) {
-      final gender = selectedPet.gender!.toLowerCase();
-      if (gender == 'male' || gender == 'm') {
-        genderText = '♂';
-      } else if (gender == 'female' || gender == 'f') {
-        genderText = '♀';
-      } else {
-        genderText = selectedPet.gender!;
-      }
-    }
     String breedText =
         selectedPet.breed != null && selectedPet.breed!.isNotEmpty
         ? selectedPet.breed!.trim()
@@ -80,12 +77,19 @@ class FramePreviewPainter extends CustomPainter {
     // 칩 너비 계산 헬퍼 함수 (그리지 않고 너비만 계산)
     // 🔥 공통 파이프라인 모듈 사용
     double calculateChipWidth(String text, {ui.Image? iconImage}) {
-      final double chipPaddingHorizontal = SharedImagePipeline.calculateChipPaddingHorizontal(chipHeight);
-      final double iconSize = iconImage != null ? SharedImagePipeline.calculateIconSize(chipHeight) : 0;
-      final double iconSpacing = iconImage != null ? SharedImagePipeline.calculateIconSpacing(chipHeight) : 0;
+      final double chipPaddingHorizontal =
+          SharedImagePipeline.calculateChipPaddingHorizontal(chipHeight);
+      final double iconSize = iconImage != null
+          ? SharedImagePipeline.calculateIconSize(chipHeight)
+          : 0;
+      final double iconSpacing = iconImage != null
+          ? SharedImagePipeline.calculateIconSpacing(chipHeight)
+          : 0;
 
       // 최대 칩 너비 설정 (화면 너비의 70%로 제한)
-      final double maxChipWidth = SharedImagePipeline.calculateMaxChipWidth(size.width);
+      final double maxChipWidth = SharedImagePipeline.calculateMaxChipWidth(
+        size.width,
+      );
       final double maxTextWidth =
           maxChipWidth - chipPaddingHorizontal * 2 - iconSize - iconSpacing;
 
@@ -99,11 +103,11 @@ class FramePreviewPainter extends CustomPainter {
         final chipTextStyle = ui.ParagraphStyle(
           textAlign: TextAlign.left,
           fontSize: fontSize,
-          fontWeight: ui.FontWeight.w600,
+          fontWeight: ui.FontWeight.w500,
         );
         final chipTextStyleValue = ui.TextStyle(
-          color: const ui.Color.fromARGB(255, 255, 255, 255),
-          fontWeight: ui.FontWeight.w600,
+          color: const ui.Color.fromARGB(242, 255, 255, 255),
+          fontWeight: ui.FontWeight.w500,
         );
 
         final chipTextBuilder = ui.ParagraphBuilder(chipTextStyle)
@@ -130,13 +134,26 @@ class FramePreviewPainter extends CustomPainter {
     }
 
     // 🔥 공통 파이프라인 모듈 사용
-    double drawChip(String text, double x, double y, {ui.Image? iconImage}) {
-      final double chipPaddingHorizontal = SharedImagePipeline.calculateChipPaddingHorizontal(chipHeight);
-      final double iconSize = iconImage != null ? SharedImagePipeline.calculateIconSize(chipHeight) : 0;
-      final double iconSpacing = iconImage != null ? SharedImagePipeline.calculateIconSpacing(chipHeight) : 0;
+    double drawChip(
+      String text,
+      double x,
+      double y, {
+      ui.Image? iconImage,
+      bool isMeta = false,
+    }) {
+      final double chipPaddingHorizontal =
+          SharedImagePipeline.calculateChipPaddingHorizontal(chipHeight);
+      final double iconSize = iconImage != null
+          ? SharedImagePipeline.calculateIconSize(chipHeight)
+          : 0;
+      final double iconSpacing = iconImage != null
+          ? SharedImagePipeline.calculateIconSpacing(chipHeight)
+          : 0;
 
       // 최대 칩 너비 설정 (화면 너비의 70%로 제한)
-      final double maxChipWidth = SharedImagePipeline.calculateMaxChipWidth(size.width);
+      final double maxChipWidth = SharedImagePipeline.calculateMaxChipWidth(
+        size.width,
+      );
       final double maxTextWidth =
           maxChipWidth - chipPaddingHorizontal * 2 - iconSize - iconSpacing;
 
@@ -150,11 +167,11 @@ class FramePreviewPainter extends CustomPainter {
         final chipTextStyle = ui.ParagraphStyle(
           textAlign: TextAlign.left,
           fontSize: fontSize,
-          fontWeight: ui.FontWeight.w600,
+          fontWeight: ui.FontWeight.w500,
         );
         final chipTextStyleValue = ui.TextStyle(
-          color: const ui.Color.fromARGB(255, 255, 255, 255),
-          fontWeight: ui.FontWeight.w600,
+          color: const ui.Color.fromARGB(242, 255, 255, 255),
+          fontWeight: ui.FontWeight.w500,
         );
 
         final chipTextBuilder = ui.ParagraphBuilder(chipTextStyle)
@@ -178,35 +195,38 @@ class FramePreviewPainter extends CustomPainter {
       final double chipWidth =
           chipTextWidth + chipPaddingHorizontal * 2 + iconSize + iconSpacing;
 
-      // 글래스모피즘 효과: 반투명 배경 + 흰색 테두리 + 그림자
+      // 칩 배경 (톤 다운한 소프트 스타일)
       final chipRect = RRect.fromRectAndRadius(
         Rect.fromLTWH(x, y, chipWidth, chipHeight),
         Radius.circular(chipCornerRadius),
       );
 
-      // 그림자 효과 (투명도 조절)
+      // 얇은 그림자
       final shadowPaint = Paint()
-        ..color = Colors.black.withValues(alpha: 0.25)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
+        ..color = Colors.black.withValues(alpha: 0.16)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2);
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-          Rect.fromLTWH(x, y + 1.5, chipWidth, chipHeight),
+          Rect.fromLTWH(x, y + 1.0, chipWidth, chipHeight),
           Radius.circular(chipCornerRadius),
         ),
         shadowPaint,
       );
 
-      // 글래스 배경 (반투명 흰색)
-      final chipBgPaint = Paint()
-        ..color = Colors.white.withValues(alpha: 0.25)
-        ..style = PaintingStyle.fill;
+      // 배경
+      final chipBgPaint = Paint()..style = PaintingStyle.fill;
+      if (isMeta) {
+        chipBgPaint.color = Colors.black.withValues(alpha: 0.26);
+      } else {
+        chipBgPaint.color = Colors.black.withValues(alpha: 0.32);
+      }
       canvas.drawRRect(chipRect, chipBgPaint);
 
-      // 흰색 테두리
+      // 테두리
       final borderPaint = Paint()
-        ..color = Colors.white.withValues(alpha: 0.4)
+        ..color = Colors.white.withValues(alpha: isMeta ? 0.18 : 0.22)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5;
+        ..strokeWidth = 1.0;
       canvas.drawRRect(chipRect, borderPaint);
 
       // 아이콘 그리기
@@ -241,8 +261,17 @@ class FramePreviewPainter extends CustomPainter {
     }
 
     // 상단 칩들
-    double currentTopChipX = horizontalPadding;
-    final double topChipY = chipPadding;
+    final double previewRatio = size.height > 0
+        ? (size.width / size.height)
+        : (9 / 16);
+    final bool isSquareRatio = previewRatio >= 0.95;
+    final bool isTallRatio = previewRatio <= 0.62;
+    final double topInsetAdjust = isSquareRatio
+        ? chipPadding * 0.35
+        : (isTallRatio ? chipPadding * 0.12 : chipPadding * 0.2);
+    double currentTopChipX =
+        horizontalPadding + (isSquareRatio ? chipPadding * 0.2 : 0);
+    final double topChipY = chipPadding + topInsetAdjust;
 
     final truncatedName = truncateText(selectedPet.name, 12);
     final nameChipWidth = drawChip(
@@ -253,12 +282,9 @@ class FramePreviewPainter extends CustomPainter {
     );
     currentTopChipX += nameChipWidth + chipSpacing;
 
-    // 나이, 젠더, 종을 한 칩에 묶어서 표시
+    // 정보 칩 (나이, 종)
     List<String> infoParts = [];
     infoParts.add('$age살');
-    if (genderText.isNotEmpty) {
-      infoParts.add(genderText);
-    }
     if (breedText.isNotEmpty) {
       infoParts.add(breedText);
     }
@@ -270,11 +296,12 @@ class FramePreviewPainter extends CustomPainter {
 
     // 🔥 공통 파이프라인 모듈 사용: 하단 칩 위치 계산 (프리뷰용)
     // 하단 저작권 정보를 칩 형태로 표시 (촬영날짜, 위치정보)
-    final double? finalBottomInfoY = SharedImagePipeline.calculateBottomChipYForPreview(
-      size.height,
-      chipHeight,
-      chipPadding,
-    );
+    final double? finalBottomInfoY =
+        SharedImagePipeline.calculateBottomChipYForPreview(
+          size.height,
+          chipHeight,
+          chipPadding,
+        );
 
     // 하단 칩 위치가 유효하지 않으면 그리지 않음
     if (finalBottomInfoY == null) {
@@ -291,36 +318,22 @@ class FramePreviewPainter extends CustomPainter {
     }
 
     final now = DateTime.now();
-    final monthNames = [
-      '',
-      'January',
-      'February',
-      'March',
-      'April',
-      'May',
-      'June',
-      'July',
-      'August',
-      'September',
-      'October',
-      'November',
-      'December',
-    ];
-    final dateStr = '📅 ${monthNames[now.month]} ${now.day}, ${now.year}';
+    final dateStr =
+        '${now.year.toString().padLeft(4, '0')}.${now.month.toString().padLeft(2, '0')}.${now.day.toString().padLeft(2, '0')}';
 
     // 오른쪽 정렬로 칩 그리기 (칩의 오른쪽 끝이 화면 오른쪽에 맞춰짐)
-    final double rightMargin = horizontalPadding * 2.0; // 오른쪽 패딩
+    final double rightMargin = horizontalPadding * (isSquareRatio ? 2.5 : 2.0);
     final double bottomChipSpacing = chipPadding * 0.5; // 칩 간격
 
     // 1열: 촬영날짜 (아래쪽) - 칩 형태, 오른쪽 정렬
     // 너비만 계산 (그리지 않음)
     final dateChipWidth = calculateChipWidth(dateStr);
     final double dateChipX = size.width - rightMargin - dateChipWidth; // 오른쪽 정렬
-    drawChip(dateStr, dateChipX, finalBottomInfoY);
+    drawChip(dateStr, dateChipX, finalBottomInfoY, isMeta: true);
 
     // 2열: 촬영장소 (위쪽, 위치 정보가 있을 때만) - 칩 형태, 오른쪽 정렬
     if (location != null && location!.isNotEmpty) {
-      final locationText = '📍 Shot on location in $location';
+      final locationText = location!;
       // 너비만 계산 (그리지 않음)
       final locationChipWidth = calculateChipWidth(locationText);
       final double locationChipX =
@@ -329,6 +342,7 @@ class FramePreviewPainter extends CustomPainter {
         locationText,
         locationChipX,
         finalBottomInfoY - chipHeight - bottomChipSpacing,
+        isMeta: true,
       );
     }
   }
@@ -361,4 +375,3 @@ class FramePreviewPainter extends CustomPainter {
         (oldPet?.framePattern != newPet?.framePattern);
   }
 }
-

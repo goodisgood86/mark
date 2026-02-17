@@ -1,4 +1,3 @@
-import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -39,7 +38,7 @@ abstract class NativeCameraService {
 
   /// 초광각(ultra wide) 렌즈로 전환 (가능한 경우)
   Future<void> switchToUltraWideIfAvailable();
-  
+
   /// 네이티브 카메라로 원본 사진 캡처 (HEIF/JPEG) 후 파일 경로 반환
   Future<String> captureNativePhoto();
 }
@@ -133,9 +132,7 @@ class NativeCameraServiceImpl implements NativeCameraService {
   @override
   Future<void> setZoom(double uiZoom) async {
     try {
-      await _channel.invokeMethod('setZoom', {
-        'uiZoom': uiZoom,
-      });
+      await _channel.invokeMethod('setZoom', {'uiZoom': uiZoom});
     } on PlatformException catch (e, s) {
       debugPrint('[Petgram] ❌ setZoom error: $e');
       debugPrint('[Petgram] ❌ stacktrace: $s');
@@ -145,9 +142,7 @@ class NativeCameraServiceImpl implements NativeCameraService {
   @override
   Future<void> setFlashMode(String mode) async {
     try {
-      await _channel.invokeMethod('setFlashMode', {
-        'mode': mode,
-      });
+      await _channel.invokeMethod('setFlashMode', {'mode': mode});
     } on PlatformException catch (e, s) {
       debugPrint('[Petgram] ❌ setFlashMode error: $e');
       debugPrint('[Petgram] ❌ stacktrace: $s');
@@ -173,7 +168,7 @@ class NativeCameraServiceImpl implements NativeCameraService {
       debugPrint('[Petgram] ❌ stacktrace: $s');
     }
   }
-  
+
   @override
   Future<String> captureNativePhoto() async {
     try {
@@ -190,5 +185,3 @@ class NativeCameraServiceImpl implements NativeCameraService {
     }
   }
 }
-
-

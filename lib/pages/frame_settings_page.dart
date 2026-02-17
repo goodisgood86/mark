@@ -4,12 +4,15 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_datetime_picker_plus/flutter_datetime_picker_plus.dart'
     as dtp;
+import 'package:geolocator/geolocator.dart';
+import 'package:flutter/foundation.dart';
 
 import '../models/constants.dart';
 import '../models/pet_info.dart';
 import '../models/petgram_nav_tab.dart';
 import '../widgets/petgram_bottom_nav_bar.dart';
 import 'diary_page.dart';
+import 'backup_page.dart';
 
 class FrameSettingsPage extends StatefulWidget {
   final List<PetInfo> petList;
@@ -44,6 +47,10 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
     _petList = List.from(widget.petList);
     _frameEnabled = widget.frameEnabled;
     _selectedPetId = widget.selectedPetId;
+
+    // 🔥🔥🔥 앱 시작 시 위치정보 권한 팝업 방지: initState에서는 위치정보 권한 체크하지 않음
+    // 위치정보 권한 체크는 사용자가 위치정보를 활성화하려고 할 때만 수행
+    // _checkAndDisableLocationIfPermissionDenied(); // 제거: 앱 시작 시 위치정보 권한 팝업 방지
   }
 
   Future<void> _savePetList() async {
@@ -67,6 +74,99 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
 
   void _addPet() {
     _showPetEditDialog(null);
+  }
+
+  void _showFrameInfoGuide() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (sheetContext) {
+        final maxHeight = MediaQuery.of(sheetContext).size.height * 0.58;
+        return SafeArea(
+          top: false,
+          child: SizedBox(
+            height: maxHeight,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFDDBCC8),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    '프레임 설정 안내',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF7E4C5F),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: _buildInfoHighlight(
+                        icon: Icons.photo_filter_outlined,
+                        text: '프레임 설정 및 활성화 시,\n관련 정보가 자동으로 [한줄 일기]에 추가 됩니다.',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: TextButton(
+                      onPressed: () => Navigator.of(sheetContext).pop(),
+                      child: const Text('확인'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildInfoHighlight({required IconData icon, required String text}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFEEF4),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFEFCAD8)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: const Color(0xFF9A5D74)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF7E4C5F),
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   void _editPet(PetInfo pet) {
@@ -132,6 +232,9 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) {
+          // 🔥🔥🔥 앱 시작 시 위치정보 권한 팝업 방지: 다이얼로그 내부에서도 초기 권한 체크 제거
+          // 사용자가 위치정보 스위치를 켤 때만 권한을 체크하고 요청하도록 변경
+          // 다이얼로그가 열릴 때 자동으로 위치정보 권한을 체크하지 않음
           return Dialog(
             backgroundColor: Colors.transparent,
             insetPadding: const EdgeInsets.symmetric(horizontal: 20),
@@ -473,10 +576,201 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
                               const SizedBox(width: 12),
                               Switch(
                                 value: locationEnabled,
-                                onChanged: (value) {
-                                  setDialogState(() {
-                                    locationEnabled = value;
-                                  });
+                                onChanged: (value) async {
+                                  if (!value) {
+                                    // 스위치를 끄는 경우: 바로 비활성화
+                                    setDialogState(() {
+                                      locationEnabled = false;
+                                    });
+                                    return;
+                                  }
+
+                                  // 🔥🔥🔥 스위치를 켜려는 경우: 권한 체크 및 요청
+                                  try {
+                                    // 위치 서비스 활성화 여부 확인
+                                    bool serviceEnabled =
+                                        await Geolocator.isLocationServiceEnabled();
+                                    if (!serviceEnabled) {
+                                      // 위치 서비스가 비활성화되어 있음
+                                      if (context.mounted) {
+                                        showDialog(
+                                          context: context,
+                                          builder: (context) => AlertDialog(
+                                            backgroundColor: Colors.white,
+                                            shape: RoundedRectangleBorder(
+                                              borderRadius:
+                                                  BorderRadius.circular(20),
+                                            ),
+                                            title: const Text(
+                                              '위치 서비스 비활성화',
+                                              style: TextStyle(
+                                                fontSize: 18,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                            content: const Text(
+                                              '위치 정보를 사용하려면 기기의 위치 서비스를 활성화해주세요.',
+                                              style: TextStyle(fontSize: 14),
+                                            ),
+                                            actions: [
+                                              TextButton(
+                                                onPressed: () =>
+                                                    Navigator.of(context).pop(),
+                                                child: const Text(
+                                                  '확인',
+                                                  style: TextStyle(
+                                                    color: kMainPink,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      }
+                                      // 스위치를 켤 수 없으므로 false 유지
+                                      return;
+                                    }
+
+                                    // 위치 권한 확인
+                                    LocationPermission permission =
+                                        await Geolocator.checkPermission();
+
+                                    // 🔥🔥🔥 deniedForever 상태 체크: 설정으로만 이동 가능
+                                    if (permission ==
+                                        LocationPermission.deniedForever) {
+                                      if (context.mounted) {
+                                        showDialog(
+                                          context: context,
+                                          builder: (context) => AlertDialog(
+                                            backgroundColor: Colors.white,
+                                            shape: RoundedRectangleBorder(
+                                              borderRadius:
+                                                  BorderRadius.circular(20),
+                                            ),
+                                            title: const Text(
+                                              '위치 권한 필요',
+                                              style: TextStyle(
+                                                fontSize: 18,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                            content: const Text(
+                                              '위치 정보를 사용하려면 위치 권한이 필요합니다. 설정에서 권한을 허용해주세요.',
+                                              style: TextStyle(fontSize: 14),
+                                            ),
+                                            actions: [
+                                              TextButton(
+                                                onPressed: () =>
+                                                    Navigator.of(context).pop(),
+                                                child: const Text(
+                                                  '취소',
+                                                  style: TextStyle(
+                                                    color: Colors.grey,
+                                                  ),
+                                                ),
+                                              ),
+                                              TextButton(
+                                                onPressed: () async {
+                                                  Navigator.of(context).pop();
+                                                  await Geolocator.openAppSettings();
+                                                },
+                                                child: const Text(
+                                                  '설정으로 이동',
+                                                  style: TextStyle(
+                                                    color: kMainPink,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      }
+                                      setDialogState(() {
+                                        locationEnabled = false;
+                                      });
+                                      return;
+                                    }
+
+                                    if (permission ==
+                                        LocationPermission.denied) {
+                                      // 🔥🔥🔥 denied 상태: requestPermission 시도 (시스템 팝업은 다시 안 뜸)
+                                      permission =
+                                          await Geolocator.requestPermission();
+                                    }
+
+                                    // 권한 상태 확인
+                                    bool hasPermission =
+                                        permission ==
+                                            LocationPermission.whileInUse ||
+                                        permission == LocationPermission.always;
+
+                                    if (!hasPermission) {
+                                      // 권한이 거부됨 (denied 상태)
+                                      if (context.mounted) {
+                                        showDialog(
+                                          context: context,
+                                          builder: (context) => AlertDialog(
+                                            backgroundColor: Colors.white,
+                                            shape: RoundedRectangleBorder(
+                                              borderRadius:
+                                                  BorderRadius.circular(20),
+                                            ),
+                                            title: const Text(
+                                              '위치 권한 필요',
+                                              style: TextStyle(
+                                                fontSize: 18,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                            content: const Text(
+                                              '위치 정보를 사용하려면 위치 권한이 필요합니다. 설정에서 권한을 허용해주세요.',
+                                              style: TextStyle(fontSize: 14),
+                                            ),
+                                            actions: [
+                                              TextButton(
+                                                onPressed: () =>
+                                                    Navigator.of(context).pop(),
+                                                child: const Text(
+                                                  '취소',
+                                                  style: TextStyle(
+                                                    color: Colors.grey,
+                                                  ),
+                                                ),
+                                              ),
+                                              TextButton(
+                                                onPressed: () async {
+                                                  Navigator.of(context).pop();
+                                                  await Geolocator.openAppSettings();
+                                                },
+                                                child: const Text(
+                                                  '설정으로 이동',
+                                                  style: TextStyle(
+                                                    color: kMainPink,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      }
+                                      // 스위치를 켤 수 없으므로 false 유지
+                                      setDialogState(() {
+                                        locationEnabled = false;
+                                      });
+                                    } else {
+                                      // 권한이 허용됨
+                                      setDialogState(() {
+                                        locationEnabled = true;
+                                      });
+                                    }
+                                  } catch (e) {
+                                    if (kDebugMode) {
+                                      debugPrint('[Petgram] 위치 권한 요청 오류: $e');
+                                    }
+                                    setDialogState(() {
+                                      locationEnabled = false;
+                                    });
+                                  }
                                 },
                                 activeThumbColor: kMainPink,
                               ),
@@ -557,6 +851,39 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
                                 );
                                 return;
                               }
+
+                              // 🔥🔥🔥 위치정보 권한 최종 체크: locationEnabled가 true이면 최종 권한 확인만 수행
+                              // (스위치를 켤 때 이미 권한 요청을 했으므로, 여기서는 확인만)
+                              bool finalLocationEnabled = locationEnabled;
+                              if (locationEnabled) {
+                                try {
+                                  // 위치 서비스 활성화 여부 확인
+                                  bool serviceEnabled =
+                                      await Geolocator.isLocationServiceEnabled();
+                                  if (!serviceEnabled) {
+                                    finalLocationEnabled = false;
+                                  } else {
+                                    // 위치 권한 최종 확인 (요청하지 않고 확인만)
+                                    LocationPermission permission =
+                                        await Geolocator.checkPermission();
+                                    bool hasPermission =
+                                        permission ==
+                                            LocationPermission.whileInUse ||
+                                        permission == LocationPermission.always;
+
+                                    if (!hasPermission) {
+                                      // 권한이 없으면 비활성화
+                                      finalLocationEnabled = false;
+                                    }
+                                  }
+                                } catch (e) {
+                                  if (kDebugMode) {
+                                    debugPrint('[Petgram] 위치 권한 최종 체크 오류: $e');
+                                  }
+                                  finalLocationEnabled = false;
+                                }
+                              }
+
                               if (pet == null) {
                                 // 추가
                                 final newPet = PetInfo(
@@ -568,13 +895,11 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
                                   framePattern: framePattern,
                                   gender: selectedGender!,
                                   breed: breed,
-                                  locationEnabled: locationEnabled,
+                                  locationEnabled: finalLocationEnabled,
                                 );
                                 setState(() {
                                   _petList.add(newPet);
-                                  if (_selectedPetId == null) {
-                                    _selectedPetId = newPet.id;
-                                  }
+                                  _selectedPetId ??= newPet.id;
                                 });
                               } else {
                                 // 수정
@@ -591,16 +916,15 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
                                       framePattern: framePattern,
                                       gender: selectedGender!,
                                       breed: breed,
-                                      locationEnabled: locationEnabled,
+                                      locationEnabled: finalLocationEnabled,
                                     );
                                   });
                                 }
                               }
                               await _savePetList();
-                              if (mounted) {
-                                Navigator.of(context).pop();
-                                setState(() {});
-                              }
+                              if (!mounted || !context.mounted) return;
+                              Navigator.of(context).pop();
+                              setState(() {});
                             },
                             style: ElevatedButton.styleFrom(
                               backgroundColor: kMainPink,
@@ -637,9 +961,26 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
     return Scaffold(
       backgroundColor: const Color(0xFFFFF5F8),
       appBar: AppBar(
-        title: const Text('프레임 설정'),
         backgroundColor: const Color(0xFFFFF5F8),
         elevation: 0,
+        centerTitle: false,
+        titleSpacing: 0,
+        title: const Text(
+          '프레임 설정',
+          style: TextStyle(
+            color: Color(0xFF7E4C5F),
+            fontWeight: FontWeight.w800,
+            fontSize: 19,
+            letterSpacing: -0.1,
+          ),
+        ),
+        actions: [
+          IconButton(
+            tooltip: '프레임 설정 안내',
+            onPressed: _showFrameInfoGuide,
+            icon: const Icon(Icons.info_outline_rounded, color: Colors.black87),
+          ),
+        ],
       ),
       body: SafeArea(
         top: true,
@@ -691,47 +1032,33 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
                 ),
                 children: [
                   // 프레임 활성화 (간소화)
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(
-                            _frameEnabled
-                                ? Icons.photo_filter
-                                : Icons.photo_filter_outlined,
-                            color: _frameEnabled ? kMainPink : Colors.grey[400],
-                            size: 22,
-                          ),
-                          const SizedBox(width: 12),
-                          Text(
-                            '프레임 활성화',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w600,
-                              color: _frameEnabled
-                                  ? Colors.black87
-                                  : Colors.grey[600],
-                            ),
-                          ),
-                        ],
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text(
+                      '프레임 활성화',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
                       ),
-                      Switch(
-                        value: _frameEnabled,
-                        onChanged: _petList.isEmpty
-                            ? null
-                            : (value) {
-                                setState(() {
-                                  _frameEnabled = value;
-                                });
-                                widget.onFrameEnabledChanged(value);
-                              },
-                        activeThumbColor: kMainPink,
-                      ),
-                    ],
+                    ),
+                    subtitle: const Text(
+                      '프레임 정보가 한줄 일기에 자동 반영 됩니다.',
+                      style: TextStyle(fontSize: 11.5, color: Colors.black54),
+                    ),
+                    isThreeLine: false,
+                    value: _frameEnabled,
+                    onChanged: _petList.isEmpty
+                        ? null
+                        : (value) {
+                            setState(() {
+                              _frameEnabled = value;
+                            });
+                            widget.onFrameEnabledChanged(value);
+                          },
+                    activeThumbColor: kMainPink,
+                    activeTrackColor: kMainPink.withValues(alpha: 0.35),
                   ),
                   const SizedBox(height: 20),
-                  // 안내 문구 (간소화)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 12),
                     child: Text(
@@ -880,7 +1207,7 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
                         ),
                       ),
                     );
-                  }).toList(),
+                  }),
                   const SizedBox(height: 20),
                   // 반려동물 추가 버튼
                   OutlinedButton.icon(
@@ -921,6 +1248,12 @@ class _FrameSettingsPageState extends State<FrameSettingsPage> {
               Navigator.push(
                 context,
                 MaterialPageRoute(builder: (_) => const DiaryPage()),
+              );
+            },
+            onBackupTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const BackupPage()),
               );
             },
           ),

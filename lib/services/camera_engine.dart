@@ -84,7 +84,14 @@ class CameraEngine {
   IPetgramCamera? _nativeCamera;
   bool _isInitializing = false;
   bool _isInitializingNative = false; // 🔥 네이티브 초기화 중 플래그 (중복 호출 방지)
+  Future<void>? _initializeIfNeededInFlight; // 🔥 initializeIfNeeded 단일비행
+  int? _initializeIfNeededViewId;
+  String? _initializeIfNeededCameraPosition;
+  double? _initializeIfNeededAspectRatio;
+  DateTime? _lastInitializeIfNeededRequestedAt;
   bool _isResuming = false; // 🔥 resume 중 플래그 (중복 호출 방지)
+  Future<void>? _resumeInFlight; // 🔥 resume 중복 호출 coalescing
+  DateTime? _lastResumeRequestedAt; // 🔥 resume 호출 간격 제한
   bool _useMockCamera = false;
   bool _isSimulator = false; // 🔥 시뮬레이터 여부 캐시
   String? _initErrorMessage;
@@ -278,34 +285,35 @@ class CameraEngine {
   }
 
   /// viewId를 저장하고 NativeCameraController를 생성 (attachNativeView)
-  /// NativeCameraPreview.onCreated에서만 호출됨
-  void attachNativeView(int viewId) async {
+  /// NativeCameraPreview.onCreated에서만 호출됨. onCreated에서 await 후 _doCameraInit 호출.
+  /// isSimulator는 비블로킹(백그라운드) — await 시 네이티브에서 지연/블록되면 _doCameraInit가 호출되지 않는 문제 방지.
+  Future<void> attachNativeView(int viewId) async {
     _viewId = viewId;
 
-    if (_nativeCamera == null) {
-      _nativeCamera = NativeCameraController();
-    }
+    _nativeCamera ??= NativeCameraController();
 
     if (_nativeCamera is NativeCameraController) {
       (_nativeCamera as NativeCameraController).setViewId(viewId);
 
-      // 🔥 시뮬레이터 여부 즉시 확인
-      try {
-        _isSimulator = await (_nativeCamera as NativeCameraController)
-            .isSimulator();
-        if (kDebugMode) {
-          debugPrint('[CameraEngine] 📱 Simulator check: $_isSimulator');
-        }
-
-        // iOS 시뮬레이터이면 즉시 Mock 모드 준비
-        if (Platform.isIOS && _isSimulator) {
-          _useMockCamera = true;
-          useMockCameraNotifier.value = true;
-          _notifyListeners();
-        }
-      } catch (e) {
-        debugPrint('[CameraEngine] ⚠️ Failed to check simulator state: $e');
-      }
+      // 시뮬레이터 체크: 블로킹하지 않고 백그라운드에서 실행 (await 시 네이티브 지연/블록으로 _doCameraInit 미호출 방지)
+      (_nativeCamera as NativeCameraController)
+          .isSimulator()
+          .then((v) {
+            _isSimulator = v;
+            if (kDebugMode) {
+              debugPrint('[CameraEngine] 📱 Simulator check: $_isSimulator');
+            }
+            if (Platform.isIOS && _isSimulator) {
+              _useMockCamera = true;
+              useMockCameraNotifier.value = true;
+              _notifyListeners();
+            }
+          })
+          .catchError((e) {
+            if (kDebugMode) {
+              debugPrint('[CameraEngine] ⚠️ Simulator check failed: $e');
+            }
+          });
     }
 
     _startCameraStateListener();
@@ -347,7 +355,7 @@ class CameraEngine {
     final isPinkFallback = _toBool(stateMap['isPinkFallback']);
     final nativeInit = _toBool(stateMap['nativeInit']);
     final String stateStr = stateMap['state'] as String? ?? 'idle';
-    
+
     // 🔥 카메라 초기화 완료 감지: sessionRunning && videoConnected && hasFirstFrame이면 초기화 완료
     final bool cameraReady = sessionRunning && videoConnected && hasFirstFrame;
     if (cameraReady && _isInitializing) {
@@ -403,6 +411,63 @@ class CameraEngine {
     required String cameraPosition,
     double? aspectRatio,
   }) async {
+    final now = DateTime.now();
+    final inFlight = _initializeIfNeededInFlight;
+    final hasInFlight = inFlight != null;
+    final isSameAsInFlight =
+        hasInFlight &&
+        _initializeIfNeededViewId == viewId &&
+        _initializeIfNeededCameraPosition == cameraPosition &&
+        _isAspectRatioClose(_initializeIfNeededAspectRatio, aspectRatio);
+
+    // 🔥 단일비행: 같은 인자면 기존 in-flight 요청에 합류
+    if (isSameAsInFlight) {
+      _emitDebugLog(
+        '[CameraEngine] ⏸️ requestInitializeIfNeeded coalesced: same args in-flight (viewId=$viewId, position=$cameraPosition, aspectRatio=$aspectRatio)',
+      );
+      await inFlight;
+      return;
+    }
+
+    // 🔥 짧은 디바운스: 직전 요청 직후 같은 키로 다시 들어오면 스킵
+    final lastRequestedAt = _lastInitializeIfNeededRequestedAt;
+    if (lastRequestedAt != null &&
+        now.difference(lastRequestedAt) < const Duration(milliseconds: 120) &&
+        _initializeIfNeededViewId == viewId &&
+        _initializeIfNeededCameraPosition == cameraPosition &&
+        _isAspectRatioClose(_initializeIfNeededAspectRatio, aspectRatio)) {
+      _emitDebugLog(
+        '[CameraEngine] ⏸️ requestInitializeIfNeeded debounced: duplicate within 120ms (viewId=$viewId)',
+      );
+      return;
+    }
+
+    _initializeIfNeededViewId = viewId;
+    _initializeIfNeededCameraPosition = cameraPosition;
+    _initializeIfNeededAspectRatio = aspectRatio;
+    _lastInitializeIfNeededRequestedAt = now;
+
+    final operation = _requestInitializeIfNeededInternal(
+      viewId: viewId,
+      cameraPosition: cameraPosition,
+      aspectRatio: aspectRatio,
+    );
+    _initializeIfNeededInFlight = operation;
+
+    try {
+      await operation;
+    } finally {
+      if (identical(_initializeIfNeededInFlight, operation)) {
+        _initializeIfNeededInFlight = null;
+      }
+    }
+  }
+
+  Future<void> _requestInitializeIfNeededInternal({
+    required int viewId,
+    required String cameraPosition,
+    double? aspectRatio,
+  }) async {
     _emitDebugLog(
       '[CameraEngine] 📷 requestInitializeIfNeeded: viewId=$viewId, position=$cameraPosition, aspectRatio=$aspectRatio',
     );
@@ -425,12 +490,40 @@ class CameraEngine {
           '[CameraEngine] ✅ requestInitializeIfNeeded: command sent to native FSM',
         );
       } on PlatformException catch (e, _) {
+        if (e.code == 'INIT_CALL_TIMEOUT') {
+          _emitDebugLog(
+            '[CameraEngine] ⚠️ initializeIfNeeded timeout -> recoverIfNeeded + retry 1회',
+          );
+          try {
+            await controller.recoverIfNeeded();
+          } catch (_) {}
+          await Future<void>.delayed(const Duration(milliseconds: 150));
+          await controller.requestInitializeIfNeeded(
+            viewId: viewId,
+            cameraPosition: cameraPosition,
+            aspectRatio: aspectRatio,
+          );
+          _emitDebugLog(
+            '[CameraEngine] ✅ timeout retry succeeded: initializeIfNeeded',
+          );
+          return;
+        }
         _emitDebugLog(
           '[CameraEngine] ❌ requestInitializeIfNeeded failed: code=${e.code}, message=${e.message}',
         );
         rethrow;
       }
     }
+  }
+
+  static bool _isAspectRatioClose(double? a, double? b) {
+    if (a == null && b == null) {
+      return true;
+    }
+    if (a == null || b == null) {
+      return false;
+    }
+    return (a - b).abs() < 0.0001;
   }
 
   Future<void> initializeSingle({
@@ -524,7 +617,7 @@ class CameraEngine {
 
     // 🔥 기존 initializeNativeCamera 로직 호출
     try {
-      final bool retrySucceeded = await _performInitializeNativeCamera(
+      await _performInitializeNativeCamera(
         viewId: viewId,
         cameraPosition: cameraPosition,
         aspectRatio: aspectRatio,
@@ -542,7 +635,7 @@ class CameraEngine {
       // 세션이 시작되면 즉시 초기화 완료로 간주하고, 첫 프레임은 백그라운드에서 수신
       // UI는 먼저 표시하고 프리뷰는 준비되면 자동으로 표시됨
       // initialize() 호출은 블로킹될 수 있으므로 제거
-      
+
       // 🔥 성능 최적화: 세션 상태 확인 (짧은 대기)
       // 네이티브 초기화가 완료되었으므로 세션이 곧 시작될 것임
       // 최대 500ms 대기 후 세션 상태 확인
@@ -555,7 +648,7 @@ class CameraEngine {
           break;
         }
       }
-      
+
       if (sessionRunning) {
         // 세션이 실행 중이면 초기화 완료로 간주 (첫 프레임은 나중에 수신)
         _emitDebugLog(
@@ -1199,15 +1292,16 @@ class CameraEngine {
   Future<double?> setZoom(double zoom) async {
     if (_nativeCamera == null) return null;
     if (_nativeCamera is! NativeCameraController) return null;
-    
+
     // 🔥 UI에서 전달된 zoom(0.5~10.0)을 네이티브에 그대로 전달
     // 네이티브에서 디바이스별 min/maxZoomFactor를 확인하여 최종 clamp 수행
     // Flutter 레벨에서는 최소한의 범위 체크만 수행
     final clamped = zoom.clamp(0.5, 10.0);
-    
+
     // 🔥🔥🔥 setZoomAndGetActual 사용: 한 번의 호출로 setZoom + actualZoom 반환 (중복 호출 방지)
-    final actualZoom = await (_nativeCamera as NativeCameraController).setZoomAndGetActual(clamped);
-    
+    final actualZoom = await (_nativeCamera as NativeCameraController)
+        .setZoomAndGetActual(clamped);
+
     if (kDebugMode) {
       if (actualZoom != null && (actualZoom - clamped).abs() > 0.01) {
         debugPrint(
@@ -1219,8 +1313,17 @@ class CameraEngine {
         );
       }
     }
-    
+
     return actualZoom;
+  }
+
+  /// 핀치 제스처용 빠른 줌 적용 (actualZoom 동기화 없이 즉시 반영)
+  Future<void> setZoomFast(double zoom) async {
+    if (_nativeCamera == null) return;
+    if (_nativeCamera is! NativeCameraController) return;
+
+    final clamped = zoom.clamp(0.5, 10.0);
+    await (_nativeCamera as NativeCameraController).setZoom(clamped);
   }
 
   /// 포커스 포인트 설정
@@ -1228,6 +1331,14 @@ class CameraEngine {
     if (_nativeCamera == null) return;
     if (_nativeCamera is! NativeCameraController) return;
     await (_nativeCamera as NativeCameraController).setFocusPoint(normalized);
+  }
+
+  Future<void> setContinuousAutoFocus(bool enabled) async {
+    if (_nativeCamera == null) return;
+    if (_nativeCamera is! NativeCameraController) return;
+    await (_nativeCamera as NativeCameraController).setContinuousAutoFocus(
+      enabled,
+    );
   }
 
   /// 노출 포인트 설정
@@ -1322,10 +1433,15 @@ class CameraEngine {
     if (_isCapturingPhoto) {
       throw StateError('Photo capture already in progress');
     }
+    _isCapturingPhoto = true;
+    _emitDebugLog('[Photo] isCapturingPhoto=true START');
+    _emitDebugLog(
+      '[CameraEngine] 🔒 isCapturingPhoto = true (takePicture started)',
+    );
 
-    // 🔒 촬영 보호 펜스 시작: 촬영 직후 재초기화/재개 차단
+    // 🔒 촬영 보호 펜스 시작: 짧은 구간만 보호 (복귀 지연 최소화)
     final captureStart = DateTime.now();
-    _captureFenceUntil = captureStart.add(const Duration(seconds: 4));
+    _captureFenceUntil = captureStart.add(const Duration(milliseconds: 1200));
     _emitDebugLog('[Photo] 🚧 capture fence set until $_captureFenceUntil');
 
     // 🔥 Mock 카메라 모드: getDebugState() 호출 전에 확인하여 null 오류 방지
@@ -1358,11 +1474,42 @@ class CameraEngine {
           sessionRunning && videoConnected && hasFirstFrame;
 
       if (!isSessionHealthy && !isPinkFallback) {
-        // 세션이 정상이 아니고 핑크 fallback도 아니면 에러
-        final error =
-            'Camera session not ready for capture: sessionRunning=$sessionRunning, videoConnected=$videoConnected, hasFirstFrame=$hasFirstFrame, isPinkFallback=$isPinkFallback';
-        _emitDebugLog('[CameraEngine] ❌ $error');
-        throw StateError(error);
+        // 세션이 일시적으로 false로 떨어지는 구간(네이티브 auto-restart 직후)을 흡수
+        if (!sessionRunning && videoConnected && hasFirstFrame) {
+          _emitDebugLog(
+            '[CameraEngine] ⏳ Transient session drop detected before capture; attempting short recovery...',
+          );
+          try {
+            await resume();
+          } catch (_) {
+            // resume 실패는 아래 재확인으로 최종 판단
+          }
+          await Future.delayed(const Duration(milliseconds: 350));
+          final retryState = await getDebugState();
+          final retrySessionRunning =
+              retryState?['sessionRunning'] as bool? ?? false;
+          final retryVideoConnected =
+              retryState?['videoConnected'] as bool? ?? false;
+          final retryHasFirstFrame =
+              retryState?['hasFirstFrame'] as bool? ?? false;
+          final recovered =
+              retrySessionRunning && retryVideoConnected && retryHasFirstFrame;
+          if (!recovered) {
+            final error =
+                'Camera session not ready for capture: sessionRunning=$retrySessionRunning, videoConnected=$retryVideoConnected, hasFirstFrame=$retryHasFirstFrame, isPinkFallback=${retryState?['isPinkFallback'] as bool? ?? false}';
+            _emitDebugLog('[CameraEngine] ❌ $error');
+            throw StateError(error);
+          }
+          _emitDebugLog(
+            '[CameraEngine] ✅ Session recovered after transient drop; proceeding with capture',
+          );
+        } else {
+          // 세션이 정상이 아니고 핑크 fallback도 아니면 에러
+          final error =
+              'Camera session not ready for capture: sessionRunning=$sessionRunning, videoConnected=$videoConnected, hasFirstFrame=$hasFirstFrame, isPinkFallback=$isPinkFallback';
+          _emitDebugLog('[CameraEngine] ❌ $error');
+          throw StateError(error);
+        }
       }
 
       // 🔥 핑크 fallback이지만 세션이 정상이면 촬영 허용 (네이티브에서 동일 로직)
@@ -1373,13 +1520,6 @@ class CameraEngine {
         throw StateError(error);
       }
     }
-
-    // 🔥 촬영 시작 플래그 설정
-    _isCapturingPhoto = true;
-    _emitDebugLog('[Photo] isCapturingPhoto=true START');
-    _emitDebugLog(
-      '[CameraEngine] 🔒 isCapturingPhoto = true (takePicture started)',
-    );
 
     // 🔥 크래시 디버깅: takePicture 진입 로그
     final engineDebugInfo = StringBuffer()
@@ -1450,13 +1590,17 @@ class CameraEngine {
     } finally {
       // 🔥 핵심 수정: finally 블록에서 항상 플래그 리셋 (예외 발생 시에도 보장)
       _isCapturingPhoto = false;
+      // 촬영 종료 시점에는 펜스를 즉시 해제해 페이지 복귀 resume 지연을 방지
+      _captureFenceUntil = null;
       _emitDebugLog('[Photo] isCapturingPhoto=false END');
       _emitDebugLog(
         '[CameraEngine] 🔓 isCapturingPhoto = false (takePicture completed/failed)',
       );
       // 🔥🔥🔥 연속 촬영 문제 디버깅: debugPrint로 항상 출력하여 리셋 확인
       if (kDebugMode) {
-        debugPrint('[CameraEngine] 🔓🔓🔓 isCapturingPhoto RESET to false in finally block');
+        debugPrint(
+          '[CameraEngine] 🔓🔓🔓 isCapturingPhoto RESET to false in finally block',
+        );
       }
     }
   }
@@ -1738,6 +1882,22 @@ class CameraEngine {
     if (_nativeCamera is! NativeCameraController) return;
     try {
       await (_nativeCamera as NativeCameraController).pauseSession();
+      // pause 직후에는 stale 상태(canUseCamera=true)가 남지 않도록 즉시 not-ready로 동기화
+      _sessionRunning = false;
+      _videoConnected = false;
+      _hasFirstFrame = false;
+      _isReady = false;
+      if (_lastDebugState != null) {
+        _lastDebugState = CameraDebugState(
+          viewId: _lastDebugState!.viewId,
+          sessionRunning: false,
+          videoConnected: false,
+          hasFirstFrame: false,
+          isPinkFallback: _lastDebugState!.isPinkFallback,
+          instancePtr: _lastDebugState!.instancePtr,
+        );
+      }
+      _notifyListeners();
       if (kDebugMode) {
         debugPrint('[CameraEngine] ⏸️ Camera session paused');
       }
@@ -1751,25 +1911,51 @@ class CameraEngine {
   /// 🔥 성능 최적화: 카메라 세션 재개
   /// 홈 화면으로 돌아올 때 또는 앱이 포그라운드로 올 때 호출
   Future<void> resume() async {
+    // 중복 resume 호출은 같은 Future를 공유
+    if (_resumeInFlight != null) {
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] ⏸️ Resume already in flight, joining...');
+      }
+      await _resumeInFlight;
+      return;
+    }
+
+    // 너무 짧은 간격의 resume 스파이크 방지
+    final now = DateTime.now();
+    if (_lastResumeRequestedAt != null &&
+        now.difference(_lastResumeRequestedAt!).inMilliseconds < 700) {
+      if (kDebugMode) {
+        debugPrint('[CameraEngine] ⏸️ Resume throttled (<700ms)');
+      }
+      return;
+    }
+    _lastResumeRequestedAt = now;
+
+    _resumeInFlight = _resumeInternal();
+    try {
+      await _resumeInFlight;
+    } finally {
+      _resumeInFlight = null;
+    }
+  }
+
+  Future<void> _resumeInternal() async {
     // 🔥 핵심 수정: 중복 호출 방지
     if (_isResuming) {
       if (kDebugMode) {
-        debugPrint('[CameraEngine] ⏸️ Resume already in progress, skipping duplicate call');
+        debugPrint(
+          '[CameraEngine] ⏸️ Resume already in progress, skipping duplicate call',
+        );
       }
       return;
     }
 
-    // 🔥 촬영 중이거나 촬영 직후 펜스가 활성이면 지연 실행
-    if (_isCapturingPhoto ||
-        (_captureFenceUntil != null &&
-            DateTime.now().isBefore(_captureFenceUntil!))) {
-      // 촬영 완료 및 펜스 해제까지 대기 (최대 5초)
+    // 촬영 중에는 resume를 지연한다. (촬영 후에는 즉시 복귀 가능해야 하므로 fence 대기는 하지 않음)
+    if (_isCapturingPhoto) {
+      // 촬영 완료까지 대기 (최대 2초)
       int retryCount = 0;
-      const maxRetries = 50; // 50 * 100ms = 5초
-      while ((_isCapturingPhoto ||
-              (_captureFenceUntil != null &&
-                  DateTime.now().isBefore(_captureFenceUntil!))) &&
-          retryCount < maxRetries) {
+      const maxRetries = 20; // 20 * 100ms = 2초
+      while (_isCapturingPhoto && retryCount < maxRetries) {
         await Future.delayed(const Duration(milliseconds: 100));
         retryCount++;
       }
@@ -1786,7 +1972,9 @@ class CameraEngine {
     }
     if (_nativeCamera is! NativeCameraController) {
       if (kDebugMode) {
-        debugPrint('[CameraEngine] ⚠️ Resume skipped: nativeCamera is not NativeCameraController');
+        debugPrint(
+          '[CameraEngine] ⚠️ Resume skipped: nativeCamera is not NativeCameraController',
+        );
       }
       return;
     }
@@ -1794,32 +1982,105 @@ class CameraEngine {
     // 🔥 플래그 설정 (try 블록 시작 전에 설정)
     _isResuming = true;
 
+    bool isRecoverableResumeError(Object error) {
+      final msg = error.toString().toLowerCase();
+      return msg.contains('resume_timeout') ||
+          msg.contains('resume_not_ready') ||
+          msg.contains('timeout');
+    }
+
     try {
       // 🔥🔥🔥 백그라운드 복귀 시 무조건 resumeSession 시도
       await (_nativeCamera as NativeCameraController).resumeSession();
-      
+
+      // 네이티브 resumeSession은 queue 작업을 비동기로 시작하고 즉시 반환할 수 있으므로,
+      // 실제 세션 복귀(sessionRunning/videoConnected)까지 대기한다.
+      bool sessionRecovered = await _waitForSessionRecovery(
+        const Duration(milliseconds: 1200),
+      );
+
+      // 1차 실패 시 resumeSession 1회 재시도
+      if (!sessionRecovered) {
+        if (kDebugMode) {
+          debugPrint(
+            '[CameraEngine] ⚠️ Resume not recovered in 1.2s, retrying resumeSession once...',
+          );
+        }
+        await (_nativeCamera as NativeCameraController).resumeSession();
+        sessionRecovered = await _waitForSessionRecovery(
+          const Duration(milliseconds: 1200),
+        );
+      }
+
+      if (!sessionRecovered) {
+        // 응답 타이밍 이슈가 있어도 실제 세션이 살아있으면 성공 처리한다.
+        final softRecovered = await _waitForSessionRecovery(
+          const Duration(milliseconds: 1500),
+        );
+        if (!softRecovered) {
+          throw StateError('Camera session did not recover after resume/retry');
+        }
+      }
+
       // 🔥🔥🔥 핵심 수정: Flutter에서 재초기화를 완전히 제거
       // 네이티브 FSM이 자동으로 복구하므로 Flutter는 resumeSession만 호출하고 기다림
       // 상태 확인을 최소화하여 Flutter-네이티브 동기화 문제 방지
       _isResuming = false; // 플래그 즉시 리셋 (네이티브가 처리하도록)
-      
+
       if (kDebugMode) {
-        debugPrint('[CameraEngine] ✅ Resume called: native FSM will handle recovery automatically');
+        debugPrint(
+          '[CameraEngine] ✅ Resume called: native FSM will handle recovery automatically',
+        );
       }
-      
+
       // 🔥🔥🔥 네이티브 FSM이 자동으로 복구하므로 Flutter는 기다리기만 함
       // 상태 폴링 타이머가 자동으로 상태를 업데이트하므로 여기서는 아무것도 하지 않음
       return;
     } catch (e) {
+      if (isRecoverableResumeError(e)) {
+        final recovered = await _waitForSessionRecovery(
+          const Duration(milliseconds: 1600),
+        );
+        if (recovered) {
+          _isResuming = false;
+          if (kDebugMode) {
+            debugPrint(
+              '[CameraEngine] ⚠️ resumeSession error ignored after soft recovery: $e',
+            );
+          }
+          return;
+        }
+      }
       _isResuming = false; // 플래그 리셋
       if (kDebugMode) {
         debugPrint('[CameraEngine] ❌ resumeSession failed: $e');
       }
-      // 🔥🔥🔥 보수적 접근: 예외 발생 시에도 재초기화하지 않음
-      // 네이티브 FSM이 자동으로 복구하므로 Flutter는 기다리기만 함
-      if (kDebugMode) {
-        debugPrint('[CameraEngine] ⚠️ Resume error handled: native FSM will handle recovery');
+      // 실패를 상위로 전달해야 호출부가 복구 대기/재시도 UI를 올바르게 제어할 수 있다.
+      rethrow;
+    }
+  }
+
+  Future<bool> _waitForSessionRecovery(Duration timeout) async {
+    final deadline = DateTime.now().add(timeout);
+    int consecutiveHealthy = 0;
+    while (DateTime.now().isBefore(deadline)) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      final state = await getDebugState();
+      final bool running = (state?['sessionRunning'] as bool?) ?? false;
+      final bool connected = (state?['videoConnected'] as bool?) ?? false;
+      final bool hasFirstFrame = (state?['hasFirstFrame'] as bool?) ?? false;
+      final int sampleBufferCount = (state?['sampleBufferCount'] as int?) ?? 0;
+      final bool healthyNow =
+          running && connected && (hasFirstFrame || sampleBufferCount > 0);
+      if (healthyNow) {
+        consecutiveHealthy++;
+        if (consecutiveHealthy >= 2) {
+          return true;
+        }
+      } else {
+        consecutiveHealthy = 0;
       }
     }
+    return false;
   }
 }

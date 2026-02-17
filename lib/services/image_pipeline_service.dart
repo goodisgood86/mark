@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
@@ -121,14 +120,14 @@ class ImagePipelineService {
     _previewBasePathCache[originalPath] = basePath;
 
     debugPrint(
-      '[Petgram] 🧱 Preview BASE create: ${width}x${height} → ${resizedImage.width}x${resizedImage.height}, path=$basePath',
+      '[Petgram] 🧱 Preview BASE create: ${width}x$height → ${resizedImage.width}x${resizedImage.height}, path=$basePath',
     );
 
     return basePath;
   }
 
   /// Aspect 비율에 맞게 크롭 (공통 파이프라인 모듈 사용)
-  /// 
+  ///
   /// 프리뷰와 저장이 동일한 크롭 계산을 사용하도록 보장하기 위해
   /// SharedImagePipeline의 수식을 사용합니다.
   img.Image _cropToAspectRatio(img.Image image, double targetRatio) {
@@ -146,7 +145,8 @@ class ImagePipelineService {
       targetRatio,
     );
 
-    if (crop.width > 0 && crop.height > 0 &&
+    if (crop.width > 0 &&
+        crop.height > 0 &&
         crop.x + crop.width <= image.width &&
         crop.y + crop.height <= image.height) {
       final cropped = img.copyCrop(
@@ -158,9 +158,9 @@ class ImagePipelineService {
       );
 
       if (kDebugMode) {
-      debugPrint(
+        debugPrint(
           '[Petgram] 📐 Aspect crop (shared pipeline): ${image.width}x${image.height} → ${cropped.width}x${cropped.height}, ratio=${(cropped.width / cropped.height).toStringAsFixed(3)}',
-      );
+        );
       }
 
       return cropped;
@@ -268,8 +268,9 @@ class ImagePipelineService {
     img.Image baseImage = originalImage;
     final int originalWidth = originalImage.width;
     final int originalHeight = originalImage.height;
-    final int originalLongSide =
-        originalWidth > originalHeight ? originalWidth : originalHeight;
+    final int originalLongSide = originalWidth > originalHeight
+        ? originalWidth
+        : originalHeight;
 
     if (originalLongSide > kSaveMaxDimension) {
       final double scale = kSaveMaxDimension / originalLongSide;
@@ -282,7 +283,7 @@ class ImagePipelineService {
       if (kDebugMode) {
         debugPrint(
           '[ImagePipelineService] 📐 Early downsample: '
-          '${originalWidth}x${originalHeight} → '
+          '${originalWidth}x$originalHeight → '
           '${baseImage.width}x${baseImage.height} (longSide: $originalLongSide → ${(originalLongSide * scale).round()})',
         );
       }
@@ -326,7 +327,7 @@ class ImagePipelineService {
     if (longSide < kSaveMinDimension) {
       if (kDebugMode) {
         debugPrint(
-          '[ImagePipelineService] ⚠️ Save image is smaller than minimum: ${width}x${height} (longSide: $longSide < $kSaveMinDimension)',
+          '[ImagePipelineService] ⚠️ Save image is smaller than minimum: ${width}x$height (longSide: $longSide < $kSaveMinDimension)',
         );
         debugPrint(
           '[ImagePipelineService] ℹ️ Keeping original size (no upscaling to avoid quality loss)',
@@ -338,7 +339,7 @@ class ImagePipelineService {
     else {
       if (kDebugMode) {
         debugPrint(
-          '[ImagePipelineService] 📐 Save image size: ${width}x${height} (longSide: $longSide, within range: $kSaveMinDimension~$kSaveMaxDimension)',
+          '[ImagePipelineService] 📐 Save image size: ${width}x$height (longSide: $longSide, within range: $kSaveMinDimension~$kSaveMaxDimension)',
         );
       }
       resizedImage = filteredImage;
@@ -389,7 +390,7 @@ class ImagePipelineService {
   }
 
   /// ColorMatrix 생성 (공통 파이프라인 모듈 사용)
-  /// 
+  ///
   /// 프리뷰와 저장이 동일한 수식을 사용하도록 보장하기 위해
   /// SharedImagePipeline의 수식을 사용합니다.
   List<double> _buildColorMatrix(FilterConfig config) {
@@ -587,7 +588,7 @@ class ImagePipelineService {
 
     if (kDebugMode) {
       debugPrint(
-        '[ImagePipelineService] 🎨 GPU ColorMatrix: input=${width}x${height} (preserving sensor resolution)',
+        '[ImagePipelineService] 🎨 GPU ColorMatrix: input=${width}x$height (preserving sensor resolution)',
       );
     }
 

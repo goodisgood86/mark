@@ -15,18 +15,18 @@ class FrameChip {
   });
 
   Map<String, dynamic> toJson() => {
-        'label': label,
-        'value': value,
-        if (iconType != null) 'iconType': iconType,
-        if (iconBase64 != null) 'iconBase64': iconBase64,
-      };
+    'label': label,
+    'value': value,
+    if (iconType != null) 'iconType': iconType,
+    if (iconBase64 != null) 'iconBase64': iconBase64,
+  };
 
   factory FrameChip.fromJson(Map<String, dynamic> json) => FrameChip(
-        label: json['label'] as String,
-        value: json['value'] as String,
-        iconType: json['iconType'] as String?,
-        iconBase64: json['iconBase64'] as String?,
-      );
+    label: json['label'] as String,
+    value: json['value'] as String,
+    iconType: json['iconType'] as String?,
+    iconBase64: json['iconBase64'] as String?,
+  );
 }
 
 /// 프레임 오버레이 설정 모델
@@ -36,27 +36,24 @@ class FrameOverlayConfig {
   final List<FrameChip> topChips; // 최대 2개까지만 (이름, 정보)
   final List<FrameChip> bottomChips; // 하단 칩 (날짜, 위치) - 프리뷰와 동일하게
 
-  FrameOverlayConfig({
-    required this.topChips,
-    required this.bottomChips,
-  }) : assert(
-          topChips.length <= 2,
-          'topChips는 최대 2개까지만 허용됩니다',
-        );
+  FrameOverlayConfig({required this.topChips, required this.bottomChips})
+    : assert(topChips.length <= 2, 'topChips는 최대 2개까지만 허용됩니다');
 
   /// JSON으로 변환 (네이티브에 전달)
   Map<String, dynamic> toJson() => {
-        'topChips': topChips.take(2).map((chip) => chip.toJson()).toList(),
-        'bottomChips': bottomChips.map((chip) => chip.toJson()).toList(),
-      };
+    'topChips': topChips.take(2).map((chip) => chip.toJson()).toList(),
+    'bottomChips': bottomChips.map((chip) => chip.toJson()).toList(),
+  };
 
   factory FrameOverlayConfig.fromJson(Map<String, dynamic> json) =>
       FrameOverlayConfig(
-        topChips: (json['topChips'] as List<dynamic>?)
+        topChips:
+            (json['topChips'] as List<dynamic>?)
                 ?.map((e) => FrameChip.fromJson(e as Map<String, dynamic>))
                 .toList() ??
             [],
-        bottomChips: (json['bottomChips'] as List<dynamic>?)
+        bottomChips:
+            (json['bottomChips'] as List<dynamic>?)
                 ?.map((e) => FrameChip.fromJson(e as Map<String, dynamic>))
                 .toList() ??
             [],
@@ -65,4 +62,3 @@ class FrameOverlayConfig {
   /// JSON 문자열로 변환
   String toJsonString() => jsonEncode(toJson());
 }
-

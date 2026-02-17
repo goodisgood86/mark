@@ -126,5 +126,3 @@ class CameraMappingUtils {
     return Offset(screenX, screenY);
   }
 }
-
-

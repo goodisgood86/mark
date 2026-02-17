@@ -10,8 +10,7 @@ import 'dart:io';
 ///
 /// Android는 기존대로 AndroidView를 사용합니다.
 class NativeCameraPreview extends StatefulWidget {
-  const NativeCameraPreview({Key? key, required this.onCreated})
-    : super(key: key);
+  const NativeCameraPreview({super.key, required this.onCreated});
 
   /// 🔄 리팩토링: iOS에서는 더 이상 viewId가 필요 없지만,
   /// 호환성을 위해 콜백은 유지합니다 (즉시 호출)
@@ -27,14 +26,10 @@ class _NativeCameraPreviewState extends State<NativeCameraPreview> {
   @override
   void initState() {
     super.initState();
-    // 🔥 디버그 로그: initState 호출 확인 (강제 출력)
-    final initStateMsg = '[NativeCameraPreview] 🔥🔥🔥 initState CALLED, Platform.isIOS=${Platform.isIOS}';
-    debugPrint(initStateMsg);
-    print(initStateMsg); // 콘솔에도 강제 출력
-    
+    // 강제 print는 로그 폭주를 유발하므로 제거하고 debugPrint만 유지
     if (kDebugMode) {
       debugPrint(
-        '[NativeCameraPreview] 🔍 initState called, Platform.isIOS=${Platform.isIOS}',
+        '[NativeCameraPreview] 🔍 initState called, Platform.isIOS=${Platform.isIOS}, hasCalled=$_hasCalledOnCreated',
       );
     }
 
@@ -66,10 +61,10 @@ class _NativeCameraPreviewState extends State<NativeCameraPreview> {
     if (_hasCalledOnCreated) {
       return; // 이미 호출됨
     }
-    
+
     // 플래그를 먼저 설정하여 중복 호출 방지
     _hasCalledOnCreated = true;
-    
+
     // 🔥 Pattern A 보장: iOS에서는 viewId를 0으로 설정 (유효한 값)
     //    iOS에서는 PlatformView를 사용하지 않지만, Flutter 쪽에서 viewId 체크를 하므로
     //    유효한 값(0)을 전달하여 initialize 호출이 가능하도록 함
@@ -80,7 +75,9 @@ class _NativeCameraPreviewState extends State<NativeCameraPreview> {
 
     try {
       widget.onCreated(0);
-      debugPrint('[NativeCameraPreview] ✅ onCreated callback called (iOS) with viewId=0');
+      debugPrint(
+        '[NativeCameraPreview] ✅ onCreated callback called (iOS) with viewId=0',
+      );
     } catch (e, stackTrace) {
       // 에러 발생 시 플래그 리셋하여 재시도 가능하게
       _hasCalledOnCreated = false;
@@ -112,10 +109,7 @@ class _NativeCameraPreviewState extends State<NativeCameraPreview> {
       // 문제: LayoutBuilder가 ColorFiltered와 SizedBox.expand()의 tight constraints와 충돌
       // 해결책: IgnorePointer + Container()를 직접 반환하여 부모 제약을 그대로 따르도록 함
       // SizedBox.expand()가 이미 부모 제약을 명시적으로 전달하므로 여기서는 단순한 위젯만 필요
-      return IgnorePointer(
-        ignoring: true,
-        child: Container(),
-      );
+      return IgnorePointer(ignoring: true, child: Container());
     } else {
       // Android는 기존대로 AndroidView 사용
       return _buildAndroidPreview();

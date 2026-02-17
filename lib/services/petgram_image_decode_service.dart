@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 
@@ -10,14 +9,15 @@ class PetgramImageDecodeService {
   /// 최대 600x600 픽셀로 다운샘플링
   static Future<Uint8List?> decodeQuickPreview(String path) async {
     try {
-      return await compute(_decodeImpl, _DecodeParams(
-        path: path,
-        maxWidth: 600,
-        maxHeight: 600,
-      ));
+      return await compute(
+        _decodeImpl,
+        _DecodeParams(path: path, maxWidth: 600, maxHeight: 600),
+      );
     } catch (e, stackTrace) {
       if (kDebugMode) {
-        debugPrint('[PetgramImageDecodeService] ❌ decodeQuickPreview error: $e');
+        debugPrint(
+          '[PetgramImageDecodeService] ❌ decodeQuickPreview error: $e',
+        );
         debugPrint('[PetgramImageDecodeService] Stack trace: $stackTrace');
       }
       // 에러 발생 시 null 반환 (절대 throw하지 않음)
@@ -29,11 +29,10 @@ class PetgramImageDecodeService {
   /// 최대 1080x1350 픽셀로 다운샘플링 (짧은 변 1080 기준)
   static Future<Uint8List?> decodeFullPreview(String path) async {
     try {
-      return await compute(_decodeImpl, _DecodeParams(
-        path: path,
-        maxWidth: 1080,
-        maxHeight: 1350,
-      ));
+      return await compute(
+        _decodeImpl,
+        _DecodeParams(path: path, maxWidth: 1080, maxHeight: 1350),
+      );
     } catch (e, stackTrace) {
       if (kDebugMode) {
         debugPrint('[PetgramImageDecodeService] ❌ decodeFullPreview error: $e');
@@ -51,7 +50,9 @@ class PetgramImageDecodeService {
       final file = File(params.path);
       if (!file.existsSync()) {
         if (kDebugMode) {
-          debugPrint('[PetgramImageDecodeService] ⚠️ File does not exist: ${params.path}');
+          debugPrint(
+            '[PetgramImageDecodeService] ⚠️ File does not exist: ${params.path}',
+          );
         }
         return null;
       }
@@ -60,7 +61,9 @@ class PetgramImageDecodeService {
       final bytes = file.readAsBytesSync();
       if (bytes.isEmpty) {
         if (kDebugMode) {
-          debugPrint('[PetgramImageDecodeService] ⚠️ File is empty: ${params.path}');
+          debugPrint(
+            '[PetgramImageDecodeService] ⚠️ File is empty: ${params.path}',
+          );
         }
         return null;
       }
@@ -69,7 +72,9 @@ class PetgramImageDecodeService {
       final image = img.decodeImage(bytes);
       if (image == null) {
         if (kDebugMode) {
-          debugPrint('[PetgramImageDecodeService] ⚠️ Failed to decode image: ${params.path}');
+          debugPrint(
+            '[PetgramImageDecodeService] ⚠️ Failed to decode image: ${params.path}',
+          );
         }
         return null;
       }
@@ -119,7 +124,7 @@ class PetgramImageDecodeService {
 
       if (kDebugMode) {
         debugPrint(
-          '[PetgramImageDecodeService] ✅ Decoded: ${originalWidth}x${originalHeight} → ${targetWidth}x${targetHeight}, ${encodedBytes.length} bytes',
+          '[PetgramImageDecodeService] ✅ Decoded: ${originalWidth}x$originalHeight → ${targetWidth}x$targetHeight, ${encodedBytes.length} bytes',
         );
       }
 
@@ -147,4 +152,3 @@ class _DecodeParams {
     required this.maxHeight,
   });
 }
-
