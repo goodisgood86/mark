@@ -310,7 +310,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   /// 디버그 상태 폴링 시작
-  /// - 시작 구간: 첫 프레임 전에는 빠르게(0.12s) 폴링
+  /// - 시작 구간: 첫 프레임 전에는 빠르게(0.25s) 폴링
   /// - 안정화 후: 10초 간격으로 전환
   void _startDebugStatePolling({bool fastUntilFirstFrame = true}) {
     _debugStatePollTimer?.cancel();
@@ -318,7 +318,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         fastUntilFirstFrame && (_cameraEngine.hasFirstFrame != true);
     _isFastDebugStatePolling = useFastPolling;
     final Duration interval = useFastPolling
-        ? const Duration(milliseconds: 120)
+        ? const Duration(milliseconds: 250)
         : const Duration(seconds: 10);
 
     _debugStatePollTimer = Timer.periodic(interval, (_) {
