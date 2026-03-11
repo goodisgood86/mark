@@ -68,12 +68,13 @@ class _SettingsPageState extends State<SettingsPage> {
 
   void _handlePurchaseUpdates(List<PurchaseDetails> purchaseDetailsList) {
     for (final purchaseDetails in purchaseDetailsList) {
-      _clearPurchaseStartTimeout();
       if (purchaseDetails.status == PurchaseStatus.pending) {
+        _startPurchaseStartTimeout();
         if (!mounted) continue;
         setState(() => _isPurchasing = true);
       } else if (purchaseDetails.status == PurchaseStatus.purchased ||
           purchaseDetails.status == PurchaseStatus.restored) {
+        _clearPurchaseStartTimeout();
         if (_isRestoring) {
           _receivedRestoreEvent = true;
           _isRestoring = false;
@@ -281,7 +282,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void _startPurchaseStartTimeout() {
     _purchaseStartTimeout?.cancel();
     _isAwaitingPurchaseUpdate = true;
-    _purchaseStartTimeout = Timer(const Duration(seconds: 12), () {
+    _purchaseStartTimeout = Timer(const Duration(seconds: 20), () {
       if (!mounted) return;
       if (_isPurchasing && _isAwaitingPurchaseUpdate) {
         setState(() {
