@@ -28,10 +28,12 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _isPurchasing = false;
   bool _isRestoring = false;
   bool _receivedRestoreEvent = false;
+  bool _isAwaitingPurchaseUpdate = false;
   bool _isDonationCompleted = false;
   String? _errorMessage;
 
   StreamSubscription<List<PurchaseDetails>>? _subscription;
+  Timer? _purchaseStartTimeout;
 
   @override
   void initState() {
@@ -44,6 +46,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void dispose() {
     _subscription?.cancel();
+    _purchaseStartTimeout?.cancel();
     super.dispose();
   }
 
@@ -52,6 +55,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _handlePurchaseUpdates,
       onDone: () => _subscription?.cancel(),
       onError: (_) {
+        _clearPurchaseStartTimeout();
         if (!mounted) return;
         setState(() {
           _isPurchasing = false;
@@ -64,6 +68,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   void _handlePurchaseUpdates(List<PurchaseDetails> purchaseDetailsList) {
     for (final purchaseDetails in purchaseDetailsList) {
+      _clearPurchaseStartTimeout();
       if (purchaseDetails.status == PurchaseStatus.pending) {
         if (!mounted) continue;
         setState(() => _isPurchasing = true);
@@ -75,6 +80,7 @@ class _SettingsPageState extends State<SettingsPage> {
         }
         _verifyPurchase(purchaseDetails.status);
       } else if (purchaseDetails.status == PurchaseStatus.canceled) {
+        _clearPurchaseStartTimeout();
         if (!mounted) continue;
         setState(() {
           _isPurchasing = false;
@@ -82,6 +88,7 @@ class _SettingsPageState extends State<SettingsPage> {
           _errorMessage = '결제가 취소되었습니다.';
         });
       } else if (purchaseDetails.status == PurchaseStatus.error) {
+        _clearPurchaseStartTimeout();
         if (!mounted) continue;
         setState(() {
           _isPurchasing = false;
@@ -105,6 +112,7 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   void _verifyPurchase(PurchaseStatus status) {
+    _clearPurchaseStartTimeout();
     if (!mounted) return;
     setState(() {
       _isPurchasing = false;
@@ -246,12 +254,14 @@ class _SettingsPageState extends State<SettingsPage> {
       _isPurchasing = true;
       _errorMessage = null;
     });
+    _startPurchaseStartTimeout();
 
     try {
       final success = await _inAppPurchase.buyNonConsumable(
         purchaseParam: PurchaseParam(productDetails: productDetails),
       );
       if (!success) {
+        _clearPurchaseStartTimeout();
         if (!mounted) return;
         setState(() {
           _isPurchasing = false;
@@ -259,12 +269,34 @@ class _SettingsPageState extends State<SettingsPage> {
         });
       }
     } catch (_) {
+      _clearPurchaseStartTimeout();
       if (!mounted) return;
       setState(() {
         _isPurchasing = false;
         _errorMessage = '결제 중 오류가 발생했습니다.';
       });
     }
+  }
+
+  void _startPurchaseStartTimeout() {
+    _purchaseStartTimeout?.cancel();
+    _isAwaitingPurchaseUpdate = true;
+    _purchaseStartTimeout = Timer(const Duration(seconds: 12), () {
+      if (!mounted) return;
+      if (_isPurchasing && _isAwaitingPurchaseUpdate) {
+        setState(() {
+          _isPurchasing = false;
+          _isAwaitingPurchaseUpdate = false;
+          _errorMessage = '결제가 취소되었거나 응답이 지연되었습니다. 다시 시도해주세요.';
+        });
+      }
+    });
+  }
+
+  void _clearPurchaseStartTimeout() {
+    _purchaseStartTimeout?.cancel();
+    _purchaseStartTimeout = null;
+    _isAwaitingPurchaseUpdate = false;
   }
 
   @override
