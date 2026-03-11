@@ -86,7 +86,7 @@ class _SettingsPageState extends State<SettingsPage> {
         setState(() {
           _isPurchasing = false;
           _isRestoring = false;
-          _errorMessage = '결제가 취소되었습니다.';
+          _errorMessage = null;
         });
       } else if (purchaseDetails.status == PurchaseStatus.error) {
         _clearPurchaseStartTimeout();
@@ -288,7 +288,7 @@ class _SettingsPageState extends State<SettingsPage> {
         setState(() {
           _isPurchasing = false;
           _isAwaitingPurchaseUpdate = false;
-          _errorMessage = '결제가 취소되었거나 응답이 지연되었습니다. 다시 시도해주세요.';
+          _errorMessage = null;
         });
       }
     });
