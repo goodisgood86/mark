@@ -720,16 +720,30 @@ class _FilterPageState extends State<FilterPage> {
     final rawPath = file.path.trim();
     if (rawPath.isEmpty) return null;
 
+    if (kDebugMode) {
+      debugPrint('[FilterPage] 🔎 meta lookup start: rawPath=$rawPath');
+    }
+
     final exactRef = 'file:$rawPath';
     final fromExactRef = await PetgramPhotoRepository.instance.getByFilePath(
       exactRef,
     );
-    if (fromExactRef != null) return fromExactRef.meta;
+    if (fromExactRef != null) {
+      if (kDebugMode) {
+        debugPrint('[FilterPage] ✅ meta matched by exact ref: $exactRef');
+      }
+      return fromExactRef.meta;
+    }
 
     final fromRawPath = await PetgramPhotoRepository.instance.getByFilePath(
       rawPath,
     );
-    if (fromRawPath != null) return fromRawPath.meta;
+    if (fromRawPath != null) {
+      if (kDebugMode) {
+        debugPrint('[FilterPage] ✅ meta matched by raw path');
+      }
+      return fromRawPath.meta;
+    }
 
     final candidates = <String>{};
     final pathName = p.basename(rawPath).trim();
@@ -745,13 +759,45 @@ class _FilterPageState extends State<FilterPage> {
       final fromNameRef = await PetgramPhotoRepository.instance.getByFilePath(
         'name:$fileName',
       );
-      if (fromNameRef != null) return fromNameRef.meta;
+      if (fromNameRef != null) {
+        if (kDebugMode) {
+          debugPrint('[FilterPage] ✅ meta matched by name ref: $fileName');
+        }
+        return fromNameRef.meta;
+      }
+
+      final assetRef = await PetgramMediaRefService.instance
+          .resolveNameToAssetRef('name:$fileName');
+      if (assetRef != null) {
+        final fromAssetRef = await PetgramPhotoRepository.instance
+            .getByFilePath(assetRef);
+        if (fromAssetRef != null) {
+          if (kDebugMode) {
+            debugPrint(
+              '[FilterPage] ✅ meta matched by asset ref: $assetRef (name=$fileName)',
+            );
+          }
+          return fromAssetRef.meta;
+        }
+      }
 
       final fromPattern = await PetgramPhotoRepository.instance
           .getByFileNamePattern(fileName);
-      if (fromPattern != null) return fromPattern.meta;
+      if (fromPattern != null) {
+        if (kDebugMode) {
+          debugPrint(
+            '[FilterPage] ✅ meta matched by filename pattern: $fileName',
+          );
+        }
+        return fromPattern.meta;
+      }
     }
 
+    if (kDebugMode) {
+      debugPrint(
+        '[FilterPage] ❌ meta lookup miss. candidates=${candidates.toList()} source=${widget.sourceFileName}',
+      );
+    }
     return null;
   }
 
