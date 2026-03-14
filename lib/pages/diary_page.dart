@@ -1908,77 +1908,148 @@ class _DiaryPageState extends State<DiaryPage> {
       return;
     }
 
-    await showDialog<void>(
-      context: context,
-      barrierColor: const Color(0xE6000000),
-      builder: (dialogContext) {
-        return Dialog(
-          backgroundColor: Colors.transparent,
-          insetPadding: EdgeInsets.zero,
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: InteractiveViewer(
-                  minScale: 1,
-                  maxScale: 4.5,
-                  child: Center(
-                    child: Image.file(
-                      file,
-                      fit: BoxFit.contain,
-                      errorBuilder: (context, error, stackTrace) {
-                        return const Center(
-                          child: Icon(
-                            Icons.broken_image_outlined,
-                            color: Colors.white70,
-                            size: 34,
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ),
-              ),
-              Positioned(
-                top: MediaQuery.of(dialogContext).padding.top + 8,
-                right: 12,
-                child: Material(
-                  color: const Color(0xB3000000),
-                  shape: const CircleBorder(),
-                  child: InkWell(
-                    customBorder: const CircleBorder(),
+    final cacheKey = _entryCacheKey(entry);
+    final ratioCandidate =
+        _entryAspectRatioCache[cacheKey] ?? _globalAspectRatioCache[cacheKey];
+    final imageRatio =
+        ratioCandidate != null && ratioCandidate.isFinite && ratioCandidate > 0
+        ? ratioCandidate
+        : (3 / 4);
+    final zoomController = TransformationController();
+    TapDownDetails? lastDoubleTapDown;
+
+    try {
+      await showDialog<void>(
+        context: context,
+        barrierColor: const Color(0xE6000000),
+        builder: (dialogContext) {
+          return Dialog(
+            backgroundColor: Colors.transparent,
+            insetPadding: EdgeInsets.zero,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
                     onTap: () => Navigator.of(dialogContext).pop(),
-                    child: Container(
-                      width: 40,
-                      height: 40,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: const Color(0x66FFFFFF),
-                          width: 1.1,
-                        ),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Color(0x33000000),
-                            blurRadius: 6,
-                            offset: Offset(0, 2),
+                  ),
+                ),
+                Center(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final maxWidth = constraints.maxWidth.isFinite
+                          ? constraints.maxWidth
+                          : MediaQuery.of(dialogContext).size.width;
+                      final maxHeight = constraints.maxHeight.isFinite
+                          ? constraints.maxHeight
+                          : MediaQuery.of(dialogContext).size.height;
+                      final widthByHeight = maxHeight * imageRatio;
+                      final viewerWidth = widthByHeight < maxWidth
+                          ? widthByHeight
+                          : maxWidth;
+                      final viewerHeight = viewerWidth / imageRatio;
+
+                      return GestureDetector(
+                        behavior: HitTestBehavior.translucent,
+                        onTap: () {},
+                        onDoubleTapDown: (details) {
+                          lastDoubleTapDown = details;
+                        },
+                        onDoubleTap: () {
+                          final currentScale = zoomController.value
+                              .getMaxScaleOnAxis();
+                          if (currentScale > 1.05) {
+                            zoomController.value = Matrix4.identity();
+                            return;
+                          }
+                          final tapPosition =
+                              lastDoubleTapDown?.localPosition ??
+                              Offset(viewerWidth / 2, viewerHeight / 2);
+                          const targetScale = 2.6;
+                          final translateX =
+                              -tapPosition.dx * (targetScale - 1);
+                          final translateY =
+                              -tapPosition.dy * (targetScale - 1);
+                          final zoomed = Matrix4.identity()
+                            ..setEntry(0, 0, targetScale)
+                            ..setEntry(1, 1, targetScale)
+                            ..setEntry(0, 3, translateX)
+                            ..setEntry(1, 3, translateY);
+                          zoomController.value = zoomed;
+                        },
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: SizedBox(
+                            width: viewerWidth,
+                            height: viewerHeight,
+                            child: InteractiveViewer(
+                              transformationController: zoomController,
+                              minScale: 1,
+                              maxScale: 4.5,
+                              child: Image.file(
+                                file,
+                                fit: BoxFit.cover,
+                                errorBuilder: (context, error, stackTrace) {
+                                  return const Center(
+                                    child: Icon(
+                                      Icons.broken_image_outlined,
+                                      color: Colors.white70,
+                                      size: 34,
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
                           ),
-                        ],
-                      ),
-                      alignment: Alignment.center,
-                      child: const Icon(
-                        Icons.close_rounded,
-                        color: Colors.white,
-                        size: 24,
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                Positioned(
+                  top: MediaQuery.of(dialogContext).padding.top + 8,
+                  right: 12,
+                  child: Material(
+                    color: const Color(0xB3000000),
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      customBorder: const CircleBorder(),
+                      onTap: () => Navigator.of(dialogContext).pop(),
+                      child: Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: const Color(0x66FFFFFF),
+                            width: 1.1,
+                          ),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x33000000),
+                              blurRadius: 6,
+                              offset: Offset(0, 2),
+                            ),
+                          ],
+                        ),
+                        alignment: Alignment.center,
+                        child: const Icon(
+                          Icons.close_rounded,
+                          color: Colors.white,
+                          size: 24,
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
+              ],
+            ),
+          );
+        },
+      );
+    } finally {
+      zoomController.dispose();
+    }
   }
 
   Future<AssetEntity?> _resolveAssetEntity(OneLineDiaryEntry entry) {
