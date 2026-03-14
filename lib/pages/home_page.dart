@@ -6807,6 +6807,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             final isCapturingStateError =
                 errorText.contains('state: capturing') ||
                 errorText.contains('Capture already in progress');
+            final isCaptureTimeoutError =
+                errorText.contains('CAPTURE_TIMEOUT') ||
+                errorText.contains('Photo capture timeout');
             if (!isAutoBurst && allowBusyRetry && isCapturingStateError) {
               if (!_isWaitingCameraRecovery) {
                 if (mounted) {
@@ -6826,6 +6829,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 releaseProcessingForEarlyReturn(
                   'capture_failed_state_capturing_retry',
                 );
+                await _takePhoto(
+                  isAutoBurst: false,
+                  allowBusyRetry: false,
+                  bypassRequestLock: true,
+                );
+                return;
+              }
+            }
+            if (!isAutoBurst && allowBusyRetry && isCaptureTimeoutError) {
+              _addDebugLog(
+                '[Petgram] ⏳ CAPTURE_TIMEOUT detected: trying single recovery retry',
+              );
+              try {
+                await _cameraEngine.resume();
+              } catch (_) {
+                // resume 실패는 아래 재시도로 흡수한다.
+              }
+              await Future.delayed(const Duration(milliseconds: 300));
+              if (canUseCamera) {
+                releaseProcessingForEarlyReturn('capture_timeout_retry');
                 await _takePhoto(
                   isAutoBurst: false,
                   allowBusyRetry: false,
@@ -6925,7 +6948,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
         if (mounted) {
           String errorMessage = '사진 촬영 중 오류가 발생했어요.';
-          if ('$e'.contains('permission') ||
+          final lowerError = '$e'.toLowerCase();
+          if (lowerError.contains('capture_timeout') ||
+              lowerError.contains('photo capture timeout')) {
+            errorMessage = '카메라 응답이 지연되었습니다. 잠시 후 다시 시도해주세요.';
+          } else if (lowerError.contains('another capture is in progress') ||
+              lowerError.contains('capture already in progress') ||
+              lowerError.contains('state: capturing')) {
+            errorMessage = '촬영 처리 중입니다. 잠시 후 다시 시도해주세요.';
+          } else if (lowerError.contains('camera session not ready') ||
+              lowerError.contains('session state invalid') ||
+              lowerError.contains('camera not initialized')) {
+            errorMessage = '카메라 준비 상태가 불안정합니다. 잠시 후 다시 시도해주세요.';
+          } else if ('$e'.contains('permission') ||
               '$e'.contains('Permission') ||
               '$e'.contains('권한')) {
             errorMessage = '갤러리 저장 권한이 필요합니다. 설정에서 권한을 허용해주세요.';
