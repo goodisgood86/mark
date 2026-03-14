@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:gal/gal.dart';
 
@@ -654,11 +655,6 @@ class _FilterPageState extends State<FilterPage> {
   /// 복원된 메타데이터는 _currentOriginalMeta에 저장됨
   /// 예외 처리를 강화하여 Flutter 에러 화면이 뜨지 않도록 함
   /// 🔥 중요: DB에서 먼저 확인하고, 없으면 EXIF에서 읽기
-  /// 🔥 EXIF에서 메타데이터 복원 (DB 조회 제거, EXIF만 사용)
-  ///
-  /// 원본 파일은 그대로 두고 보정 파일을 1개 더 만드는 것이므로
-  /// 이미지 피커로 불러오는 게 맞고, DB 경로 문제를 피하기 위해
-  /// EXIF에 있으면 그대로 복사해오는 것으로 처리
   Future<void> _restoreMetaFromExif(File imageFile) async {
     final file = File(_currentImagePath);
 
@@ -682,6 +678,20 @@ class _FilterPageState extends State<FilterPage> {
         return;
       }
 
+      // 1) 기존 DB 메타 복원 (가장 우선)
+      final fromDb = await _lookupOriginalMetaFromDb(file);
+      if (fromDb != null) {
+        if (mounted) {
+          setState(() {
+            _currentOriginalMeta = fromDb;
+          });
+        } else {
+          _currentOriginalMeta = fromDb;
+        }
+        return;
+      }
+
+      // 2) EXIF에서 메타 복원
       final imageBytes = await file.readAsBytes();
       final userComment = await readUserCommentFromJpeg(imageBytes);
 
@@ -702,6 +712,36 @@ class _FilterPageState extends State<FilterPage> {
         debugPrint('[FilterPage] ❌ Stack trace: $stackTrace');
       }
     }
+  }
+
+  Future<PetgramPhotoMeta?> _lookupOriginalMetaFromDb(File file) async {
+    final rawPath = file.path.trim();
+    if (rawPath.isEmpty) return null;
+
+    final exactRef = 'file:$rawPath';
+    final fromExactRef = await PetgramPhotoRepository.instance.getByFilePath(
+      exactRef,
+    );
+    if (fromExactRef != null) return fromExactRef.meta;
+
+    final fromRawPath = await PetgramPhotoRepository.instance.getByFilePath(
+      rawPath,
+    );
+    if (fromRawPath != null) return fromRawPath.meta;
+
+    final fileName = p.basename(rawPath).trim();
+    if (fileName.isEmpty) return null;
+
+    final fromNameRef = await PetgramPhotoRepository.instance.getByFilePath(
+      'name:$fileName',
+    );
+    if (fromNameRef != null) return fromNameRef.meta;
+
+    final fromPattern = await PetgramPhotoRepository.instance
+        .getByFileNamePattern(fileName);
+    if (fromPattern != null) return fromPattern.meta;
+
+    return null;
   }
 
   @override
@@ -2107,7 +2147,9 @@ class _FilterPageState extends State<FilterPage> {
       final originalImageBytes = await originalFile.readAsBytes();
 
       // 🔥 원본 메타데이터 우선 사용 (DB/EXIF에서 복원한 것 또는 widget에서 전달받은 것)
-      final originalMeta = _currentOriginalMeta ?? widget.originalMeta;
+      var originalMeta = _currentOriginalMeta ?? widget.originalMeta;
+      // 저장 직전에 한 번 더 DB를 확인해, 복원 지연으로 메타가 빠지는 경우를 방지한다.
+      originalMeta ??= await _lookupOriginalMetaFromDb(originalFile);
 
       // 🔥 buildMetaForFilterSave는 이미 originalMeta를 받아서 isPetgramEdited=true로 설정함
       //    원본 메타데이터의 모든 정보(프레임, 펫 정보 등)를 유지하면서 편집 표시만 추가
