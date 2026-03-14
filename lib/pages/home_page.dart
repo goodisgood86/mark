@@ -11435,11 +11435,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         context,
         MaterialPageRoute(builder: (_) => const BackupPage()),
       );
+      await _reloadStateAfterBackupReturn();
       await _recoverCameraAfterRouteReady(source: 'backup');
     } finally {
       _lastBackupPageClosedAt = DateTime.now();
       _isOpeningBackupPage = false;
     }
+  }
+
+  Future<void> _reloadStateAfterBackupReturn() async {
+    if (!mounted) return;
+    await _loadLastSelectedFilter();
+    await _loadAllSettings();
+    await _loadPetName();
   }
 
   Future<void> _recoverCameraAfterRouteReady({required String source}) async {

@@ -356,7 +356,8 @@ class _BackupPageState extends State<BackupPage> with WidgetsBindingObserver {
 
     setState(() => _isBusy = true);
     try {
-      final result = await PetgramSupabaseSyncService.instance.withdrawAccount();
+      final result = await PetgramSupabaseSyncService.instance
+          .withdrawAccount();
       _awaitingAuthCompletion = false;
       setState(() => _lastBackupInfo = null);
       if (result.authDeleted && result.backupDeleted) {
@@ -429,7 +430,7 @@ class _BackupPageState extends State<BackupPage> with WidgetsBindingObserver {
       if (result.hasChanges) {
         await _refreshRemoteBackupInfo();
         _showSnack(
-          '복원 완료: 사진 ${result.restoredPhotoCount}건, 일기 ${result.restoredDraftCount}건, 태그 ${result.restoredTagCount}건',
+          '복원 완료: 사진 ${result.restoredPhotoCount}건, 일기 ${result.restoredDraftCount}건, 태그 ${result.restoredTagCount}건, 설정 ${result.restoredPrefCount}건',
         );
       } else {
         _showSnack('최신 데이터입니다.');
