@@ -56,6 +56,13 @@ class OneLineDiaryService {
         .toSet()
         .toList(growable: false);
     final tagsByEntryId = await _loadTagMapForEntryIds(db, entryIds);
+    final registeredPets = await loadRegisteredPets();
+    final petById = <String, PetInfo>{};
+    for (final pet in registeredPets) {
+      final id = pet.id.trim();
+      if (id.isEmpty) continue;
+      petById[id] = pet;
+    }
 
     final results = <OneLineDiaryEntry>[];
     int existenceCheckBudget = validateExistence ? records.length : 0;
@@ -86,8 +93,23 @@ class OneLineDiaryService {
       if (isHidden && !includeHidden) continue;
 
       final fileName = _fileNameFromPath(effectivePath);
-      final rawPetName = record.meta.frameMeta['petName']?.toString().trim();
-      final rawPetType = record.meta.frameMeta['petType']?.toString().trim();
+      final rawPetId = _readTrimmedString(record.meta.frameMeta['petId']);
+      final rawPetName = _readTrimmedString(record.meta.frameMeta['petName']);
+      final rawPetType = _readTrimmedString(record.meta.frameMeta['petType']);
+      final mappedPet = rawPetId == null ? null : petById[rawPetId];
+      final mappedPetName = _readTrimmedString(mappedPet?.name);
+      final mappedPetType = _readTrimmedString(mappedPet?.type);
+      final overlayPetName = _readOverlayChipValue(
+        frameMeta: record.meta.frameMeta,
+        chipLabel: 'name',
+      );
+      final overlayPetType = _readOverlayChipIconType(
+        frameMeta: record.meta.frameMeta,
+        chipLabel: 'name',
+      );
+      final resolvedPetName = rawPetName ?? mappedPetName ?? overlayPetName;
+      final resolvedPetType =
+          (rawPetType ?? mappedPetType ?? overlayPetType)?.toLowerCase();
 
       results.add(
         OneLineDiaryEntry(
@@ -95,12 +117,8 @@ class OneLineDiaryService {
           filePath: effectivePath,
           takenAt: record.meta.takenAt.toLocal(),
           fileName: fileName,
-          petName: (rawPetName == null || rawPetName.isEmpty)
-              ? null
-              : rawPetName,
-          petType: (rawPetType == null || rawPetType.isEmpty)
-              ? null
-              : rawPetType.toLowerCase(),
+          petName: resolvedPetName,
+          petType: resolvedPetType,
           comment: entryRow?['comment']?.toString() ?? '',
           userTags: tagsByEntryId[rowEntryId] ?? const <String>[],
           isHidden: isHidden,
@@ -658,6 +676,56 @@ class OneLineDiaryService {
       tag = tag.substring(1).trimLeft();
     }
     return tag.trim();
+  }
+
+  String? _readTrimmedString(Object? value) {
+    if (value == null) return null;
+    final text = value.toString().trim();
+    if (text.isEmpty) return null;
+    return text;
+  }
+
+  String? _readOverlayChipValue({
+    required Map<String, dynamic> frameMeta,
+    required String chipLabel,
+  }) {
+    final chips = _overlayTopChips(frameMeta);
+    for (final chip in chips) {
+      final label = _readTrimmedString(chip['label'])?.toLowerCase();
+      if (label != chipLabel.toLowerCase()) continue;
+      final value = _readTrimmedString(chip['value']);
+      if (value != null) return value;
+    }
+    return null;
+  }
+
+  String? _readOverlayChipIconType({
+    required Map<String, dynamic> frameMeta,
+    required String chipLabel,
+  }) {
+    final chips = _overlayTopChips(frameMeta);
+    for (final chip in chips) {
+      final label = _readTrimmedString(chip['label'])?.toLowerCase();
+      if (label != chipLabel.toLowerCase()) continue;
+      final iconType = _readTrimmedString(chip['iconType']);
+      if (iconType != null) return iconType;
+    }
+    return null;
+  }
+
+  List<Map<String, dynamic>> _overlayTopChips(Map<String, dynamic> frameMeta) {
+    final overlay = frameMeta['overlayConfig'];
+    if (overlay is! Map) return const <Map<String, dynamic>>[];
+    final topChipsRaw = overlay['topChips'];
+    if (topChipsRaw is! List) return const <Map<String, dynamic>>[];
+
+    final chips = <Map<String, dynamic>>[];
+    for (final item in topChipsRaw) {
+      if (item is Map) {
+        chips.add(Map<String, dynamic>.from(item));
+      }
+    }
+    return chips;
   }
 
   int _readInt(dynamic value, [int fallback = 0]) {
