@@ -7161,6 +7161,54 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         });
   }
 
+  Future<PetgramPhotoMeta?> _lookupOriginalMetaForPickedImage(
+    XFile picked,
+  ) async {
+    final rawPath = picked.path.trim();
+    final candidates = <String>{};
+    final pickedName = picked.name.trim();
+    if (pickedName.isNotEmpty) {
+      candidates.add(pickedName);
+    }
+    final pathName = _extractFileName(rawPath).trim();
+    if (pathName.isNotEmpty) {
+      candidates.add(pathName);
+    }
+
+    if (rawPath.isNotEmpty) {
+      final fromExactRef = await PetgramPhotoRepository.instance.getByFilePath(
+        'file:$rawPath',
+      );
+      if (fromExactRef != null) return fromExactRef.meta;
+
+      final fromRawPath = await PetgramPhotoRepository.instance.getByFilePath(
+        rawPath,
+      );
+      if (fromRawPath != null) return fromRawPath.meta;
+    }
+
+    for (final name in candidates) {
+      final fromNameRef = await PetgramPhotoRepository.instance.getByFilePath(
+        'name:$name',
+      );
+      if (fromNameRef != null) return fromNameRef.meta;
+
+      final assetRef = await PetgramMediaRefService.instance
+          .resolveNameToAssetRef('name:$name');
+      if (assetRef != null) {
+        final fromAssetRef = await PetgramPhotoRepository.instance
+            .getByFilePath(assetRef);
+        if (fromAssetRef != null) return fromAssetRef.meta;
+      }
+
+      final fromPattern = await PetgramPhotoRepository.instance
+          .getByFileNamePattern(name);
+      if (fromPattern != null) return fromPattern.meta;
+    }
+
+    return null;
+  }
+
   /// 🔥 프레임 오버레이 통합: FrameOverlayConfig 생성
   /// 프리뷰와 저장 모두 이 함수를 사용하여 일관성 유지
   FrameOverlayConfig? _buildFrameOverlayConfig() {
@@ -11071,13 +11119,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         // - 필터 초기 적용하지 않음
                         // - EXIF 메타데이터 읽기도 FilterPage에서 수행
                         final originalFile = File(picked.path);
+                        final originalMeta =
+                            await _lookupOriginalMetaForPickedImage(picked);
 
                         // FilterPage로 즉시 이동 (heavy work는 FilterPage에서 수행)
                         // 사진 목록이 닫힌 뒤 멈추지 않고 바로 FilterPage로 전환
                         // await를 제거하여 즉시 push (전환 애니메이션이 끊기지 않도록)
                         _openFilterPage(
                           originalFile,
-                          originalMeta: null, // FilterPage에서 EXIF에서 읽음
+                          originalMeta: originalMeta,
                         );
                       } catch (e) {
                         if (kDebugMode) {
