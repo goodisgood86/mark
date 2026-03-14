@@ -766,21 +766,6 @@ class _FilterPageState extends State<FilterPage> {
         return fromNameRef.meta;
       }
 
-      final assetRef = await PetgramMediaRefService.instance
-          .resolveNameToAssetRef('name:$fileName');
-      if (assetRef != null) {
-        final fromAssetRef = await PetgramPhotoRepository.instance
-            .getByFilePath(assetRef);
-        if (fromAssetRef != null) {
-          if (kDebugMode) {
-            debugPrint(
-              '[FilterPage] ✅ meta matched by asset ref: $assetRef (name=$fileName)',
-            );
-          }
-          return fromAssetRef.meta;
-        }
-      }
-
       final fromPattern = await PetgramPhotoRepository.instance
           .getByFileNamePattern(fileName);
       if (fromPattern != null) {
