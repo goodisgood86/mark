@@ -34,6 +34,7 @@ class FilterPage extends StatefulWidget {
   final String? coatPreset; // 코트 프리셋 (light/mid/dark)
   final PetgramPhotoMeta? originalMeta; // 원본 메타데이터 (우리 앱에서 촬영한 경우)
   final AspectRatioMode? aspectMode; // 선택된 비율 모드 (1:1, 3:4, 9:16)
+  final String? sourceFileName; // ImagePicker 원본 파일명(있는 경우)
 
   const FilterPage({
     super.key,
@@ -43,6 +44,7 @@ class FilterPage extends StatefulWidget {
     this.coatPreset,
     this.originalMeta, // 원본 메타데이터 추가
     this.aspectMode, // 선택된 비율 모드 추가
+    this.sourceFileName,
   });
 
   @override
@@ -729,17 +731,26 @@ class _FilterPageState extends State<FilterPage> {
     );
     if (fromRawPath != null) return fromRawPath.meta;
 
-    final fileName = p.basename(rawPath).trim();
-    if (fileName.isEmpty) return null;
+    final candidates = <String>{};
+    final pathName = p.basename(rawPath).trim();
+    if (pathName.isNotEmpty) {
+      candidates.add(pathName);
+    }
+    final sourceName = (widget.sourceFileName ?? '').trim();
+    if (sourceName.isNotEmpty) {
+      candidates.add(sourceName);
+    }
 
-    final fromNameRef = await PetgramPhotoRepository.instance.getByFilePath(
-      'name:$fileName',
-    );
-    if (fromNameRef != null) return fromNameRef.meta;
+    for (final fileName in candidates) {
+      final fromNameRef = await PetgramPhotoRepository.instance.getByFilePath(
+        'name:$fileName',
+      );
+      if (fromNameRef != null) return fromNameRef.meta;
 
-    final fromPattern = await PetgramPhotoRepository.instance
-        .getByFileNamePattern(fileName);
-    if (fromPattern != null) return fromPattern.meta;
+      final fromPattern = await PetgramPhotoRepository.instance
+          .getByFileNamePattern(fileName);
+      if (fromPattern != null) return fromPattern.meta;
+    }
 
     return null;
   }
